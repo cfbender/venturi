@@ -1,0 +1,30 @@
+{
+  "app-id": "org.venturi.Venturi",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "47",
+  "sdk": "org.gnome.Sdk",
+  "command": "venturi",
+  "finish-args": [
+    "--share=network",
+    "--socket=pulseaudio",
+    "--filesystem=xdg-run/pipewire-0"
+  ],
+  "modules": [
+    {
+      "name": "venturi",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release",
+        "install -Dm755 target/release/venturi /app/bin/venturi",
+        "install -Dm644 data/venturi.desktop /app/share/applications/venturi.desktop",
+        "install -Dm644 data/org.venturi.Venturi.metainfo.xml /app/share/metainfo/org.venturi.Venturi.metainfo.xml"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": ".."
+        }
+      ]
+    }
+  ]
+}

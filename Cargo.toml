@@ -1,0 +1,25 @@
+[package]
+name = "venturi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ashpd = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+pipewire = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.13"
+
+[package.metadata.deb]
+depends = "$auto, libpipewire-0.3-0, libgtk-4-1, libadwaita-1-0"
+assets = [
+  ["target/release/venturi", "usr/bin/", "755"],
+  ["data/venturi.desktop", "usr/share/applications/", "644"],
+  ["data/org.venturi.Venturi.metainfo.xml", "usr/share/metainfo/", "644"]
+]
