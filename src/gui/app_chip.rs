@@ -57,6 +57,7 @@ impl DndPayload {
 
 pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
     let label = gtk::Label::new(Some(&chip.display_name));
+    label.add_css_class("chip-text");
     label.set_xalign(0.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_max_width_chars(16);
@@ -66,6 +67,7 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
         ChipStatus::Idle => "⚪",
         ChipStatus::Muted => "🔇",
     }));
+    status_dot.add_css_class("chip-status");
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.append(&status_dot);

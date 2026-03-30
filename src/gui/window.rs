@@ -220,6 +220,15 @@ fn install_mixer_css(palette: Option<&Palette>) {
         background-color: alpha(@window_fg_color, 0.03);
     }}
 
+    .device-label {{
+        color: alpha(@window_fg_color, 0.95);
+        font-weight: 600;
+    }}
+
+    .device-dropdown {{
+        color: alpha(@window_fg_color, 0.98);
+    }}
+
     .chip-drop-zone {{
         border-radius: 12px;
         min-height: 136px;
@@ -271,6 +280,18 @@ fn install_mixer_css(palette: Option<&Palette>) {
         background-color: {chip_aux_bg};
         border: 1px solid {chip_aux_border};
         border-radius: 8px;
+    }}
+
+    .chip-text,
+    .chip-status,
+    .chip-main label,
+    .chip-mic label,
+    .chip-game label,
+    .chip-media label,
+    .chip-chat label,
+    .chip-aux label {{
+        color: alpha(@window_fg_color, 0.98);
+        font-weight: 600;
     }}
     "#
     );

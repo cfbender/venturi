@@ -194,6 +194,8 @@ pub fn build_mixer_widget(
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let output_label = gtk::Label::new(Some("Output"));
     let input_label = gtk::Label::new(Some("Input"));
+    output_label.add_css_class("device-label");
+    input_label.add_css_class("device-label");
 
     let out_model = gtk::StringList::new(EMPTY_STRS.as_slice());
     let in_model = gtk::StringList::new(EMPTY_STRS.as_slice());
@@ -201,10 +203,10 @@ pub fn build_mixer_widget(
     {
         let state = model.lock().expect("mixer lock");
         for d in &state.devices.output_devices {
-            out_model.append(d);
+            out_model.append(&friendly_device_label(d));
         }
         for d in &state.devices.input_devices {
-            in_model.append(d);
+            in_model.append(&friendly_device_label(d));
         }
         if state.devices.output_devices.is_empty() {
             out_model.append(NO_DEVICES_FOUND);
@@ -216,23 +218,21 @@ pub fn build_mixer_widget(
 
     let output_dropdown = gtk::DropDown::builder().model(&out_model).build();
     let input_dropdown = gtk::DropDown::builder().model(&in_model).build();
+    output_dropdown.add_css_class("device-dropdown");
+    input_dropdown.add_css_class("device-dropdown");
 
     {
         let tx = command_tx.clone();
         let model = model.clone();
         output_dropdown.connect_selected_notify(move |dd| {
-            if let Some(item) = dd.selected_item()
-                && let Ok(value) = item.downcast::<gtk::StringObject>()
+            let idx = dd.selected() as usize;
+            if let Ok(mut state) = model.try_lock()
+                && let Some(chosen) = state.devices.output_devices.get(idx).cloned()
+                && state.devices.selected_output.as_deref() != Some(chosen.as_str())
             {
-                let chosen = value.string().to_string();
-                if chosen != NO_DEVICES_FOUND
-                    && let Ok(mut state) = model.try_lock()
-                    && state.devices.selected_output.as_deref() != Some(&chosen)
-                {
-                    state.devices.set_selected_output(chosen.clone());
-                    state.mark_ui_dirty();
-                    let _ = tx.send(CoreCommand::SetOutputDevice(chosen));
-                }
+                state.devices.set_selected_output(chosen.clone());
+                state.mark_ui_dirty();
+                let _ = tx.send(CoreCommand::SetOutputDevice(chosen));
             }
         });
     }
@@ -241,18 +241,14 @@ pub fn build_mixer_widget(
         let tx = command_tx.clone();
         let model = model.clone();
         input_dropdown.connect_selected_notify(move |dd| {
-            if let Some(item) = dd.selected_item()
-                && let Ok(value) = item.downcast::<gtk::StringObject>()
+            let idx = dd.selected() as usize;
+            if let Ok(mut state) = model.try_lock()
+                && let Some(chosen) = state.devices.input_devices.get(idx).cloned()
+                && state.devices.selected_input.as_deref() != Some(chosen.as_str())
             {
-                let chosen = value.string().to_string();
-                if chosen != NO_DEVICES_FOUND
-                    && let Ok(mut state) = model.try_lock()
-                    && state.devices.selected_input.as_deref() != Some(&chosen)
-                {
-                    state.devices.set_selected_input(chosen.clone());
-                    state.mark_ui_dirty();
-                    let _ = tx.send(CoreCommand::SetInputDevice(chosen));
-                }
+                state.devices.set_selected_input(chosen.clone());
+                state.mark_ui_dirty();
+                let _ = tx.send(CoreCommand::SetInputDevice(chosen));
             }
         });
     }
@@ -411,7 +407,7 @@ pub fn build_mixer_widget(
             if out_devices != last_out_devices {
                 out_model.splice(0, out_model.n_items(), &EMPTY_STRS);
                 for dev in &out_devices {
-                    out_model.append(dev);
+                    out_model.append(&friendly_device_label(dev));
                 }
                 last_out_devices = out_devices;
             }
@@ -419,7 +415,7 @@ pub fn build_mixer_widget(
             if in_devices != last_in_devices {
                 in_model.splice(0, in_model.n_items(), &EMPTY_STRS);
                 for dev in &in_devices {
-                    in_model.append(dev);
+                    in_model.append(&friendly_device_label(dev));
                 }
                 last_in_devices = in_devices;
             }
@@ -461,4 +457,16 @@ pub fn build_mixer_widget(
     });
 
     root
+}
+
+fn friendly_device_label(raw: &str) -> String {
+    if raw == NO_DEVICES_FOUND {
+        return raw.to_string();
+    }
+
+    raw.replace("alsa_output.", "")
+        .replace("alsa_input.", "")
+        .replace(".analog-stereo", "")
+        .replace(".mono-fallback", "")
+        .replace("_", " ")
 }
