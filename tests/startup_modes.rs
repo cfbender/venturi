@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
-use venturi::app::{AppBootstrap, AppRunner, GuiLauncher};
+use venturi::app::{AppBootstrap, AppRunner, GuiLauncher, should_create_tray};
 use venturi::core::messages::{CoreCommand, CoreEvent};
 
 #[derive(Clone)]
@@ -59,4 +59,11 @@ fn daemon_mode_reaches_ready_and_roundtrip() {
     runner
         .run(true, bootstrap)
         .expect("daemon mode should get ready and ping/pong");
+}
+
+#[test]
+fn tray_creation_gate_respects_daemon_and_config_flag() {
+    assert!(!should_create_tray(true, true));
+    assert!(!should_create_tray(false, false));
+    assert!(should_create_tray(false, true));
 }

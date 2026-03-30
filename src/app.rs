@@ -1,5 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+use crate::config::persistence::{Paths, load_config};
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_manager::PipeWireManager;
 use crate::gui::window::MainWindow;
@@ -88,7 +89,13 @@ impl<G: GuiLauncher> AppRunner<G> {
         )?;
 
         if !daemon {
-            let _tray = create_tray(bootstrap.command_tx.clone());
+            let paths = Paths::resolve();
+            let config = load_config(&paths);
+            let _tray = if should_create_tray(daemon, config.general.show_tray_icon) {
+                create_tray(bootstrap.command_tx.clone())
+            } else {
+                None
+            };
             self.gui_launcher
                 .launch(bootstrap.command_tx.clone(), bootstrap.event_rx.clone())?;
         }
@@ -125,4 +132,8 @@ where
 
 pub fn pump_event(window: &mut MainWindow, event: CoreEvent) {
     window.apply_core_event(&event);
+}
+
+pub fn should_create_tray(daemon: bool, show_tray_icon: bool) -> bool {
+    !daemon && show_tray_icon
 }
