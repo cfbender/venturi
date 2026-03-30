@@ -2,6 +2,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_manager::PipeWireManager;
+use crate::gui::window::MainWindow;
 
 #[derive(Debug)]
 pub struct AppBootstrap {
@@ -90,4 +91,8 @@ impl<G: GuiLauncher> AppRunner<G> {
         let _ = manager.join();
         Ok(())
     }
+}
+
+pub fn pump_event(window: &mut MainWindow, event: CoreEvent) {
+    window.apply_core_event(&event);
 }
