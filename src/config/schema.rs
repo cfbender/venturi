@@ -9,6 +9,7 @@ pub struct Config {
     pub categorizer: Categorizer,
     pub hotkeys: Hotkeys,
     pub soundboard: Soundboard,
+    pub palette: Option<Palette>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,6 +54,30 @@ pub struct SoundPad {
     pub name: String,
     pub file: String,
     pub icon: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Palette {
+    pub main: String,
+    pub mic: String,
+    pub game: String,
+    pub media: String,
+    pub chat: String,
+    pub aux: String,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            main: "#938AA9".to_string(),
+            mic: "#7AA89F".to_string(),
+            game: "#87A987".to_string(),
+            media: "#E46876".to_string(),
+            chat: "#7FB4CA".to_string(),
+            aux: "#E6C384".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -107,6 +132,7 @@ impl Default for Config {
                 toggle_window: "ctrl+shift+v".to_string(),
             },
             soundboard: Soundboard { pads: Vec::new() },
+            palette: None,
         }
     }
 }

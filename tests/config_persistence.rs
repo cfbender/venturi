@@ -6,7 +6,7 @@ use venturi::config::persistence::{
     CURRENT_CONFIG_VERSION, DebouncedSaver, Paths, ensure_dirs, load_config, load_state,
     save_config, save_state,
 };
-use venturi::config::schema::{Config, State};
+use venturi::config::schema::{Config, Palette, State};
 
 #[test]
 fn resolves_xdg_paths() {
@@ -94,4 +94,31 @@ fn debounce_waits_500ms_from_last_change() {
 
     saver.did_flush();
     assert!(!saver.should_flush(start + Duration::from_millis(1000)));
+}
+
+#[test]
+fn palette_overrides_roundtrip_via_config_file() {
+    let tmp = tempdir().expect("tempdir");
+    let paths = Paths {
+        config_dir: tmp.path().join("config").join("venturi"),
+        state_dir: tmp.path().join("state").join("venturi"),
+    };
+    ensure_dirs(&paths).expect("ensure dirs");
+
+    let config = Config {
+        palette: Some(Palette {
+            main: "#938AA9".to_string(),
+            mic: "#7AA89F".to_string(),
+            game: "#87A987".to_string(),
+            media: "#E46876".to_string(),
+            chat: "#7FB4CA".to_string(),
+            aux: "#E6C384".to_string(),
+        }),
+        ..Config::default()
+    };
+
+    save_config(&paths, &config).expect("save config");
+    let loaded = load_config(&paths);
+
+    assert_eq!(loaded.palette, config.palette);
 }

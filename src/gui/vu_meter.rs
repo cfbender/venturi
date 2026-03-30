@@ -54,3 +54,16 @@ impl Default for VuMeter {
         Self::new()
     }
 }
+
+pub fn build_meter_widget() -> gtk::Box {
+    use gtk::prelude::*;
+
+    let container = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    let left = gtk::ProgressBar::new();
+    let right = gtk::ProgressBar::new();
+    left.set_show_text(false);
+    right.set_show_text(false);
+    container.append(&left);
+    container.append(&right);
+    container
+}

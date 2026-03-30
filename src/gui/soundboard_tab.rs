@@ -58,3 +58,46 @@ impl SoundboardTab {
         false
     }
 }
+
+pub fn build_soundboard_widget(
+    model: std::sync::Arc<std::sync::Mutex<SoundboardTab>>,
+    command_tx: crossbeam_channel::Sender<crate::core::messages::CoreCommand>,
+) -> gtk::Box {
+    use gtk::prelude::*;
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(8);
+    grid.set_row_spacing(8);
+
+    {
+        let mut state = model.lock().expect("soundboard lock");
+        state.ensure_empty_slots(10);
+    }
+
+    let pads = model.lock().expect("soundboard lock").pads.clone();
+    for (index, pad) in pads.into_iter().enumerate() {
+        let button = gtk::Button::with_label(&format!("{} {}", pad.icon, pad.name));
+        if pad.active {
+            button.add_css_class("suggested-action");
+        }
+
+        let tx = command_tx.clone();
+        let model = model.clone();
+        button.connect_clicked(move |_| {
+            if let Ok(mut state) = model.lock() {
+                let active = state.toggle_active(pad.id);
+                let _ = if active {
+                    tx.send(crate::core::messages::CoreCommand::PlaySound(pad.id))
+                } else {
+                    tx.send(crate::core::messages::CoreCommand::StopSound(pad.id))
+                };
+            }
+        });
+
+        grid.attach(&button, (index % 5) as i32, (index / 5) as i32, 1, 1);
+    }
+
+    root.append(&grid);
+    root
+}

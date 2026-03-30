@@ -24,3 +24,89 @@ impl SettingsTab {
         }
     }
 }
+
+pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>>) -> gtk::Box {
+    use gtk::prelude::*;
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+
+    let noise_group = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let noise_title = gtk::Label::new(Some("Mic Processing"));
+    noise_title.add_css_class("title-4");
+
+    let gate_toggle = gtk::Switch::new();
+    let gate_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    gate_row.append(&gtk::Label::new(Some("Enable noise gate")));
+    gate_row.append(&gate_toggle);
+
+    let threshold = gtk::Scale::with_range(gtk::Orientation::Horizontal, -80.0, 0.0, 1.0);
+    let threshold_label = gtk::Label::new(Some("Threshold (dB)"));
+
+    {
+        let state = model.lock().expect("settings lock");
+        gate_toggle.set_active(state.noise_gate_enabled);
+        threshold.set_value(state.noise_gate_threshold_db as f64);
+    }
+
+    {
+        let model = model.clone();
+        gate_toggle.connect_state_set(move |_, active| {
+            if let Ok(mut state) = model.lock() {
+                state.noise_gate_enabled = active;
+            }
+            false.into()
+        });
+    }
+
+    {
+        let model = model.clone();
+        threshold.connect_value_changed(move |scale| {
+            if let Ok(mut state) = model.lock() {
+                state.noise_gate_threshold_db = scale.value() as f32;
+            }
+        });
+    }
+
+    noise_group.append(&noise_title);
+    noise_group.append(&gate_row);
+    noise_group.append(&threshold_label);
+    noise_group.append(&threshold);
+
+    let hotkeys_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    hotkeys_group.append(&gtk::Label::new(Some("Hotkeys")));
+    if let Ok(state) = model.lock() {
+        hotkeys_group.append(&gtk::Label::new(Some(&format!(
+            "Mute Main: {}",
+            state.mute_main_hotkey
+        ))));
+        hotkeys_group.append(&gtk::Label::new(Some(&format!(
+            "Mute Mic: {}",
+            state.mute_mic_hotkey
+        ))));
+        hotkeys_group.append(&gtk::Label::new(Some(&format!(
+            "Toggle Window: {}",
+            state.toggle_window_hotkey
+        ))));
+    }
+
+    let config_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    config_group.append(&gtk::Label::new(Some("Config")));
+    if let Ok(state) = model.lock() {
+        config_group.append(&gtk::Label::new(Some(&format!(
+            "Path: {}",
+            state.config_path_label
+        ))));
+    }
+
+    let about_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    about_group.append(&gtk::Label::new(Some("About")));
+    if let Ok(state) = model.lock() {
+        about_group.append(&gtk::Label::new(Some(&state.about_label)));
+    }
+
+    root.append(&noise_group);
+    root.append(&hotkeys_group);
+    root.append(&config_group);
+    root.append(&about_group);
+    root
+}

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crossbeam_channel::{Receiver, Sender};
 use venturi::app::{AppBootstrap, AppRunner, GuiLauncher};
+use venturi::core::messages::{CoreCommand, CoreEvent};
 
 #[derive(Clone)]
 struct CountingGui {
@@ -9,7 +11,11 @@ struct CountingGui {
 }
 
 impl GuiLauncher for CountingGui {
-    fn launch(&self) -> Result<(), String> {
+    fn launch(
+        &self,
+        _command_tx: Sender<CoreCommand>,
+        _event_rx: Receiver<CoreEvent>,
+    ) -> Result<(), String> {
         self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

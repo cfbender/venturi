@@ -36,14 +36,22 @@ impl Default for AppBootstrap {
 }
 
 pub trait GuiLauncher {
-    fn launch(&self) -> Result<(), String>;
+    fn launch(
+        &self,
+        command_tx: Sender<CoreCommand>,
+        event_rx: Receiver<CoreEvent>,
+    ) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct NoopGuiLauncher;
 
 impl GuiLauncher for NoopGuiLauncher {
-    fn launch(&self) -> Result<(), String> {
+    fn launch(
+        &self,
+        _command_tx: Sender<CoreCommand>,
+        _event_rx: Receiver<CoreEvent>,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -81,7 +89,8 @@ impl<G: GuiLauncher> AppRunner<G> {
         }
 
         if !daemon {
-            self.gui_launcher.launch()?;
+            self.gui_launcher
+                .launch(bootstrap.command_tx.clone(), bootstrap.event_rx.clone())?;
         }
 
         bootstrap

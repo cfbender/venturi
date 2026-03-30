@@ -1,4 +1,5 @@
 use crate::core::messages::Channel;
+use gtk::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChipStatus {
@@ -52,4 +53,53 @@ impl DndPayload {
             origin: channel,
         })
     }
+}
+
+pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
+    let label = gtk::Label::new(Some(&chip.display_name));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(16);
+
+    let status_dot = gtk::Label::new(Some(match chip.status {
+        ChipStatus::Playing => "🟢",
+        ChipStatus::Idle => "⚪",
+        ChipStatus::Muted => "🔇",
+    }));
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.append(&status_dot);
+    row.append(&label);
+
+    let button = gtk::Button::builder().child(&row).build();
+    button.add_css_class("flat");
+    match chip.channel {
+        Channel::Main => button.add_css_class("chip-main"),
+        Channel::Mic => button.add_css_class("chip-mic"),
+        Channel::Game => button.add_css_class("chip-game"),
+        Channel::Media => button.add_css_class("chip-media"),
+        Channel::Chat => button.add_css_class("chip-chat"),
+        Channel::Aux => button.add_css_class("chip-aux"),
+    }
+    button.set_halign(gtk::Align::Fill);
+    button.set_margin_start(2);
+    button.set_margin_end(2);
+    button.set_margin_top(1);
+    button.set_margin_bottom(1);
+
+    let payload = DndPayload {
+        stream_id: chip.stream_id,
+        app_key: chip.app_key.clone(),
+        origin: chip.channel,
+    };
+
+    let drag = gtk::DragSource::builder()
+        .actions(gtk::gdk::DragAction::MOVE)
+        .build();
+    drag.connect_prepare(move |_, _, _| {
+        let encoded = payload.encode();
+        Some(gtk::gdk::ContentProvider::for_value(&encoded.to_value()))
+    });
+    button.add_controller(drag);
+    button
 }
