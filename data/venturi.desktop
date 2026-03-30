@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Venturi
+Comment=Linux audio mixer for PipeWire
+Exec=venturi
+Icon=venturi
+Categories=AudioVideo;Audio;
+Terminal=false
