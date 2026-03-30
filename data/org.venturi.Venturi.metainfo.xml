@@ -8,5 +8,5 @@
   <description>
     <p>Venturi provides per-application routing, channel strips, and virtual audio devices for Linux streamers and gamers.</p>
   </description>
-  <launchable type="desktop-id">venturi.desktop</launchable>
+  <launchable type="desktop-id">org.venturi.Venturi.desktop</launchable>
 </component>

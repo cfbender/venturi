@@ -38,6 +38,34 @@ cargo run -- --daemon
 
 ## Packaging
 
-- Flatpak manifest: `flatpak/org.venturi.Venturi.json`
-- Debian package tooling: `cargo install cargo-deb && cargo deb`
-- AppImage tooling: `cargo install cargo-appimage && cargo appimage`
+### Flatpak
+
+Manifest: `flatpak/org.venturi.Venturi.json`
+
+Dry-run/lint (manifest parse only):
+
+```bash
+flatpak-builder --show-manifest flatpak-build flatpak/org.venturi.Venturi.json
+```
+
+Local build:
+
+```bash
+flatpak-builder --force-clean flatpak-build flatpak/org.venturi.Venturi.json
+```
+
+### Debian (.deb)
+
+```bash
+cargo install cargo-deb
+cargo deb
+```
+
+### AppImage
+
+Config scaffold: `AppImageBuilder.yml`
+
+```bash
+cargo install cargo-appimage
+cargo appimage
+```

@@ -1,0 +1,23 @@
+version: 1
+
+AppDir:
+  path: AppDir
+  app_info:
+    id: org.venturi.Venturi
+    name: Venturi
+    icon: venturi
+    version: 0.1.0
+    exec: usr/bin/venturi
+    exec_args: $@
+  files:
+    include:
+      - target/release/venturi
+      - data/venturi.desktop
+      - data/org.venturi.Venturi.metainfo.xml
+  runtime:
+    env:
+      GTK_THEME: Adwaita
+
+AppImage:
+  arch: x86_64
+  update-information: guess
