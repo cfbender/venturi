@@ -36,6 +36,10 @@ cargo run
 cargo run -- --daemon
 ```
 
+## Architecture
+
+- Core runtime walkthrough: `docs/architecture/core-runtime.md`
+
 ## Packaging
 
 ### Flatpak

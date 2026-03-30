@@ -1,6 +1,9 @@
 pub mod hotkeys;
 pub mod messages;
 pub mod meter;
+pub(crate) mod pipewire_backend;
+pub(crate) mod pipewire_channel_control;
+pub(crate) mod pipewire_discovery;
 pub mod pipewire_manager;
 pub mod router;
 pub mod virtual_devices;
