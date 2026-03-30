@@ -72,21 +72,66 @@ pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>
     noise_group.append(&threshold_label);
     noise_group.append(&threshold);
 
-    let hotkeys_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    hotkeys_group.append(&gtk::Label::new(Some("Hotkeys")));
+    let hotkeys_group = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let hotkeys_title = gtk::Label::new(Some("Hotkeys"));
+    hotkeys_title.add_css_class("title-4");
+    hotkeys_group.append(&hotkeys_title);
+
+    let mute_main_entry = gtk::Entry::new();
+    let mute_mic_entry = gtk::Entry::new();
+    let ptt_entry = gtk::Entry::new();
+    let toggle_window_entry = gtk::Entry::new();
+
     if let Ok(state) = model.lock() {
-        hotkeys_group.append(&gtk::Label::new(Some(&format!(
-            "Mute Main: {}",
-            state.mute_main_hotkey
-        ))));
-        hotkeys_group.append(&gtk::Label::new(Some(&format!(
-            "Mute Mic: {}",
-            state.mute_mic_hotkey
-        ))));
-        hotkeys_group.append(&gtk::Label::new(Some(&format!(
-            "Toggle Window: {}",
-            state.toggle_window_hotkey
-        ))));
+        mute_main_entry.set_text(&state.mute_main_hotkey);
+        mute_mic_entry.set_text(&state.mute_mic_hotkey);
+        ptt_entry.set_text(&state.push_to_talk_hotkey);
+        toggle_window_entry.set_text(&state.toggle_window_hotkey);
+    }
+
+    for (label, entry) in [
+        ("Mute Main", &mute_main_entry),
+        ("Mute Mic", &mute_mic_entry),
+        ("Push to talk", &ptt_entry),
+        ("Toggle Window", &toggle_window_entry),
+    ] {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.append(&gtk::Label::new(Some(label)));
+        row.append(entry);
+        hotkeys_group.append(&row);
+    }
+
+    {
+        let model = model.clone();
+        mute_main_entry.connect_changed(move |entry| {
+            if let Ok(mut state) = model.lock() {
+                state.mute_main_hotkey = entry.text().to_string();
+            }
+        });
+    }
+    {
+        let model = model.clone();
+        mute_mic_entry.connect_changed(move |entry| {
+            if let Ok(mut state) = model.lock() {
+                state.mute_mic_hotkey = entry.text().to_string();
+            }
+        });
+    }
+    {
+        let model = model.clone();
+        ptt_entry.connect_changed(move |entry| {
+            if let Ok(mut state) = model.lock() {
+                state.push_to_talk_hotkey = entry.text().to_string();
+            }
+        });
+    }
+    {
+        let model = model.clone();
+        toggle_window_entry.connect_changed(move |entry| {
+            if let Ok(mut state) = model.lock() {
+                state.toggle_window_hotkey = entry.text().to_string();
+            }
+        });
     }
 
     let config_group = gtk::Box::new(gtk::Orientation::Vertical, 4);

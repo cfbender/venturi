@@ -346,7 +346,9 @@ impl PipeWireManager {
                             run_wpctl(&args);
                         }
                         CoreCommand::Shutdown => break,
-                        CoreCommand::PlaySound(_) | CoreCommand::StopSound(_) => {}
+                        CoreCommand::ToggleWindow
+                        | CoreCommand::PlaySound(_)
+                        | CoreCommand::StopSound(_) => {}
                     },
                     Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
