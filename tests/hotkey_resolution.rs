@@ -1,6 +1,6 @@
 use venturi::core::hotkeys::{
-    HotkeyBackend, HotkeyBindings, HotkeyEvent, HotkeyState, build_adapter, choose_backend,
-    commands_for_hotkey_event, resolve_backend,
+    HotkeyBackend, HotkeyBindings, HotkeyEvent, HotkeyState, WaylandPortalAdapter, build_adapter,
+    choose_backend, collect_adapter_commands, commands_for_hotkey_event, resolve_backend,
 };
 use venturi::core::messages::{Channel, CoreCommand};
 
@@ -72,4 +72,36 @@ fn build_adapter_uses_portal_first_policy() {
 
     let adapter = build_adapter(Some("x11"), false);
     assert_eq!(adapter.backend(), HotkeyBackend::X11);
+}
+
+#[test]
+fn adapter_events_map_to_push_to_talk_commands() {
+    let mut adapter = WaylandPortalAdapter::new();
+    adapter.enqueue_for_test(HotkeyEvent::Pressed("alt+v".to_string()));
+    adapter.enqueue_for_test(HotkeyEvent::Released("alt+v".to_string()));
+
+    let bindings = HotkeyBindings {
+        mute_main: "ctrl+shift+m".to_string(),
+        mute_mic: "ctrl+shift+n".to_string(),
+        push_to_talk: "alt+v".to_string(),
+        toggle_window: "ctrl+shift+v".to_string(),
+    };
+    let state = HotkeyState {
+        main_muted: false,
+        mic_muted: true,
+    };
+
+    let pressed = collect_adapter_commands(
+        &mut adapter as &mut dyn venturi::core::hotkeys::HotkeyAdapter,
+        &bindings,
+        state,
+    );
+    assert_eq!(pressed, vec![CoreCommand::SetMute(Channel::Mic, false)]);
+
+    let released = collect_adapter_commands(
+        &mut adapter as &mut dyn venturi::core::hotkeys::HotkeyAdapter,
+        &bindings,
+        state,
+    );
+    assert_eq!(released, vec![CoreCommand::SetMute(Channel::Mic, true)]);
 }

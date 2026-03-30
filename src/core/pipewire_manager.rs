@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::categorizer::learning::{deserialize_overrides, serialize_overrides};
 use crate::categorizer::rules::classify_with_priority;
 use crate::config::persistence::{Paths, ensure_dirs, load_config, save_config};
+use crate::core::hotkeys::{HotkeyBindings, HotkeyState, build_adapter, collect_adapter_commands};
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::router::{
     FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands, build_metadata_target_args,
@@ -186,6 +187,14 @@ impl PipeWireManager {
                 )));
             }
             let mut runtime_config = load_config(&paths);
+            let hotkey_bindings = HotkeyBindings::from(&runtime_config.hotkeys);
+            let mut hotkey_state = HotkeyState {
+                main_muted: false,
+                mic_muted: false,
+            };
+            let mut hotkey_adapter =
+                build_adapter(std::env::var("XDG_SESSION_TYPE").ok().as_deref(), false);
+            let _ = hotkey_adapter.register(&hotkey_bindings);
             let mut last_snapshot = Snapshot::default();
             let mut overrides = deserialize_overrides(&runtime_config.categorizer.overrides);
             let mut selected_output = Some("Default".to_string());
@@ -261,6 +270,13 @@ impl PipeWireManager {
                             }
                         }
                         CoreCommand::SetMute(channel, muted) => {
+                            if channel == crate::core::messages::Channel::Main {
+                                hotkey_state.main_muted = muted;
+                            }
+                            if channel == crate::core::messages::Channel::Mic {
+                                hotkey_state.mic_muted = muted;
+                            }
+
                             let value = if muted { "1" } else { "0" };
                             if channel == crate::core::messages::Channel::Mic {
                                 let target = resolve_input_target(
@@ -353,6 +369,56 @@ impl PipeWireManager {
                     },
                     Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
+                }
+
+                let hotkey_commands =
+                    collect_adapter_commands(&mut *hotkey_adapter, &hotkey_bindings, hotkey_state);
+                for command in hotkey_commands {
+                    match command {
+                        CoreCommand::SetMute(channel, muted) => {
+                            if channel == crate::core::messages::Channel::Main {
+                                hotkey_state.main_muted = muted;
+                            }
+                            if channel == crate::core::messages::Channel::Mic {
+                                hotkey_state.mic_muted = muted;
+                            }
+
+                            let value = if muted { "1" } else { "0" };
+                            if channel == crate::core::messages::Channel::Mic {
+                                let target = resolve_input_target(
+                                    selected_input.as_deref(),
+                                    &last_snapshot.input_ids,
+                                );
+                                if last_source_mute_by_target.get(&target) != Some(&muted) {
+                                    let args = vec![
+                                        "set-mute".to_string(),
+                                        target.clone(),
+                                        value.to_string(),
+                                    ];
+                                    run_wpctl(&args);
+                                    last_source_mute_by_target.insert(target, muted);
+                                }
+                            } else {
+                                let target = resolve_output_target(
+                                    selected_output.as_deref(),
+                                    &last_snapshot.output_ids,
+                                );
+                                if last_sink_mute_by_target.get(&target) != Some(&muted) {
+                                    let args = vec![
+                                        "set-mute".to_string(),
+                                        target.clone(),
+                                        value.to_string(),
+                                    ];
+                                    run_wpctl(&args);
+                                    last_sink_mute_by_target.insert(target, muted);
+                                }
+                            }
+                        }
+                        CoreCommand::ToggleWindow => {
+                            let _ = event_tx.send(CoreEvent::ToggleWindowRequested);
+                        }
+                        _ => {}
+                    }
                 }
 
                 match poll_snapshot() {

@@ -1,3 +1,4 @@
+use crate::config::schema;
 use crate::core::messages::{Channel, CoreCommand};
 use std::collections::VecDeque;
 
@@ -109,6 +110,17 @@ pub struct HotkeyBindings {
     pub toggle_window: String,
 }
 
+impl From<&schema::Hotkeys> for HotkeyBindings {
+    fn from(value: &schema::Hotkeys) -> Self {
+        Self {
+            mute_main: value.mute_main.clone(),
+            mute_mic: value.mute_mic.clone(),
+            push_to_talk: value.push_to_talk.clone(),
+            toggle_window: value.toggle_window.clone(),
+        }
+    }
+}
+
 impl HotkeyBindings {
     pub fn matches_press(&self, event: &HotkeyEvent, binding: &str) -> bool {
         matches!(event, HotkeyEvent::Pressed(chord) if !binding.is_empty() && normalize_chord(chord) == normalize_chord(binding))
@@ -151,6 +163,17 @@ pub fn commands_for_hotkey_event(
     }
 
     Vec::new()
+}
+
+pub fn collect_adapter_commands(
+    adapter: &mut dyn HotkeyAdapter,
+    bindings: &HotkeyBindings,
+    state: HotkeyState,
+) -> Vec<CoreCommand> {
+    adapter
+        .poll_event()
+        .map(|event| commands_for_hotkey_event(&event, bindings, state))
+        .unwrap_or_default()
 }
 
 fn normalize_chord(raw: &str) -> String {
