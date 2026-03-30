@@ -68,25 +68,23 @@ impl<G: GuiLauncher> AppRunner<G> {
     pub fn run(&self, daemon: bool, bootstrap: AppBootstrap) -> Result<(), String> {
         let manager = bootstrap.spawn_mock_core();
 
-        let first_event = bootstrap
-            .event_rx
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .map_err(|_| "core did not become ready".to_string())?;
-        if first_event != CoreEvent::Ready {
-            return Err("unexpected first core event".to_string());
-        }
+        wait_for_event(
+            &bootstrap.event_rx,
+            std::time::Duration::from_secs(1),
+            |event| matches!(event, CoreEvent::Ready),
+            "core did not become ready",
+        )?;
 
         bootstrap
             .command_tx
             .send(CoreCommand::Ping)
             .map_err(|e| e.to_string())?;
-        let pong = bootstrap
-            .event_rx
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .map_err(|_| "core did not answer ping".to_string())?;
-        if pong != CoreEvent::Pong {
-            return Err("unexpected ping response".to_string());
-        }
+        wait_for_event(
+            &bootstrap.event_rx,
+            std::time::Duration::from_secs(1),
+            |event| matches!(event, CoreEvent::Pong),
+            "core did not answer ping",
+        )?;
 
         if !daemon {
             self.gui_launcher
@@ -100,6 +98,27 @@ impl<G: GuiLauncher> AppRunner<G> {
         let _ = manager.join();
         Ok(())
     }
+}
+
+fn wait_for_event<F>(
+    event_rx: &Receiver<CoreEvent>,
+    timeout: std::time::Duration,
+    predicate: F,
+    timeout_message: &str,
+) -> Result<(), String>
+where
+    F: Fn(&CoreEvent) -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(event) = event_rx.recv_timeout(std::time::Duration::from_millis(100))
+            && predicate(&event)
+        {
+            return Ok(());
+        }
+    }
+
+    Err(timeout_message.to_string())
 }
 
 pub fn pump_event(window: &mut MainWindow, event: CoreEvent) {

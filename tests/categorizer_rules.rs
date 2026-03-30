@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use venturi::categorizer::learning::Overrides;
+use venturi::categorizer::learning::{Overrides, deserialize_overrides, serialize_overrides};
 use venturi::categorizer::rules::{classify_with_priority, matching_key};
 use venturi::core::messages::Channel;
 
@@ -44,4 +44,21 @@ fn learning_overrides_roundtrip() {
     overrides.insert("discord", Channel::Chat);
     assert_eq!(overrides.get("discord"), Some(Channel::Chat));
     assert_eq!(overrides.as_map().get("discord"), Some(&Channel::Chat));
+
+    let persisted = serialize_overrides(overrides.as_map());
+    assert_eq!(persisted.get("discord"), Some(&"chat".to_string()));
+
+    let restored = deserialize_overrides(&persisted);
+    assert_eq!(restored.get("discord"), Some(&Channel::Chat));
+}
+
+#[test]
+fn deserialize_ignores_unknown_channel_values() {
+    let mut raw = BTreeMap::new();
+    raw.insert("foo".to_string(), "unknown".to_string());
+    raw.insert("bar".to_string(), "game".to_string());
+
+    let restored = deserialize_overrides(&raw);
+    assert!(!restored.contains_key("foo"));
+    assert_eq!(restored.get("bar"), Some(&Channel::Game));
 }

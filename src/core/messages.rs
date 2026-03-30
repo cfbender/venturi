@@ -15,6 +15,7 @@ pub enum CoreCommand {
     MoveStream { stream_id: u32, channel: Channel },
     SetOutputDevice(String),
     SetInputDevice(String),
+    ToggleWindow,
     PlaySound(u32),
     StopSound(u32),
     Ping,
