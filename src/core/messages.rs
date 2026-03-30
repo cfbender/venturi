@@ -26,6 +26,7 @@ pub enum CoreCommand {
 pub enum CoreEvent {
     Ready,
     Pong,
+    ToggleWindowRequested,
     StreamAppeared {
         id: u32,
         name: String,

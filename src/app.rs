@@ -3,6 +3,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_manager::PipeWireManager;
 use crate::gui::window::MainWindow;
+use crate::tray::create_tray;
 
 #[derive(Debug)]
 pub struct AppBootstrap {
@@ -87,6 +88,7 @@ impl<G: GuiLauncher> AppRunner<G> {
         )?;
 
         if !daemon {
+            let _tray = create_tray(bootstrap.command_tx.clone());
             self.gui_launcher
                 .launch(bootstrap.command_tx.clone(), bootstrap.event_rx.clone())?;
         }

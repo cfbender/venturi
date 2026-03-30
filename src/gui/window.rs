@@ -142,8 +142,18 @@ pub fn run_gtk_app(
         let vm = vm.clone();
         let mixer_model_for_events = mixer_model.clone();
         let event_rx = event_rx_outer.clone();
+        let window_for_events = window.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
             while let Ok(event) = event_rx.try_recv() {
+                if matches!(event, CoreEvent::ToggleWindowRequested) {
+                    if window_for_events.is_visible() {
+                        window_for_events.hide();
+                    } else {
+                        window_for_events.present();
+                    }
+                    continue;
+                }
+
                 vm.borrow_mut().apply_core_event(&event);
                 if let Ok(mut state) = mixer_model_for_events.lock() {
                     state.apply_event(&event);

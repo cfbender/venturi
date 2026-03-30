@@ -345,10 +345,11 @@ impl PipeWireManager {
                             let args = vec!["set-default".to_string(), target];
                             run_wpctl(&args);
                         }
+                        CoreCommand::ToggleWindow => {
+                            let _ = event_tx.send(CoreEvent::ToggleWindowRequested);
+                        }
                         CoreCommand::Shutdown => break,
-                        CoreCommand::ToggleWindow
-                        | CoreCommand::PlaySound(_)
-                        | CoreCommand::StopSound(_) => {}
+                        CoreCommand::PlaySound(_) | CoreCommand::StopSound(_) => {}
                     },
                     Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
