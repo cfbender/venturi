@@ -1,9 +1,78 @@
 use crate::core::messages::{Channel, CoreCommand};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyBackend {
     WaylandPortal,
     X11,
+}
+
+pub trait HotkeyAdapter {
+    fn backend(&self) -> HotkeyBackend;
+    fn register(&mut self, _bindings: &HotkeyBindings) -> Result<(), String> {
+        Ok(())
+    }
+    fn poll_event(&mut self) -> Option<HotkeyEvent>;
+}
+
+#[derive(Debug, Default)]
+pub struct WaylandPortalAdapter {
+    queued_events: VecDeque<HotkeyEvent>,
+}
+
+impl WaylandPortalAdapter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enqueue_for_test(&mut self, event: HotkeyEvent) {
+        self.queued_events.push_back(event);
+    }
+}
+
+impl HotkeyAdapter for WaylandPortalAdapter {
+    fn backend(&self) -> HotkeyBackend {
+        HotkeyBackend::WaylandPortal
+    }
+
+    fn poll_event(&mut self) -> Option<HotkeyEvent> {
+        self.queued_events.pop_front()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct X11HotkeyAdapter {
+    queued_events: VecDeque<HotkeyEvent>,
+}
+
+impl X11HotkeyAdapter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enqueue_for_test(&mut self, event: HotkeyEvent) {
+        self.queued_events.push_back(event);
+    }
+}
+
+impl HotkeyAdapter for X11HotkeyAdapter {
+    fn backend(&self) -> HotkeyBackend {
+        HotkeyBackend::X11
+    }
+
+    fn poll_event(&mut self) -> Option<HotkeyEvent> {
+        self.queued_events.pop_front()
+    }
+}
+
+pub fn build_adapter(
+    session_type: Option<&str>,
+    portal_available: bool,
+) -> Box<dyn HotkeyAdapter + Send> {
+    match resolve_backend(session_type, portal_available) {
+        HotkeyBackend::WaylandPortal => Box::new(WaylandPortalAdapter::new()),
+        HotkeyBackend::X11 => Box::new(X11HotkeyAdapter::new()),
+    }
 }
 
 pub fn choose_backend(portal_available: bool) -> HotkeyBackend {

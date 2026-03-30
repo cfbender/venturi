@@ -103,6 +103,16 @@ pub fn run_gtk_app(
             format!("Venturi {}", env!("CARGO_PKG_VERSION")),
         )));
 
+        {
+            let mut state = vm.borrow_mut();
+            state.settings.mute_main_hotkey = config.hotkeys.mute_main.clone();
+            state.settings.mute_mic_hotkey = config.hotkeys.mute_mic.clone();
+            state.settings.push_to_talk_hotkey = config.hotkeys.push_to_talk.clone();
+            state.settings.toggle_window_hotkey = config.hotkeys.toggle_window.clone();
+            state.settings.noise_gate_enabled = config.mic_processing.noise_gate_enabled;
+            state.settings.noise_gate_threshold_db = config.mic_processing.noise_gate_threshold;
+        }
+
         let mixer_model = Arc::new(Mutex::new(vm.borrow().mixer.clone()));
         let settings_model = Arc::new(Mutex::new(vm.borrow().settings.clone()));
         let soundboard_model = Arc::new(Mutex::new(vm.borrow().soundboard.clone()));

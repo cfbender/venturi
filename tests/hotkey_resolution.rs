@@ -1,5 +1,5 @@
 use venturi::core::hotkeys::{
-    HotkeyBackend, HotkeyBindings, HotkeyEvent, HotkeyState, choose_backend,
+    HotkeyBackend, HotkeyBindings, HotkeyEvent, HotkeyState, build_adapter, choose_backend,
     commands_for_hotkey_event, resolve_backend,
 };
 use venturi::core::messages::{Channel, CoreCommand};
@@ -63,4 +63,13 @@ fn toggle_window_hotkey_emits_toggle_command() {
         state,
     );
     assert_eq!(cmds, vec![CoreCommand::ToggleWindow]);
+}
+
+#[test]
+fn build_adapter_uses_portal_first_policy() {
+    let adapter = build_adapter(Some("x11"), true);
+    assert_eq!(adapter.backend(), HotkeyBackend::WaylandPortal);
+
+    let adapter = build_adapter(Some("x11"), false);
+    assert_eq!(adapter.backend(), HotkeyBackend::X11);
 }
