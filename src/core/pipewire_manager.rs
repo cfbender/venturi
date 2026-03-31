@@ -749,6 +749,35 @@ fn should_refresh_meter_snapshot(
     snapshot_missing || elapsed >= refresh_interval
 }
 
+/// Coalesce a batch of commands: keep only the last SetVolume per channel,
+/// preserve all other commands in order, and stop early on Shutdown.
+fn coalesce_commands(commands: Vec<CoreCommand>) -> Vec<CoreCommand> {
+    let mut volume_map: BTreeMap<Channel, f32> = BTreeMap::new();
+    let mut result: Vec<CoreCommand> = Vec::new();
+
+    for cmd in commands {
+        match cmd {
+            CoreCommand::SetVolume(channel, vol) => {
+                volume_map.insert(channel, vol);
+            }
+            CoreCommand::Shutdown => {
+                // Shutdown discards everything — pending volumes and remaining commands
+                return vec![CoreCommand::Shutdown];
+            }
+            other => {
+                result.push(other);
+            }
+        }
+    }
+
+    // Append coalesced volumes in deterministic Channel order
+    for (channel, vol) in volume_map {
+        result.push(CoreCommand::SetVolume(channel, vol));
+    }
+
+    result
+}
+
 fn compute_level_sample_count(sample_rate_hz: u32, sample_interval: Duration) -> u32 {
     let interval_ms = sample_interval.as_millis() as u64;
     let sample_count = (sample_rate_hz as u64)
@@ -915,8 +944,10 @@ mod tests {
     use crate::core::messages::Channel;
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
 
+    use crate::core::messages::CoreCommand;
+
     use super::{
-        build_channel_level_targets, compute_channel_level_updates_with,
+        build_channel_level_targets, coalesce_commands, compute_channel_level_updates_with,
         compute_level_sample_count, node_id_to_channel, persisted_channel_mute,
         persisted_channel_volume, resolve_output_loopback_target, should_refresh_meter_snapshot,
         should_skip_output_device_reconcile,
@@ -1120,5 +1151,64 @@ mod tests {
         let snapshot = Snapshot::default();
         let overrides = BTreeMap::new();
         assert_eq!(node_id_to_channel(999, &snapshot, &overrides), None);
+    }
+
+    #[test]
+    fn coalesce_keeps_last_volume_per_channel() {
+        let commands = vec![
+            CoreCommand::SetVolume(Channel::Main, 0.1),
+            CoreCommand::SetVolume(Channel::Main, 0.5),
+            CoreCommand::SetVolume(Channel::Main, 0.9),
+        ];
+        let result = coalesce_commands(commands);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.9).abs() < 0.001));
+    }
+
+    #[test]
+    fn coalesce_preserves_non_volume_commands_in_order() {
+        let commands = vec![
+            CoreCommand::SetVolume(Channel::Main, 0.5),
+            CoreCommand::SetMute(Channel::Game, true),
+            CoreCommand::SetVolume(Channel::Main, 0.8),
+        ];
+        let result = coalesce_commands(commands);
+        // SetMute emitted in order, then coalesced SetVolume(Main, 0.8) at end
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], CoreCommand::SetMute(Channel::Game, true)));
+        assert!(matches!(result[1], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.8).abs() < 0.001));
+    }
+
+    #[test]
+    fn coalesce_multiple_channels_independently() {
+        let commands = vec![
+            CoreCommand::SetVolume(Channel::Main, 0.3),
+            CoreCommand::SetVolume(Channel::Game, 0.6),
+            CoreCommand::SetVolume(Channel::Main, 0.7),
+        ];
+        let result = coalesce_commands(commands);
+        assert_eq!(result.len(), 2);
+        // Volume commands emitted in deterministic Channel order (Main < Game via Ord)
+        assert!(matches!(result[0], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.7).abs() < 0.001));
+        assert!(matches!(result[1], CoreCommand::SetVolume(Channel::Game, v) if (v - 0.6).abs() < 0.001));
+    }
+
+    #[test]
+    fn coalesce_shutdown_discards_remaining() {
+        let commands = vec![
+            CoreCommand::SetVolume(Channel::Main, 0.5),
+            CoreCommand::Shutdown,
+            CoreCommand::SetVolume(Channel::Game, 0.9),
+        ];
+        let result = coalesce_commands(commands);
+        // Shutdown emits immediately, discards remaining + pending volumes
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], CoreCommand::Shutdown));
+    }
+
+    #[test]
+    fn coalesce_empty_batch_returns_empty() {
+        let result = coalesce_commands(vec![]);
+        assert!(result.is_empty());
     }
 }
