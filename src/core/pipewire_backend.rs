@@ -468,10 +468,11 @@ fn find_virtual_mic_module_id(virtual_source_name: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::{
-        build_monitor_loopback_plan, build_virtual_device_description_property,
+        MonitorLoopbackPlan, build_monitor_loopback_plan,
+        build_virtual_device_description_property,
         build_virtual_module_device_description_properties,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
-        sink_description_for, source_description_for, MonitorLoopbackPlan,
+        sink_description_for, source_description_for,
     };
 
     #[test]

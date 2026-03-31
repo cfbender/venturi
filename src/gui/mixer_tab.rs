@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::rc::Rc;
 
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::messages::{DeviceEntry, DeviceKind};
@@ -236,10 +236,7 @@ pub fn build_mixer_widget(
     {
         let state = model.lock().expect("mixer lock");
         for d in &state.devices.output_devices {
-            out_model.append(&display_device_label(
-                &state.devices.output_labels_by_id,
-                d,
-            ));
+            out_model.append(&display_device_label(&state.devices.output_labels_by_id, d));
         }
         for d in &state.devices.input_devices {
             in_model.append(&display_device_label(&state.devices.input_labels_by_id, d));
@@ -460,128 +457,131 @@ pub fn build_mixer_widget(
     let mut last_chips_snapshot: BTreeMap<Channel, Vec<AppChip>> = BTreeMap::new();
     let mut last_meter_levels: BTreeMap<Channel, f32> = BTreeMap::new();
     let mut last_meter_tick = Instant::now();
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(METER_UI_TICK_MS), move || {
-        if let Ok(state) = model_for_refresh.try_lock() {
-            let levels_snapshot = state.levels.clone();
-            let ui_dirty = state.take_ui_dirty();
+    gtk::glib::timeout_add_local(
+        std::time::Duration::from_millis(METER_UI_TICK_MS),
+        move || {
+            if let Ok(state) = model_for_refresh.try_lock() {
+                let levels_snapshot = state.levels.clone();
+                let ui_dirty = state.take_ui_dirty();
 
-            let now = Instant::now();
-            let elapsed_ms = now.duration_since(last_meter_tick).as_millis() as u32;
-            last_meter_tick = now;
-            for channel in [
-                Channel::Main,
-                Channel::Mic,
-                Channel::Game,
-                Channel::Media,
-                Channel::Chat,
-                Channel::Aux,
-            ] {
-                let (left, right) = levels_snapshot.get(&channel).copied().unwrap_or((0.0, 0.0));
-                let current = meter_display_level(left.max(right));
-                let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
-                let next = decay_peak(previous, current, elapsed_ms);
-                if let Some(widget) = meter_widgets.get(&channel) {
-                    widget.set_fraction(next as f64);
-                    widget.set_visible(meter_should_be_visible(next));
+                let now = Instant::now();
+                let elapsed_ms = now.duration_since(last_meter_tick).as_millis() as u32;
+                last_meter_tick = now;
+                for channel in [
+                    Channel::Main,
+                    Channel::Mic,
+                    Channel::Game,
+                    Channel::Media,
+                    Channel::Chat,
+                    Channel::Aux,
+                ] {
+                    let (left, right) =
+                        levels_snapshot.get(&channel).copied().unwrap_or((0.0, 0.0));
+                    let current = meter_display_level(left.max(right));
+                    let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
+                    let next = decay_peak(previous, current, elapsed_ms);
+                    if let Some(widget) = meter_widgets.get(&channel) {
+                        widget.set_fraction(next as f64);
+                        widget.set_visible(meter_should_be_visible(next));
+                    }
+                    last_meter_levels.insert(channel, next);
                 }
-                last_meter_levels.insert(channel, next);
-            }
 
-            if !ui_dirty {
-                return gtk::glib::ControlFlow::Continue;
-            }
-
-            let banner_text = state.banner.clone().unwrap_or_default();
-            let out_devices = if state.devices.output_devices.is_empty() {
-                vec![NO_DEVICES_FOUND.to_string()]
-            } else {
-                state.devices.output_devices.clone()
-            };
-            let in_devices = if state.devices.input_devices.is_empty() {
-                vec![NO_DEVICES_FOUND.to_string()]
-            } else {
-                state.devices.input_devices.clone()
-            };
-            let selected_out = state
-                .devices
-                .selected_output
-                .as_ref()
-                .and_then(|sel| state.devices.output_devices.iter().position(|d| d == sel));
-            let selected_in = state
-                .devices
-                .selected_input
-                .as_ref()
-                .and_then(|sel| state.devices.input_devices.iter().position(|d| d == sel));
-            let out_labels_by_id = state.devices.output_labels_by_id.clone();
-            let in_labels_by_id = state.devices.input_labels_by_id.clone();
-            let chips_snapshot = state.chips.clone();
-            drop(state);
-
-            if banner_text != last_banner {
-                banner.set_text(&banner_text);
-                last_banner = banner_text;
-            }
-
-            if out_devices != last_out_devices {
-                suppress_device_notify.set(true);
-                out_model.splice(0, out_model.n_items(), &EMPTY_STRS);
-                for dev in &out_devices {
-                    out_model.append(&display_device_label(&out_labels_by_id, dev));
+                if !ui_dirty {
+                    return gtk::glib::ControlFlow::Continue;
                 }
-                last_out_devices = out_devices;
-                suppress_device_notify.set(false);
-            }
 
-            if in_devices != last_in_devices {
-                suppress_device_notify.set(true);
-                in_model.splice(0, in_model.n_items(), &EMPTY_STRS);
-                for dev in &in_devices {
-                    in_model.append(&display_device_label(&in_labels_by_id, dev));
+                let banner_text = state.banner.clone().unwrap_or_default();
+                let out_devices = if state.devices.output_devices.is_empty() {
+                    vec![NO_DEVICES_FOUND.to_string()]
+                } else {
+                    state.devices.output_devices.clone()
+                };
+                let in_devices = if state.devices.input_devices.is_empty() {
+                    vec![NO_DEVICES_FOUND.to_string()]
+                } else {
+                    state.devices.input_devices.clone()
+                };
+                let selected_out = state
+                    .devices
+                    .selected_output
+                    .as_ref()
+                    .and_then(|sel| state.devices.output_devices.iter().position(|d| d == sel));
+                let selected_in = state
+                    .devices
+                    .selected_input
+                    .as_ref()
+                    .and_then(|sel| state.devices.input_devices.iter().position(|d| d == sel));
+                let out_labels_by_id = state.devices.output_labels_by_id.clone();
+                let in_labels_by_id = state.devices.input_labels_by_id.clone();
+                let chips_snapshot = state.chips.clone();
+                drop(state);
+
+                if banner_text != last_banner {
+                    banner.set_text(&banner_text);
+                    last_banner = banner_text;
                 }
-                last_in_devices = in_devices;
-                suppress_device_notify.set(false);
-            }
 
-            let next_out_selected = selected_out.map(|idx| idx as u32);
-            if next_out_selected != last_out_selected {
-                if let Some(idx) = next_out_selected
-                    && output_dropdown.selected() != idx
-                {
+                if out_devices != last_out_devices {
                     suppress_device_notify.set(true);
-                    output_dropdown.set_selected(idx);
+                    out_model.splice(0, out_model.n_items(), &EMPTY_STRS);
+                    for dev in &out_devices {
+                        out_model.append(&display_device_label(&out_labels_by_id, dev));
+                    }
+                    last_out_devices = out_devices;
                     suppress_device_notify.set(false);
                 }
-                last_out_selected = next_out_selected;
-            }
 
-            let next_in_selected = selected_in.map(|idx| idx as u32);
-            if next_in_selected != last_in_selected {
-                if let Some(idx) = next_in_selected
-                    && input_dropdown.selected() != idx
-                {
+                if in_devices != last_in_devices {
                     suppress_device_notify.set(true);
-                    input_dropdown.set_selected(idx);
+                    in_model.splice(0, in_model.n_items(), &EMPTY_STRS);
+                    for dev in &in_devices {
+                        in_model.append(&display_device_label(&in_labels_by_id, dev));
+                    }
+                    last_in_devices = in_devices;
                     suppress_device_notify.set(false);
                 }
-                last_in_selected = next_in_selected;
-            }
 
-            if chips_snapshot != last_chips_snapshot {
-                for (channel, list_box) in &chip_lists {
-                    while let Some(child) = list_box.first_child() {
-                        list_box.remove(&child);
+                let next_out_selected = selected_out.map(|idx| idx as u32);
+                if next_out_selected != last_out_selected {
+                    if let Some(idx) = next_out_selected
+                        && output_dropdown.selected() != idx
+                    {
+                        suppress_device_notify.set(true);
+                        output_dropdown.set_selected(idx);
+                        suppress_device_notify.set(false);
                     }
-                    let chips = chips_snapshot.get(channel).cloned().unwrap_or_default();
-                    for chip in chips {
-                        list_box.insert(&build_chip_widget(&chip), -1);
-                    }
+                    last_out_selected = next_out_selected;
                 }
-                last_chips_snapshot = chips_snapshot;
-            }
 
-        }
-        gtk::glib::ControlFlow::Continue
-    });
+                let next_in_selected = selected_in.map(|idx| idx as u32);
+                if next_in_selected != last_in_selected {
+                    if let Some(idx) = next_in_selected
+                        && input_dropdown.selected() != idx
+                    {
+                        suppress_device_notify.set(true);
+                        input_dropdown.set_selected(idx);
+                        suppress_device_notify.set(false);
+                    }
+                    last_in_selected = next_in_selected;
+                }
+
+                if chips_snapshot != last_chips_snapshot {
+                    for (channel, list_box) in &chip_lists {
+                        while let Some(child) = list_box.first_child() {
+                            list_box.remove(&child);
+                        }
+                        let chips = chips_snapshot.get(channel).cloned().unwrap_or_default();
+                        for chip in chips {
+                            list_box.insert(&build_chip_widget(&chip), -1);
+                        }
+                    }
+                    last_chips_snapshot = chips_snapshot;
+                }
+            }
+            gtk::glib::ControlFlow::Continue
+        },
+    );
 
     root
 }
@@ -633,7 +633,9 @@ mod tests {
     fn retains_persisted_selected_ids_when_devices_refresh() {
         let mut model = DeviceListModel {
             selected_output: Some("alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1".to_string()),
-            selected_input: Some("alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback".to_string()),
+            selected_input: Some(
+                "alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback".to_string(),
+            ),
             ..DeviceListModel::default()
         };
         let devices = vec![

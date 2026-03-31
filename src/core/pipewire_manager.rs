@@ -1,7 +1,7 @@
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::categorizer::learning::{deserialize_overrides, serialize_overrides};
@@ -14,9 +14,9 @@ use crate::core::hotkeys::{
 };
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::pipewire_backend::{
-    current_default_sink_name, current_default_source_name, ensure_virtual_devices,
-    reconcile_monitor_loopback_modules, rewire_virtual_mic_source, run_pw_link, run_pw_metadata,
-    unload_pactl_module, PwTargetSampler,
+    PwTargetSampler, current_default_sink_name, current_default_source_name,
+    ensure_virtual_devices, reconcile_monitor_loopback_modules, rewire_virtual_mic_source,
+    run_pw_link, run_pw_metadata, unload_pactl_module,
 };
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
@@ -463,7 +463,10 @@ impl CoreRuntimeState {
 
         route_result.map_err(|err| format!("failed to move stream {stream_id}: {err}"))?;
 
-        if matches!(channel, Channel::Game | Channel::Media | Channel::Chat | Channel::Aux) {
+        if matches!(
+            channel,
+            Channel::Game | Channel::Media | Channel::Chat | Channel::Aux
+        ) {
             self.apply_persisted_channel_mix(channel);
         }
 
@@ -504,7 +507,11 @@ impl CoreRuntimeState {
         self.handle_set_output_device_internal(device, false)
     }
 
-    fn handle_set_output_device_internal(&mut self, device: &str, force: bool) -> Result<(), String> {
+    fn handle_set_output_device_internal(
+        &mut self,
+        device: &str,
+        force: bool,
+    ) -> Result<(), String> {
         if should_skip_output_device_reconcile(self.selected_output.as_deref(), device, force) {
             return Ok(());
         }
@@ -631,7 +638,6 @@ impl CoreRuntimeState {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -692,7 +698,10 @@ fn limit_channel_level_targets(
 ) -> BTreeMap<crate::core::messages::Channel, Vec<u32>> {
     let mut limited = BTreeMap::new();
     for (channel, ids) in targets {
-        limited.insert(*channel, ids.iter().take(per_channel_limit).copied().collect());
+        limited.insert(
+            *channel,
+            ids.iter().take(per_channel_limit).copied().collect(),
+        );
     }
     limited
 }
@@ -749,8 +758,7 @@ fn spawn_meter_worker(
             }
             last_meter_sample = Instant::now();
             if last_override_refresh.elapsed() >= METER_OVERRIDE_REFRESH_INTERVAL {
-                meter_overrides =
-                    deserialize_overrides(&load_config(&paths).categorizer.overrides);
+                meter_overrides = deserialize_overrides(&load_config(&paths).categorizer.overrides);
                 last_override_refresh = Instant::now();
             }
             if should_refresh_meter_snapshot(
@@ -758,7 +766,9 @@ fn spawn_meter_worker(
                 METER_SNAPSHOT_REFRESH_INTERVAL,
                 last_snapshot_refresh.elapsed(),
             ) {
-                if let Ok(snapshot) = poll_snapshot(hidden_outputs.as_slice(), VIRTUAL_SOURCES.as_slice()) {
+                if let Ok(snapshot) =
+                    poll_snapshot(hidden_outputs.as_slice(), VIRTUAL_SOURCES.as_slice())
+                {
                     cached_snapshot = Some(snapshot);
                     last_snapshot_refresh = Instant::now();
                 }
@@ -781,16 +791,17 @@ fn spawn_meter_worker(
                 }
 
                 let mut failed_targets = BTreeSet::new();
-                let updates = compute_channel_level_updates_for_targets_with(&targets, |target_id| {
-                    let sampler = samplers.get_mut(&target_id)?;
-                    match sampler.sample_levels(level_sample_count) {
-                        Ok(levels) => Some(levels),
-                        Err(_) => {
-                            failed_targets.insert(target_id);
-                            None
+                let updates =
+                    compute_channel_level_updates_for_targets_with(&targets, |target_id| {
+                        let sampler = samplers.get_mut(&target_id)?;
+                        match sampler.sample_levels(level_sample_count) {
+                            Ok(levels) => Some(levels),
+                            Err(_) => {
+                                failed_targets.insert(target_id);
+                                None
+                            }
                         }
-                    }
-                });
+                    });
                 for target in failed_targets {
                     samplers.remove(&target);
                 }
@@ -888,8 +899,12 @@ mod tests {
     #[test]
     fn builds_level_targets_for_main_mic_and_classified_stream_channels() {
         let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Output".to_string(), 128);
-        snapshot.input_ids.insert("Venturi-VirtualMic".to_string(), 281);
+        snapshot
+            .output_ids
+            .insert("Venturi-Output".to_string(), 128);
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 281);
         snapshot
             .output_meter_targets
             .insert("Venturi-Output".to_string(), 37284);
@@ -928,7 +943,10 @@ mod tests {
     #[test]
     fn resolves_default_output_to_real_hardware_sink_for_loopback() {
         assert_eq!(
-            resolve_output_loopback_target("Default", Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo")),
+            resolve_output_loopback_target(
+                "Default",
+                Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo")
+            ),
             Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo".to_string())
         );
         assert_eq!(
@@ -936,7 +954,10 @@ mod tests {
             None
         );
         assert_eq!(
-            resolve_output_loopback_target("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo", Some("ignored")),
+            resolve_output_loopback_target(
+                "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo",
+                Some("ignored")
+            ),
             Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo".to_string())
         );
     }
@@ -1017,8 +1038,14 @@ mod tests {
 
     #[test]
     fn computes_meter_sample_count_for_sampling_interval() {
-        assert_eq!(compute_level_sample_count(48_000, Duration::from_millis(66)), 3168);
-        assert_eq!(compute_level_sample_count(48_000, Duration::from_millis(1)), 48);
+        assert_eq!(
+            compute_level_sample_count(48_000, Duration::from_millis(66)),
+            3168
+        );
+        assert_eq!(
+            compute_level_sample_count(48_000, Duration::from_millis(1)),
+            48
+        );
     }
 
     #[test]
@@ -1030,5 +1057,4 @@ mod tests {
         assert!((persisted_channel_volume(&state, Channel::Chat) - 0.42).abs() < 0.0001);
         assert!(persisted_channel_mute(&state, Channel::Chat));
     }
-
 }

@@ -36,11 +36,13 @@ fn device_disconnect_resets_to_default_and_toasts() {
     assert_eq!(window.mixer.devices.output_label(), "Default");
     assert_eq!(window.mixer.devices.input_label(), "Default");
     assert_eq!(fallback_to_default_device(), "Default");
-    assert!(window
-        .mixer
-        .toast
-        .as_deref()
-        .is_some_and(|m| m.contains("Reset to Default")));
+    assert!(
+        window
+            .mixer
+            .toast
+            .as_deref()
+            .is_some_and(|m| m.contains("Reset to Default"))
+    );
 }
 
 #[test]

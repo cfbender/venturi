@@ -10,12 +10,12 @@ use adw::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::GuiLauncher;
-use crate::config::persistence::{load_config, load_state, Paths};
+use crate::config::persistence::{Paths, load_config, load_state};
 use crate::config::schema::Palette;
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
-use crate::gui::mixer_tab::{build_mixer_widget, MixerTab};
-use crate::gui::settings_tab::{build_settings_widget, SettingsTab};
-use crate::gui::soundboard_tab::{build_soundboard_widget, SoundboardTab};
+use crate::gui::mixer_tab::{MixerTab, build_mixer_widget};
+use crate::gui::settings_tab::{SettingsTab, build_settings_widget};
+use crate::gui::soundboard_tab::{SoundboardTab, build_soundboard_widget};
 
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
