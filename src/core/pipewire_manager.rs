@@ -148,6 +148,32 @@ fn set_persisted_channel_mute(
     }
 }
 
+/// Map a PipeWire node ID to a Venturi Channel using snapshot state and categorizer.
+fn node_id_to_channel(
+    id: u32,
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, Channel>,
+) -> Option<Channel> {
+    // Check if id matches a known output sink → Main
+    if snapshot.output_ids.values().any(|&nid| nid == id) {
+        return Some(Channel::Main);
+    }
+    // Check if id matches a known input source → Mic
+    if snapshot.input_ids.values().any(|&nid| nid == id) {
+        return Some(Channel::Mic);
+    }
+    // Check streams → classify via categorizer
+    if let Some(stream) = snapshot.streams.get(&id) {
+        return Some(classify_with_priority(
+            overrides,
+            Some(&stream.app_key),
+            Some(&stream.display_name),
+            stream.media_role.as_deref(),
+        ));
+    }
+    None
+}
+
 fn build_channel_level_targets(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
@@ -891,8 +917,8 @@ mod tests {
 
     use super::{
         build_channel_level_targets, compute_channel_level_updates_with,
-        compute_level_sample_count, persisted_channel_mute, persisted_channel_volume,
-        resolve_output_loopback_target, should_refresh_meter_snapshot,
+        compute_level_sample_count, node_id_to_channel, persisted_channel_mute,
+        persisted_channel_volume, resolve_output_loopback_target, should_refresh_meter_snapshot,
         should_skip_output_device_reconcile,
     };
 
@@ -1056,5 +1082,43 @@ mod tests {
 
         assert!((persisted_channel_volume(&state, Channel::Chat) - 0.42).abs() < 0.0001);
         assert!(persisted_channel_mute(&state, Channel::Chat));
+    }
+
+    #[test]
+    fn node_id_to_channel_maps_output_sink_to_main() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("main-sink".to_string(), 50);
+        let overrides = BTreeMap::new();
+        assert_eq!(node_id_to_channel(50, &snapshot, &overrides), Some(Channel::Main));
+    }
+
+    #[test]
+    fn node_id_to_channel_maps_input_source_to_mic() {
+        let mut snapshot = Snapshot::default();
+        snapshot.input_ids.insert("main-source".to_string(), 60);
+        let overrides = BTreeMap::new();
+        assert_eq!(node_id_to_channel(60, &snapshot, &overrides), Some(Channel::Mic));
+    }
+
+    #[test]
+    fn node_id_to_channel_maps_stream_via_categorizer() {
+        let mut snapshot = Snapshot::default();
+        snapshot.streams.insert(100, crate::core::pipewire_discovery::StreamInfo {
+            id: 100,
+            meter_target: 0,
+            app_key: "firefox".to_string(),
+            display_name: "Firefox".to_string(),
+            media_role: None,
+        });
+        let overrides = BTreeMap::new();
+        // Firefox classifies as Media
+        assert_eq!(node_id_to_channel(100, &snapshot, &overrides), Some(Channel::Media));
+    }
+
+    #[test]
+    fn node_id_to_channel_returns_none_for_unknown_id() {
+        let snapshot = Snapshot::default();
+        let overrides = BTreeMap::new();
+        assert_eq!(node_id_to_channel(999, &snapshot, &overrides), None);
     }
 }

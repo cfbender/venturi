@@ -35,6 +35,7 @@ pub enum CoreEvent {
     },
     StreamRemoved(u32),
     LevelsUpdate(Vec<(Channel, (f32, f32))>),
+    VolumeChanged(Channel, f32),
     DevicesChanged(Vec<DeviceEntry>),
     Error(String),
 }
