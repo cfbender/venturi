@@ -213,11 +213,8 @@ pub fn run_gtk_app(
 
         let brand = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         brand.add_css_class("brand-badge");
-        let brand_mark = build_brand_logo();
-        brand_mark.add_css_class("brand-mark");
         let brand_name = gtk::Label::new(Some("Venturi"));
         brand_name.add_css_class("brand-name");
-        brand.append(&brand_mark);
         brand.append(&brand_name);
         header.pack_start(&brand);
 
@@ -313,6 +310,7 @@ pub fn run_gtk_app(
 
         window.present();
         let _ = command_tx_outer.send(CoreCommand::SetMeteringEnabled(true));
+        let _ = command_tx_outer.send(CoreCommand::RequestSnapshot);
     });
 
     app.run();
@@ -520,12 +518,6 @@ fn install_mixer_css(palette: Option<&Palette>) {
 fn resolve_dev_data_dir(manifest_dir: &Path) -> Option<PathBuf> {
     let dir = manifest_dir.join("data");
     dir.exists().then_some(dir)
-}
-
-fn build_brand_logo() -> gtk::Image {
-    let image = gtk::Image::from_icon_name("org.venturi.Venturi");
-    image.set_pixel_size(28);
-    image
 }
 
 fn color_or_theme(rgb: Option<(u8, u8, u8)>, fallback: &str, alpha: f32) -> String {

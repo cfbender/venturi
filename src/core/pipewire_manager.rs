@@ -176,6 +176,105 @@ fn node_id_to_channel(
     None
 }
 
+fn upsert_devices(
+    devices: &mut Vec<crate::core::messages::DeviceEntry>,
+    updates: Vec<crate::core::messages::DeviceEntry>,
+) {
+    for update in updates {
+        if let Some(existing) = devices
+            .iter_mut()
+            .find(|entry| entry.kind == update.kind && entry.id == update.id)
+        {
+            *existing = update;
+        } else {
+            devices.push(update);
+        }
+    }
+}
+
+fn prune_removed_node_ids(
+    snapshot: &mut Snapshot,
+    removed_ids: &[u32],
+    event_tx: &Sender<CoreEvent>,
+) {
+    if removed_ids.is_empty() {
+        return;
+    }
+
+    let removed: BTreeSet<u32> = removed_ids.iter().copied().collect();
+
+    for id in &removed {
+        if snapshot.streams.remove(id).is_some() {
+            let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
+        }
+        snapshot.volumes.remove(id);
+    }
+
+    snapshot
+        .output_ids
+        .retain(|_, node_id| !removed.contains(node_id));
+    snapshot
+        .input_ids
+        .retain(|_, node_id| !removed.contains(node_id));
+}
+
+fn apply_structural_monitor_delta(
+    snapshot: &mut Snapshot,
+    partial: Snapshot,
+    removed_ids: &[u32],
+    overrides: &BTreeMap<String, Channel>,
+    event_tx: &Sender<CoreEvent>,
+) {
+    let devices_before = snapshot.devices.clone();
+
+    snapshot.output_ids.extend(partial.output_ids);
+    snapshot.input_ids.extend(partial.input_ids);
+    snapshot
+        .output_meter_targets
+        .extend(partial.output_meter_targets);
+    snapshot.input_meter_targets.extend(partial.input_meter_targets);
+    snapshot.volumes.extend(partial.volumes);
+
+    for (id, stream_info) in partial.streams {
+        if !snapshot.streams.contains_key(&id) {
+            let category = classify_with_priority(
+                overrides,
+                Some(&stream_info.app_key),
+                Some(&stream_info.display_name),
+                stream_info.media_role.as_deref(),
+            );
+            let _ = event_tx.send(CoreEvent::StreamAppeared {
+                id,
+                name: stream_info.display_name.clone(),
+                category,
+            });
+        }
+        snapshot.streams.insert(id, stream_info);
+    }
+
+    upsert_devices(&mut snapshot.devices, partial.devices);
+    prune_removed_node_ids(snapshot, removed_ids, event_tx);
+
+    let output_node_names: BTreeSet<String> = snapshot.output_ids.keys().cloned().collect();
+    let input_node_names: BTreeSet<String> = snapshot.input_ids.keys().cloned().collect();
+
+    snapshot
+        .output_meter_targets
+        .retain(|node_name, _| output_node_names.contains(node_name));
+    snapshot
+        .input_meter_targets
+        .retain(|node_name, _| input_node_names.contains(node_name));
+
+    snapshot.devices.retain(|device| match device.kind {
+        crate::core::messages::DeviceKind::Output => output_node_names.contains(&device.id),
+        crate::core::messages::DeviceKind::Input => input_node_names.contains(&device.id),
+    });
+
+    if snapshot.devices != devices_before {
+        let _ = event_tx.send(CoreEvent::DevicesChanged(snapshot.devices.clone()));
+    }
+}
+
 fn build_channel_level_targets(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
@@ -386,6 +485,9 @@ impl CoreRuntimeState {
                 event_tx
                     .send(CoreEvent::Pong)
                     .map_err(|err| format!("failed to emit Pong event: {err}"))?;
+            }
+            CoreCommand::RequestSnapshot => {
+                self.resend_initial_state(event_tx);
             }
             CoreCommand::SetVolume(channel, volume) => {
                 apply_channel_volume(
@@ -644,6 +746,27 @@ impl CoreRuntimeState {
         self.state_saver.did_flush();
     }
 
+    /// Re-emit the current device/stream/volume state so the GUI can populate
+    /// itself even if the original events were dropped during startup.
+    fn resend_initial_state(&self, event_tx: &crossbeam_channel::Sender<CoreEvent>) {
+        if !self.last_snapshot.devices.is_empty() {
+            let _ = event_tx.send(CoreEvent::DevicesChanged(self.last_snapshot.devices.clone()));
+        }
+        for (id, stream) in &self.last_snapshot.streams {
+            let category = classify_with_priority(
+                &self.overrides,
+                Some(&stream.app_key),
+                Some(&stream.display_name),
+                stream.media_role.as_deref(),
+            );
+            let _ = event_tx.send(CoreEvent::StreamAppeared {
+                id: *id,
+                name: stream.display_name.clone(),
+                category,
+            });
+        }
+    }
+
     fn handle_monitor_event(
         &mut self,
         event: PwMonitorEvent,
@@ -729,10 +852,17 @@ impl CoreRuntimeState {
         objects: &[serde_json::Value],
         event_tx: &crossbeam_channel::Sender<CoreEvent>,
     ) {
+        let mut removed_ids = Vec::new();
+
         for obj in objects {
             let Some(id) = obj.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else {
                 continue;
             };
+
+            let removed = obj.get("info").is_none_or(serde_json::Value::is_null);
+            if removed {
+                removed_ids.push(id);
+            }
 
             // Check for volume changes
             if let Some(new_vol) = extract_volume(obj) {
@@ -769,23 +899,15 @@ impl CoreRuntimeState {
             VIRTUAL_SINKS.as_slice(),
             VIRTUAL_SOURCES.as_slice(),
         ) {
-            // Merge streams: check for appeared/removed
-            for (id, stream_info) in &partial.streams {
-                if !self.last_snapshot.streams.contains_key(id) {
-                    let category = classify_with_priority(
-                        &self.overrides,
-                        Some(&stream_info.app_key),
-                        Some(&stream_info.display_name),
-                        stream_info.media_role.as_deref(),
-                    );
-                    let _ = event_tx.send(CoreEvent::StreamAppeared {
-                        id: *id,
-                        name: stream_info.display_name.clone(),
-                        category,
-                    });
-                }
-                self.last_snapshot.streams.insert(*id, stream_info.clone());
-            }
+            apply_structural_monitor_delta(
+                &mut self.last_snapshot,
+                partial,
+                &removed_ids,
+                &self.overrides,
+                event_tx,
+            );
+        } else {
+            prune_removed_node_ids(&mut self.last_snapshot, &removed_ids, event_tx);
         }
     }
 }
@@ -1111,15 +1233,13 @@ mod tests {
     use std::time::Duration;
 
     use crate::config::schema::State;
-    use crate::core::messages::Channel;
+    use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, DeviceKind};
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
 
-    use crate::core::messages::CoreCommand;
-
     use super::{
-        build_channel_level_targets, coalesce_commands, compute_channel_level_updates_with,
-        compute_level_sample_count, node_id_to_channel, persisted_channel_mute,
-        persisted_channel_volume, resolve_output_loopback_target,
+        apply_structural_monitor_delta, build_channel_level_targets, coalesce_commands,
+        compute_channel_level_updates_with, compute_level_sample_count, node_id_to_channel,
+        persisted_channel_mute, persisted_channel_volume, resolve_output_loopback_target,
         should_skip_output_device_reconcile,
     };
 
@@ -1313,6 +1433,73 @@ mod tests {
         let snapshot = Snapshot::default();
         let overrides = BTreeMap::new();
         assert_eq!(node_id_to_channel(999, &snapshot, &overrides), None);
+    }
+
+    #[test]
+    fn structural_delta_updates_main_and_mic_node_mappings() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Output".to_string(), 225);
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 331);
+
+        let mut partial = Snapshot::default();
+        // Sink got recreated (new id), and old id was reused by mic source.
+        partial.output_ids.insert("Venturi-Output".to_string(), 412);
+        partial
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 225);
+
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let overrides = BTreeMap::new();
+        let no_removed_ids: [u32; 0] = [];
+        apply_structural_monitor_delta(
+            &mut snapshot,
+            partial,
+            no_removed_ids.as_slice(),
+            &overrides,
+            &event_tx,
+        );
+
+        assert_eq!(snapshot.output_ids.get("Venturi-Output"), Some(&412));
+        assert_eq!(snapshot.input_ids.get("Venturi-VirtualMic"), Some(&225));
+        assert_eq!(node_id_to_channel(412, &snapshot, &overrides), Some(Channel::Main));
+        assert_eq!(node_id_to_channel(225, &snapshot, &overrides), Some(Channel::Mic));
+    }
+
+    #[test]
+    fn structural_delta_prunes_removed_device_ids_and_emits_devices_changed() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Output".to_string(), 225);
+        snapshot.devices.push(DeviceEntry {
+            kind: DeviceKind::Output,
+            id: "Venturi-Output".to_string(),
+            label: "Venturi Output".to_string(),
+        });
+
+        let partial = Snapshot::default();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let overrides = BTreeMap::new();
+        let removed_ids = [225_u32];
+        apply_structural_monitor_delta(
+            &mut snapshot,
+            partial,
+            removed_ids.as_slice(),
+            &overrides,
+            &event_tx,
+        );
+
+        assert!(!snapshot.output_ids.contains_key("Venturi-Output"));
+        assert!(snapshot.devices.is_empty());
+
+        let devices_changed = event_rx
+            .try_iter()
+            .find_map(|event| match event {
+                CoreEvent::DevicesChanged(devices) => Some(devices),
+                _ => None,
+            })
+            .expect("DevicesChanged should be emitted after pruning removed output");
+        assert!(devices_changed.is_empty());
     }
 
     #[test]

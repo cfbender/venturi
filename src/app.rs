@@ -1,6 +1,6 @@
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
-use crate::config::persistence::{Paths, load_config};
+use crate::config::persistence::{load_config, Paths};
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_manager::PipeWireManager;
 use crate::gui::window::MainWindow;

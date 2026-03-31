@@ -12,13 +12,20 @@ pub enum Channel {
 pub enum CoreCommand {
     SetVolume(Channel, f32),
     SetMute(Channel, bool),
-    MoveStream { stream_id: u32, channel: Channel },
+    MoveStream {
+        stream_id: u32,
+        channel: Channel,
+    },
     SetOutputDevice(String),
     SetInputDevice(String),
     ToggleWindow,
     PlaySound(u32),
     StopSound(u32),
     Ping,
+    /// Ask the core to re-send the current snapshot (devices, streams, volumes).
+    /// Used after the GUI event loop is running to ensure it receives initial state
+    /// that may have been emitted (and dropped) before the UI was ready.
+    RequestSnapshot,
     SetMeteringEnabled(bool),
     Shutdown,
 }
