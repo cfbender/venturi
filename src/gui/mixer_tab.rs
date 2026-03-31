@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
+use crate::core::messages::{DeviceEntry, DeviceKind};
 use crate::gui::app_chip::{AppChip, ChipStatus, DndPayload, build_chip_widget};
 use crate::gui::channel_strip::{ChannelStrip, build_strip_widget};
 use gtk::prelude::*;
@@ -13,6 +14,8 @@ pub const NO_DEVICES_FOUND: &str = "No devices found";
 pub struct DeviceListModel {
     pub output_devices: Vec<String>,
     pub input_devices: Vec<String>,
+    pub output_labels_by_id: BTreeMap<String, String>,
+    pub input_labels_by_id: BTreeMap<String, String>,
     pub selected_output: Option<String>,
     pub selected_input: Option<String>,
 }
@@ -34,15 +37,22 @@ impl DeviceListModel {
         self.selected_input = Some(selected);
     }
 
-    pub fn set_from_devices_changed(&mut self, devices: &[String]) {
+    pub fn set_from_devices_changed(&mut self, devices: &[DeviceEntry]) {
         let mut outputs = Vec::new();
         let mut inputs = Vec::new();
+        let mut output_labels_by_id = BTreeMap::new();
+        let mut input_labels_by_id = BTreeMap::new();
 
         for device in devices {
-            if let Some(rest) = device.strip_prefix("out:") {
-                outputs.push(rest.to_string());
-            } else if let Some(rest) = device.strip_prefix("in:") {
-                inputs.push(rest.to_string());
+            match device.kind {
+                DeviceKind::Output => {
+                    outputs.push(device.id.clone());
+                    output_labels_by_id.insert(device.id.clone(), device.label.clone());
+                }
+                DeviceKind::Input => {
+                    inputs.push(device.id.clone());
+                    input_labels_by_id.insert(device.id.clone(), device.label.clone());
+                }
             }
         }
 
@@ -59,11 +69,15 @@ impl DeviceListModel {
 
         self.output_devices = outputs;
         self.input_devices = inputs;
+        self.output_labels_by_id = output_labels_by_id;
+        self.input_labels_by_id = input_labels_by_id;
     }
 
     pub fn reset_to_default_on_disconnect(&mut self) {
         self.output_devices = vec!["Default".to_string()];
         self.input_devices = vec!["Default".to_string()];
+        self.output_labels_by_id = BTreeMap::new();
+        self.input_labels_by_id = BTreeMap::new();
         self.selected_output = Some("Default".to_string());
         self.selected_input = Some("Default".to_string());
     }
@@ -107,6 +121,8 @@ impl MixerTab {
             devices: DeviceListModel {
                 output_devices: vec!["Default".to_string()],
                 input_devices: vec!["Default".to_string()],
+                output_labels_by_id: BTreeMap::new(),
+                input_labels_by_id: BTreeMap::new(),
                 selected_output: Some("Default".to_string()),
                 selected_input: Some("Default".to_string()),
             },
@@ -207,10 +223,13 @@ pub fn build_mixer_widget(
     {
         let state = model.lock().expect("mixer lock");
         for d in &state.devices.output_devices {
-            out_model.append(&friendly_device_label(d));
+            out_model.append(&display_device_label(
+                &state.devices.output_labels_by_id,
+                d,
+            ));
         }
         for d in &state.devices.input_devices {
-            in_model.append(&friendly_device_label(d));
+            in_model.append(&display_device_label(&state.devices.input_labels_by_id, d));
         }
         if state.devices.output_devices.is_empty() {
             out_model.append(NO_DEVICES_FOUND);
@@ -433,6 +452,8 @@ pub fn build_mixer_widget(
                 .selected_input
                 .as_ref()
                 .and_then(|sel| state.devices.input_devices.iter().position(|d| d == sel));
+            let out_labels_by_id = state.devices.output_labels_by_id.clone();
+            let in_labels_by_id = state.devices.input_labels_by_id.clone();
             let chips_snapshot = state.chips.clone();
             drop(state);
 
@@ -444,7 +465,7 @@ pub fn build_mixer_widget(
             if out_devices != last_out_devices {
                 out_model.splice(0, out_model.n_items(), &EMPTY_STRS);
                 for dev in &out_devices {
-                    out_model.append(&friendly_device_label(dev));
+                    out_model.append(&display_device_label(&out_labels_by_id, dev));
                 }
                 last_out_devices = out_devices;
             }
@@ -452,7 +473,7 @@ pub fn build_mixer_widget(
             if in_devices != last_in_devices {
                 in_model.splice(0, in_model.n_items(), &EMPTY_STRS);
                 for dev in &in_devices {
-                    in_model.append(&friendly_device_label(dev));
+                    in_model.append(&display_device_label(&in_labels_by_id, dev));
                 }
                 last_in_devices = in_devices;
             }
@@ -506,4 +527,49 @@ fn friendly_device_label(raw: &str) -> String {
         .replace(".analog-stereo", "")
         .replace(".mono-fallback", "")
         .replace("_", " ")
+}
+
+fn display_device_label(labels_by_id: &BTreeMap<String, String>, raw_id: &str) -> String {
+    labels_by_id
+        .get(raw_id)
+        .cloned()
+        .unwrap_or_else(|| friendly_device_label(raw_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceListModel;
+    use crate::core::messages::{DeviceEntry, DeviceKind};
+
+    #[test]
+    fn retains_persisted_selected_ids_when_devices_refresh() {
+        let mut model = DeviceListModel {
+            selected_output: Some("alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1".to_string()),
+            selected_input: Some("alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback".to_string()),
+            ..DeviceListModel::default()
+        };
+        let devices = vec![
+            DeviceEntry {
+                kind: DeviceKind::Output,
+                id: "alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1".to_string(),
+                label: "Navi 48 HDMI/DP Audio Controller Digital Stereo (HDMI 2)".to_string(),
+            },
+            DeviceEntry {
+                kind: DeviceKind::Input,
+                id: "alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback".to_string(),
+                label: "G735 Gaming Headset Mono".to_string(),
+            },
+        ];
+
+        model.set_from_devices_changed(devices.as_slice());
+
+        assert_eq!(
+            model.selected_output.as_deref(),
+            Some("alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1")
+        );
+        assert_eq!(
+            model.selected_input.as_deref(),
+            Some("alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback")
+        );
+    }
 }

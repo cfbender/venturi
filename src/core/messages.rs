@@ -34,6 +34,19 @@ pub enum CoreEvent {
     },
     StreamRemoved(u32),
     LevelsUpdate(Vec<(Channel, (f32, f32))>),
-    DevicesChanged(Vec<String>),
+    DevicesChanged(Vec<DeviceEntry>),
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeviceKind {
+    Output,
+    Input,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry {
+    pub kind: DeviceKind,
+    pub id: String,
+    pub label: String,
 }

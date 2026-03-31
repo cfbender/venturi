@@ -10,7 +10,7 @@ use crate::core::hotkeys::{
 };
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_backend::{
-    current_default_source_name, ensure_virtual_devices, load_monitor_loopback_module,
+    current_default_source_name, ensure_virtual_devices, reconcile_monitor_loopback_modules,
     rewire_virtual_mic_source, run_pw_link, run_pw_metadata, unload_pactl_module,
 };
 use crate::core::pipewire_channel_control::{
@@ -314,25 +314,21 @@ impl CoreRuntimeState {
             return Ok(());
         }
 
-        if let Some(prev_module) = self.output_loopback_module.take()
-            && let Err(err) = unload_pactl_module(&prev_module)
-        {
-            return Err(format!(
-                "failed to unload monitor loopback module {prev_module}: {err}"
-            ));
-        }
-        if device != fallback_to_default_device() {
-            match load_monitor_loopback_module(VENTURI_MAIN_MONITOR, device) {
-                Ok(module_id) => {
-                    self.output_loopback_module = Some(module_id);
-                }
-                Err(err) => {
-                    return Err(format!(
-                        "failed to route Venturi main mix to {device}: {err}"
-                    ));
-                }
-            }
-        }
+        let desired_output = if device != fallback_to_default_device() {
+            Some(device)
+        } else {
+            None
+        };
+        self.output_loopback_module =
+            reconcile_monitor_loopback_modules(VENTURI_MAIN_MONITOR, desired_output).map_err(
+                |err| {
+                    if let Some(target) = desired_output {
+                        format!("failed to route Venturi main mix to {target}: {err}")
+                    } else {
+                        format!("failed to clear Venturi main mix loopbacks: {err}")
+                    }
+                },
+            )?;
 
         self.selected_output = Some(device.to_string());
         self.runtime_config.audio.output_device = config_device_value(device);

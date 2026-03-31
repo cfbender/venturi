@@ -1,6 +1,8 @@
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::process::Command;
+
+use crate::core::messages::{DeviceEntry, DeviceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamInfo {
@@ -12,7 +14,7 @@ pub(crate) struct StreamInfo {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
-    pub devices: Vec<String>,
+    pub devices: Vec<DeviceEntry>,
     pub output_ids: BTreeMap<String, u32>,
     pub input_ids: BTreeMap<String, u32>,
     pub streams: BTreeMap<u32, StreamInfo>,
@@ -42,8 +44,8 @@ pub(crate) fn parse_pw_dump(
         .as_array()
         .ok_or_else(|| "pw-dump root is not array".to_string())?;
 
-    let mut outputs = BTreeSet::new();
-    let mut inputs = BTreeSet::new();
+    let mut outputs = BTreeMap::new();
+    let mut inputs = BTreeMap::new();
     let mut output_ids = BTreeMap::new();
     let mut input_ids = BTreeMap::new();
     let mut streams = BTreeMap::new();
@@ -70,6 +72,10 @@ pub(crate) fn parse_pw_dump(
         let node_name = props
             .get("node.name")
             .and_then(Value::as_str)
+            .unwrap_or_default();
+        let stream_node_name = props
+            .get("node.name")
+            .and_then(Value::as_str)
             .or_else(|| props.get("node.nick").and_then(Value::as_str))
             .or_else(|| props.get("node.description").and_then(Value::as_str))
             .unwrap_or_default();
@@ -79,7 +85,14 @@ pub(crate) fn parse_pw_dump(
                 continue;
             }
             if !hidden_outputs.contains(&node_name) {
-                outputs.insert(format!("out:{node_name}"));
+                outputs.insert(
+                    node_name.to_string(),
+                    DeviceEntry {
+                        kind: DeviceKind::Output,
+                        id: node_name.to_string(),
+                        label: preferred_device_label(props, node_name),
+                    },
+                );
             }
             if let Some(node_id) = id {
                 output_ids.insert(node_name.to_string(), node_id);
@@ -99,7 +112,14 @@ pub(crate) fn parse_pw_dump(
             if hidden_inputs.contains(&node_name) {
                 continue;
             }
-            inputs.insert(format!("in:{node_name}"));
+            inputs.insert(
+                node_name.to_string(),
+                DeviceEntry {
+                    kind: DeviceKind::Input,
+                    id: node_name.to_string(),
+                    label: preferred_device_label(props, node_name),
+                },
+            );
         }
 
         if media_class == "Stream/Output/Audio" || media_class == "Audio/Stream/Output" {
@@ -121,7 +141,8 @@ pub(crate) fn parse_pw_dump(
             if is_loopback_stream(app_name, binary, media_name, node_name) {
                 continue;
             }
-            let display_name = preferred_display_name(app_name, binary, media_name, node_name);
+            let display_name =
+                preferred_display_name(app_name, binary, media_name, stream_node_name);
             let role = props
                 .get("media.role")
                 .and_then(Value::as_str)
@@ -144,8 +165,8 @@ pub(crate) fn parse_pw_dump(
     }
 
     let mut devices = Vec::with_capacity(outputs.len() + inputs.len());
-    devices.extend(outputs);
-    devices.extend(inputs);
+    devices.extend(outputs.into_values());
+    devices.extend(inputs.into_values());
 
     Ok(Snapshot {
         devices,
@@ -225,9 +246,31 @@ fn prettify_node_name(node_name: &str) -> String {
         .replace('_', " ")
 }
 
+fn preferred_device_label(props: &serde_json::Map<String, Value>, node_name: &str) -> String {
+    props
+        .get("node.description")
+        .and_then(Value::as_str)
+        .filter(|label| !label.trim().is_empty())
+        .or_else(|| {
+            props
+                .get("device.description")
+                .and_then(Value::as_str)
+                .filter(|label| !label.trim().is_empty())
+        })
+        .or_else(|| {
+            props
+                .get("node.nick")
+                .and_then(Value::as_str)
+                .filter(|label| !label.trim().is_empty())
+        })
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| prettify_node_name(node_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_pw_dump;
+    use crate::core::messages::DeviceKind;
 
     #[test]
     fn parse_pw_dump_detects_sink_source_variants() {
@@ -239,13 +282,14 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
-        assert!(snapshot.devices.iter().any(|d| d == "out:alsa_output.pci"));
-        assert!(
-            snapshot
-                .devices
-                .iter()
-                .any(|d| d == "in:venturi_virtual_mic")
-        );
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.pci"));
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Input && d.id == "venturi_virtual_mic"));
     }
 
     #[test]
@@ -259,13 +303,11 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), hidden.as_slice()).expect("parse snapshot");
-        assert!(!snapshot.devices.iter().any(|d| d.contains(".monitor")));
-        assert!(
-            !snapshot
-                .devices
-                .iter()
-                .any(|d| d == "in:Venturi-VirtualMic")
-        );
+        assert!(!snapshot.devices.iter().any(|d| d.id.contains(".monitor")));
+        assert!(!snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Input && d.id == "Venturi-VirtualMic"));
         assert!(snapshot.input_ids.contains_key("Venturi-VirtualMic"));
     }
 
@@ -313,8 +355,42 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
-        assert!(snapshot.devices.iter().any(|d| d == "out:alsa_output.real"));
-        assert!(!snapshot.devices.iter().any(|d| d.contains("loopback")));
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.real"));
+        assert!(!snapshot.devices.iter().any(|d| d.id.contains("loopback")));
         assert!(snapshot.streams.is_empty());
+    }
+
+    #[test]
+    fn parse_pw_dump_prefers_descriptive_device_labels() {
+        let empty: [&'static str; 0] = [];
+        let raw = r#"[
+          {
+            "id": 91,
+            "info": {
+              "props": {
+                "media.class": "Audio/Sink",
+                "node.name": "alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1",
+                "node.description": "Navi 48 HDMI/DP Audio Controller Digital Stereo (HDMI 2)",
+                "device.description": "Fallback Device Label"
+              }
+            }
+          }
+        ]"#;
+
+        let snapshot =
+            parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
+        let output = snapshot
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Output)
+            .expect("output device exists");
+        assert_eq!(output.id, "alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1");
+        assert_eq!(
+            output.label,
+            "Navi 48 HDMI/DP Audio Controller Digital Stereo (HDMI 2)"
+        );
     }
 }

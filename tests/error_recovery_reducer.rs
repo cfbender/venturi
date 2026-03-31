@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use venturi::app::pump_event;
-use venturi::core::messages::{Channel, CoreEvent};
+use venturi::core::messages::{Channel, CoreEvent, DeviceEntry, DeviceKind};
 use venturi::core::pipewire_manager::{fallback_to_default_device, reconnect_delay};
 use venturi::gui::mixer_tab::NO_DEVICES_FOUND;
 use venturi::gui::window::MainWindow;
@@ -14,23 +14,33 @@ fn reconnect_policy_is_two_seconds() {
 #[test]
 fn device_disconnect_resets_to_default_and_toasts() {
     let mut window = MainWindow::new("~/.config/venturi".to_string(), "v0.1".to_string());
+    let devices = vec![
+        DeviceEntry {
+            kind: DeviceKind::Output,
+            id: "Headphones".to_string(),
+            label: "Headphones".to_string(),
+        },
+        DeviceEntry {
+            kind: DeviceKind::Input,
+            id: "Mic".to_string(),
+            label: "Mic".to_string(),
+        },
+    ];
     window
         .mixer
         .devices
-        .set_from_devices_changed(&["out:Headphones".to_string(), "in:Mic".to_string()]);
+        .set_from_devices_changed(devices.as_slice());
 
     window.mixer.on_device_disconnect();
 
     assert_eq!(window.mixer.devices.output_label(), "Default");
     assert_eq!(window.mixer.devices.input_label(), "Default");
     assert_eq!(fallback_to_default_device(), "Default");
-    assert!(
-        window
-            .mixer
-            .toast
-            .as_deref()
-            .is_some_and(|m| m.contains("Reset to Default"))
-    );
+    assert!(window
+        .mixer
+        .toast
+        .as_deref()
+        .is_some_and(|m| m.contains("Reset to Default")));
 }
 
 #[test]

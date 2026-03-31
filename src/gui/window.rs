@@ -68,6 +68,16 @@ impl MainWindow {
     }
 }
 
+fn ui_selected_device_from_config(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    if raw.eq_ignore_ascii_case("default") {
+        return Some("Default".to_string());
+    }
+    Some(raw.to_string())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GtkGuiLauncher;
 
@@ -112,6 +122,10 @@ pub fn run_gtk_app(
             state.settings.toggle_window_hotkey = config.hotkeys.toggle_window.clone();
             state.settings.noise_gate_enabled = config.mic_processing.noise_gate_enabled;
             state.settings.noise_gate_threshold_db = config.mic_processing.noise_gate_threshold;
+            state.mixer.devices.selected_output =
+                ui_selected_device_from_config(&config.audio.output_device);
+            state.mixer.devices.selected_input =
+                ui_selected_device_from_config(&config.audio.input_device);
         }
 
         let mixer_model = Arc::new(Mutex::new(vm.borrow().mixer.clone()));
@@ -420,7 +434,7 @@ fn parse_hex_color(raw: &str) -> Option<(u8, u8, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hex_color;
+    use super::{parse_hex_color, ui_selected_device_from_config};
 
     #[test]
     fn parses_six_digit_hex_colors() {
@@ -436,5 +450,22 @@ mod tests {
     fn rejects_invalid_hex_colors() {
         assert_eq!(parse_hex_color("not-a-color"), None);
         assert_eq!(parse_hex_color("#abcd"), None);
+    }
+
+    #[test]
+    fn maps_default_device_to_ui_selection() {
+        assert_eq!(
+            ui_selected_device_from_config("default"),
+            Some("Default".to_string())
+        );
+        assert_eq!(
+            ui_selected_device_from_config("DEFAULT"),
+            Some("Default".to_string())
+        );
+        assert_eq!(
+            ui_selected_device_from_config("alsa_output.foo"),
+            Some("alsa_output.foo".to_string())
+        );
+        assert_eq!(ui_selected_device_from_config(""), None);
     }
 }
