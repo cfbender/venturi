@@ -13,7 +13,7 @@ pub(crate) struct StreamInfo {
     pub media_role: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Snapshot {
     pub devices: Vec<DeviceEntry>,
     pub output_ids: BTreeMap<String, u32>,
@@ -21,6 +21,7 @@ pub(crate) struct Snapshot {
     pub output_meter_targets: BTreeMap<String, u32>,
     pub input_meter_targets: BTreeMap<String, u32>,
     pub streams: BTreeMap<u32, StreamInfo>,
+    pub volumes: BTreeMap<u32, f32>,
 }
 
 pub(crate) fn poll_snapshot(
@@ -35,6 +36,24 @@ pub(crate) fn poll_snapshot(
     }
     let raw = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
     parse_pw_dump(&raw, hidden_outputs, hidden_inputs)
+}
+
+/// Extract the maximum linear volume from a PipeWire node's channelVolumes property.
+///
+/// Looks at `info.params.Props[].channelVolumes` and returns the max across channels.
+/// Returns `None` if the node has no volume information.
+pub(crate) fn extract_volume(item: &serde_json::Value) -> Option<f32> {
+    let props_array = item.get("info")?.get("params")?.get("Props")?.as_array()?;
+    for props in props_array {
+        if let Some(vols) = props.get("channelVolumes").and_then(|v| v.as_array()) {
+            let max_vol = vols
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .fold(0.0_f64, f64::max);
+            return Some(max_vol as f32);
+        }
+    }
+    None
 }
 
 pub(crate) fn parse_pw_dump(
@@ -182,6 +201,16 @@ pub(crate) fn parse_pw_dump(
     devices.extend(outputs.into_values());
     devices.extend(inputs.into_values());
 
+    // Extract volumes for all nodes
+    let mut volumes = BTreeMap::new();
+    for item in arr {
+        if let Some(id) = item.get("id").and_then(|v| v.as_u64()) {
+            if let Some(vol) = extract_volume(item) {
+                volumes.insert(id as u32, vol);
+            }
+        }
+    }
+
     Ok(Snapshot {
         devices,
         output_ids,
@@ -189,6 +218,7 @@ pub(crate) fn parse_pw_dump(
         output_meter_targets,
         input_meter_targets,
         streams,
+        volumes,
     })
 }
 
@@ -293,7 +323,7 @@ fn preferred_device_label(props: &serde_json::Map<String, Value>, node_name: &st
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pw_dump;
+    use super::{extract_volume, parse_pw_dump};
     use crate::core::messages::DeviceKind;
 
     #[test]
@@ -455,5 +485,64 @@ mod tests {
         );
         let stream = snapshot.streams.get(&197).expect("stream exists");
         assert_eq!(stream.meter_target, 42330);
+    }
+
+    #[test]
+    fn extract_volume_from_node_with_channel_volumes() {
+        let node: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": {
+                "params": {
+                    "Props": [
+                        { "channelVolumes": [0.7, 0.7] }
+                    ]
+                }
+            }
+        });
+        assert_eq!(extract_volume(&node), Some(0.7));
+    }
+
+    #[test]
+    fn extract_volume_picks_max_channel() {
+        let node: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": {
+                "params": {
+                    "Props": [
+                        { "channelVolumes": [0.3, 0.9] }
+                    ]
+                }
+            }
+        });
+        // Max of channels
+        let vol = extract_volume(&node).unwrap();
+        assert!((vol - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn extract_volume_returns_none_when_no_params() {
+        let node: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": {
+                "props": { "node.name": "foo" }
+            }
+        });
+        assert_eq!(extract_volume(&node), None);
+    }
+
+    #[test]
+    fn extract_volume_returns_none_for_empty_channel_volumes() {
+        let node: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": {
+                "params": {
+                    "Props": [
+                        { "channelVolumes": [] }
+                    ]
+                }
+            }
+        });
+        // Empty array → max is 0.0 (or we could return None). Per spec, fold starts at 0.0.
+        assert_eq!(extract_volume(&node), Some(0.0));
     }
 }
