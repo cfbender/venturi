@@ -10,9 +10,9 @@ use adw::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::GuiLauncher;
-use crate::config::persistence::{load_config, Paths};
+use crate::config::persistence::{load_config, load_state, Paths};
 use crate::config::schema::Palette;
-use crate::core::messages::{CoreCommand, CoreEvent};
+use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::gui::mixer_tab::{build_mixer_widget, MixerTab};
 use crate::gui::settings_tab::{build_settings_widget, SettingsTab};
 use crate::gui::soundboard_tab::{build_soundboard_widget, SoundboardTab};
@@ -82,6 +82,52 @@ fn should_metering_be_enabled(window_visible: bool, _window_active: bool) -> boo
     window_visible
 }
 
+fn apply_persisted_strip_values(mixer: &mut MixerTab, persisted: &crate::config::schema::State) {
+    set_strip_value(
+        mixer,
+        Channel::Main,
+        persisted.volumes.main,
+        persisted.muted.main,
+    );
+    set_strip_value(
+        mixer,
+        Channel::Game,
+        persisted.volumes.game,
+        persisted.muted.game,
+    );
+    set_strip_value(
+        mixer,
+        Channel::Media,
+        persisted.volumes.media,
+        persisted.muted.media,
+    );
+    set_strip_value(
+        mixer,
+        Channel::Chat,
+        persisted.volumes.chat,
+        persisted.muted.chat,
+    );
+    set_strip_value(
+        mixer,
+        Channel::Aux,
+        persisted.volumes.aux,
+        persisted.muted.aux,
+    );
+    set_strip_value(
+        mixer,
+        Channel::Mic,
+        persisted.volumes.mic,
+        persisted.muted.mic,
+    );
+}
+
+fn set_strip_value(mixer: &mut MixerTab, channel: Channel, volume: f32, muted: bool) {
+    if let Some(strip) = mixer.strips.get_mut(&channel) {
+        strip.volume_linear = volume.clamp(0.0, 1.0);
+        strip.muted = muted;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GtkGuiLauncher;
 
@@ -110,6 +156,7 @@ pub fn run_gtk_app(
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
         let paths = Paths::resolve();
         let config = load_config(&paths);
+        let persisted_state = load_state(&paths);
         install_mixer_css(config.palette.as_ref());
 
         let config_path = paths.config_file().display().to_string();
@@ -130,6 +177,7 @@ pub fn run_gtk_app(
                 ui_selected_device_from_config(&config.audio.output_device);
             state.mixer.devices.selected_input =
                 ui_selected_device_from_config(&config.audio.input_device);
+            apply_persisted_strip_values(&mut state.mixer, &persisted_state);
         }
 
         let mixer_model = Arc::new(Mutex::new(vm.borrow().mixer.clone()));
@@ -518,6 +566,11 @@ fn parse_hex_color(raw: &str) -> Option<(u8, u8, u8)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::schema::State;
+    use crate::core::messages::Channel;
+    use crate::gui::channel_strip::ChannelStrip;
+    use crate::gui::mixer_tab::MixerTab;
+
     use super::{parse_hex_color, should_metering_be_enabled, ui_selected_device_from_config};
 
     #[test]
@@ -559,5 +612,21 @@ mod tests {
         assert!(should_metering_be_enabled(true, false));
         assert!(!should_metering_be_enabled(false, true));
         assert!(!should_metering_be_enabled(false, false));
+    }
+
+    #[test]
+    fn applies_persisted_strip_values_to_mixer() {
+        let mut mixer = MixerTab::new();
+        let persisted = State::default();
+
+        super::apply_persisted_strip_values(&mut mixer, &persisted);
+
+        let main = mixer
+            .strips
+            .get(&Channel::Main)
+            .cloned()
+            .unwrap_or_else(|| ChannelStrip::new(Channel::Main, "🔊", "Main"));
+        assert!((main.volume_linear - persisted.volumes.main).abs() < 0.0001);
+        assert_eq!(main.muted, persisted.muted.main);
     }
 }

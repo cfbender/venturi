@@ -10,6 +10,7 @@ const TRACK_TOP_INSET_PX: i32 = 8;
 const METER_TOP_INSET_PX: i32 = 12;
 const TRACK_BOTTOM_INSET_PX: i32 = 0;
 const SLIDER_BOTTOM_OFFSET_ADJUST_PX: i32 = -10;
+const VOLUME_SEND_THROTTLE: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone)]
 pub struct ChannelStrip {
@@ -118,7 +119,7 @@ pub fn build_strip_widget_with_meter(
             let cmd = state.set_volume_command(scale.value() as f32);
             db_label.set_text(&state.volume_text());
 
-            if now.duration_since(*last_sent_at.borrow()) >= Duration::from_millis(120) {
+            if should_emit_volume_update(*last_sent_at.borrow(), now, false) {
                 let _ = tx.send(cmd);
                 *last_sent_at.borrow_mut() = now;
             }
@@ -127,7 +128,25 @@ pub fn build_strip_widget_with_meter(
 
     {
         let state = state.clone();
-        let tx = command_tx;
+        let tx = command_tx.clone();
+        let db_label = db_label.clone();
+        let last_sent_at = last_sent_at.clone();
+        let release = gtk::GestureClick::new();
+        release.connect_released(move |_, _, _, _| {
+            let state = state.borrow();
+            let now = Instant::now();
+            if should_emit_volume_update(*last_sent_at.borrow(), now, true) {
+                let _ = tx.send(CoreCommand::SetVolume(state.channel, state.volume_linear));
+                *last_sent_at.borrow_mut() = now;
+            }
+            db_label.set_text(&state.volume_text());
+        });
+        slider.add_controller(release);
+    }
+
+    {
+        let state = state.clone();
+        let tx = command_tx.clone();
         let db_label = db_label.clone();
         mute.connect_toggled(move |btn| {
             let mut state = state.borrow_mut();
@@ -150,6 +169,10 @@ pub fn build_strip_widget_with_meter(
     (root, meter)
 }
 
+fn should_emit_volume_update(last_sent_at: Instant, now: Instant, is_release: bool) -> bool {
+    is_release || now.duration_since(last_sent_at) >= VOLUME_SEND_THROTTLE
+}
+
 fn meter_css_class_for(channel: Channel) -> &'static str {
     match channel {
         Channel::Main => "meter-main",
@@ -164,6 +187,7 @@ fn meter_css_class_for(channel: Channel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::core::messages::Channel;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn maps_channel_to_meter_css_class() {
@@ -173,5 +197,14 @@ mod tests {
         assert_eq!(super::meter_css_class_for(Channel::Media), "meter-media");
         assert_eq!(super::meter_css_class_for(Channel::Chat), "meter-chat");
         assert_eq!(super::meter_css_class_for(Channel::Aux), "meter-aux");
+    }
+
+    #[test]
+    fn emits_volume_update_on_release_even_within_throttle_window() {
+        let now = Instant::now();
+        let just_sent = now - Duration::from_millis(20);
+
+        assert!(!super::should_emit_volume_update(just_sent, now, false));
+        assert!(super::should_emit_volume_update(just_sent, now, true));
     }
 }

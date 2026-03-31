@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 
 use crate::categorizer::learning::{deserialize_overrides, serialize_overrides};
 use crate::categorizer::rules::classify_with_priority;
-use crate::config::persistence::{Paths, ensure_dirs, load_config, save_config};
+use crate::config::persistence::{
+    DebouncedSaver, Paths, ensure_dirs, load_config, load_state, save_config, save_state,
+};
 use crate::core::hotkeys::{
     HotkeyAdapter, HotkeyBindings, HotkeyState, build_adapter, collect_adapter_commands,
 };
-use crate::core::messages::{CoreCommand, CoreEvent};
+use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::pipewire_backend::{
     current_default_sink_name, current_default_source_name, ensure_virtual_devices,
     reconcile_monitor_loopback_modules, rewire_virtual_mic_source, run_pw_link, run_pw_metadata,
@@ -91,6 +93,59 @@ fn should_skip_output_device_reconcile(
     force: bool,
 ) -> bool {
     !force && current_selection == Some(requested_device)
+}
+
+fn persisted_channel_volume(state: &crate::config::schema::State, channel: Channel) -> f32 {
+    match channel {
+        Channel::Main => state.volumes.main,
+        Channel::Game => state.volumes.game,
+        Channel::Media => state.volumes.media,
+        Channel::Chat => state.volumes.chat,
+        Channel::Aux => state.volumes.aux,
+        Channel::Mic => state.volumes.mic,
+    }
+}
+
+fn persisted_channel_mute(state: &crate::config::schema::State, channel: Channel) -> bool {
+    match channel {
+        Channel::Main => state.muted.main,
+        Channel::Game => state.muted.game,
+        Channel::Media => state.muted.media,
+        Channel::Chat => state.muted.chat,
+        Channel::Aux => state.muted.aux,
+        Channel::Mic => state.muted.mic,
+    }
+}
+
+fn set_persisted_channel_volume(
+    state: &mut crate::config::schema::State,
+    channel: Channel,
+    volume: f32,
+) {
+    let normalized = volume.clamp(0.0, 1.0);
+    match channel {
+        Channel::Main => state.volumes.main = normalized,
+        Channel::Game => state.volumes.game = normalized,
+        Channel::Media => state.volumes.media = normalized,
+        Channel::Chat => state.volumes.chat = normalized,
+        Channel::Aux => state.volumes.aux = normalized,
+        Channel::Mic => state.volumes.mic = normalized,
+    }
+}
+
+fn set_persisted_channel_mute(
+    state: &mut crate::config::schema::State,
+    channel: Channel,
+    muted: bool,
+) {
+    match channel {
+        Channel::Main => state.muted.main = muted,
+        Channel::Game => state.muted.game = muted,
+        Channel::Media => state.muted.media = muted,
+        Channel::Chat => state.muted.chat = muted,
+        Channel::Aux => state.muted.aux = muted,
+        Channel::Mic => state.muted.mic = muted,
+    }
 }
 
 fn build_channel_level_targets(
@@ -177,6 +232,8 @@ struct CoreRuntimeState {
     last_source_volume_by_target: BTreeMap<String, f32>,
     last_sink_mute_by_target: BTreeMap<String, bool>,
     last_source_mute_by_target: BTreeMap<String, bool>,
+    runtime_state: crate::config::schema::State,
+    state_saver: DebouncedSaver,
     meter_enabled: Arc<AtomicBool>,
 }
 
@@ -192,6 +249,7 @@ impl CoreRuntimeState {
         }
 
         let runtime_config = load_config(&paths);
+        let runtime_state = load_state(&paths);
         let hotkey_bindings = HotkeyBindings::from(&runtime_config.hotkeys);
         let mut hotkey_adapter =
             build_adapter(std::env::var("XDG_SESSION_TYPE").ok().as_deref(), false);
@@ -236,6 +294,8 @@ impl CoreRuntimeState {
             last_source_volume_by_target: BTreeMap::new(),
             last_sink_mute_by_target: BTreeMap::new(),
             last_source_mute_by_target: BTreeMap::new(),
+            runtime_state,
+            state_saver: DebouncedSaver::new(),
             meter_enabled,
         };
 
@@ -298,6 +358,8 @@ impl CoreRuntimeState {
                     &mut self.last_sink_volume_by_target,
                     &mut self.last_source_volume_by_target,
                 );
+                set_persisted_channel_volume(&mut self.runtime_state, channel, volume);
+                self.state_saver.mark_dirty(Instant::now());
             }
             CoreCommand::SetMute(channel, muted) => {
                 self.apply_mute(channel, muted);
@@ -365,6 +427,9 @@ impl CoreRuntimeState {
             &mut self.last_sink_mute_by_target,
             &mut self.last_source_mute_by_target,
         );
+
+        set_persisted_channel_mute(&mut self.runtime_state, channel, muted);
+        self.state_saver.mark_dirty(Instant::now());
     }
 
     fn handle_move_stream(
@@ -396,7 +461,43 @@ impl CoreRuntimeState {
             }
         };
 
-        route_result.map_err(|err| format!("failed to move stream {stream_id}: {err}"))
+        route_result.map_err(|err| format!("failed to move stream {stream_id}: {err}"))?;
+
+        if matches!(channel, Channel::Game | Channel::Media | Channel::Chat | Channel::Aux) {
+            self.apply_persisted_channel_mix(channel);
+        }
+
+        Ok(())
+    }
+
+    fn apply_persisted_channel_mix(&mut self, channel: Channel) {
+        let volume = persisted_channel_volume(&self.runtime_state, channel);
+        apply_channel_volume(
+            channel,
+            volume,
+            &self.last_snapshot,
+            &self.overrides,
+            ChannelControlTargets {
+                virtual_input_source_name: VIRTUAL_SOURCES[0],
+                main_output_sink_name: VENTURI_MAIN_OUTPUT,
+            },
+            &mut self.last_sink_volume_by_target,
+            &mut self.last_source_volume_by_target,
+        );
+
+        let muted = persisted_channel_mute(&self.runtime_state, channel);
+        apply_channel_mute(
+            channel,
+            muted,
+            &self.last_snapshot,
+            &self.overrides,
+            ChannelControlTargets {
+                virtual_input_source_name: VIRTUAL_SOURCES[0],
+                main_output_sink_name: VENTURI_MAIN_OUTPUT,
+            },
+            &mut self.last_sink_mute_by_target,
+            &mut self.last_source_mute_by_target,
+        );
     }
 
     fn handle_set_output_device(&mut self, device: &str) -> Result<(), String> {
@@ -469,6 +570,28 @@ impl CoreRuntimeState {
         save_config(&self.paths, &self.runtime_config)
             .map_err(|err| format!("failed to persist input device selection: {err}"))?;
         Ok(())
+    }
+
+    fn flush_persisted_state_if_due(&mut self, event_tx: &Sender<CoreEvent>) {
+        if self.state_saver.should_flush(Instant::now()) {
+            if let Err(err) = save_state(&self.paths, &self.runtime_state) {
+                let _ = event_tx.send(CoreEvent::Error(format!(
+                    "failed to persist mixer state: {err}"
+                )));
+                return;
+            }
+            self.state_saver.did_flush();
+        }
+    }
+
+    fn flush_persisted_state_now(&mut self, event_tx: &Sender<CoreEvent>) {
+        if let Err(err) = save_state(&self.paths, &self.runtime_state) {
+            let _ = event_tx.send(CoreEvent::Error(format!(
+                "failed to persist mixer state: {err}"
+            )));
+            return;
+        }
+        self.state_saver.did_flush();
     }
 
     fn refresh_snapshot(&mut self, event_tx: &Sender<CoreEvent>) {
@@ -699,7 +822,10 @@ impl PipeWireManager {
                 match command_rx.recv_timeout(LOOP_TICK_INTERVAL) {
                     Ok(command) => match state.handle_core_command(command, &event_tx) {
                         Ok(CommandLoopControl::Continue) => {}
-                        Ok(CommandLoopControl::Shutdown) => break,
+                        Ok(CommandLoopControl::Shutdown) => {
+                            state.flush_persisted_state_now(&event_tx);
+                            break;
+                        }
                         Err(err) => {
                             let _ = event_tx
                                 .send(CoreEvent::Error(format!("command handling failed: {err}")));
@@ -710,6 +836,7 @@ impl PipeWireManager {
                 }
 
                 state.handle_hotkey_tick(&event_tx);
+                state.flush_persisted_state_if_due(&event_tx);
 
                 if last_snapshot_poll.elapsed() >= POLL_INTERVAL {
                     state.refresh_snapshot(&event_tx);
@@ -747,12 +874,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    use crate::config::schema::State;
     use crate::core::messages::Channel;
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
 
     use super::{
         build_channel_level_targets, compute_channel_level_updates_with,
-        compute_level_sample_count,
+        compute_level_sample_count, persisted_channel_mute, persisted_channel_volume,
         resolve_output_loopback_target, should_refresh_meter_snapshot,
         should_skip_output_device_reconcile,
     };
@@ -891,6 +1019,16 @@ mod tests {
     fn computes_meter_sample_count_for_sampling_interval() {
         assert_eq!(compute_level_sample_count(48_000, Duration::from_millis(66)), 3168);
         assert_eq!(compute_level_sample_count(48_000, Duration::from_millis(1)), 48);
+    }
+
+    #[test]
+    fn reads_persisted_volume_and_mute_for_channel() {
+        let mut state = State::default();
+        state.volumes.chat = 0.42;
+        state.muted.chat = true;
+
+        assert!((persisted_channel_volume(&state, Channel::Chat) - 0.42).abs() < 0.0001);
+        assert!(persisted_channel_mute(&state, Channel::Chat));
     }
 
 }
