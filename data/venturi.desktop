@@ -3,6 +3,6 @@ Type=Application
 Name=Venturi
 Comment=Linux audio mixer for PipeWire
 Exec=venturi
-Icon=venturi
+Icon=org.venturi.Venturi
 Categories=AudioVideo;Audio;
 Terminal=false

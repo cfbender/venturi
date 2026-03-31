@@ -60,7 +60,7 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
     label.add_css_class("chip-text");
     label.set_xalign(0.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_max_width_chars(16);
+    label.set_max_width_chars(7);
 
     let status_dot = gtk::Label::new(Some(match chip.status {
         ChipStatus::Playing => "🟢",
@@ -69,12 +69,13 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
     }));
     status_dot.add_css_class("chip-status");
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
     row.append(&status_dot);
     row.append(&label);
 
     let button = gtk::Button::builder().child(&row).build();
     button.add_css_class("flat");
+    button.add_css_class("chip-button");
     match chip.channel {
         Channel::Main => button.add_css_class("chip-main"),
         Channel::Mic => button.add_css_class("chip-mic"),
@@ -83,11 +84,14 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
         Channel::Chat => button.add_css_class("chip-chat"),
         Channel::Aux => button.add_css_class("chip-aux"),
     }
-    button.set_halign(gtk::Align::Fill);
-    button.set_margin_start(2);
-    button.set_margin_end(2);
-    button.set_margin_top(1);
-    button.set_margin_bottom(1);
+    button.set_halign(gtk::Align::Start);
+    button.set_valign(gtk::Align::Start);
+    button.set_hexpand(false);
+    button.set_vexpand(false);
+    button.set_margin_start(1);
+    button.set_margin_end(1);
+    button.set_margin_top(0);
+    button.set_margin_bottom(0);
 
     let payload = DndPayload {
         stream_id: chip.stream_id,
@@ -98,6 +102,31 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
     let drag = gtk::DragSource::builder()
         .actions(gtk::gdk::DragAction::MOVE)
         .build();
+
+    {
+        let button_for_icon = button.clone();
+        drag.connect_drag_begin(move |source, _drag| {
+            let paintable = gtk::WidgetPaintable::new(Some(&button_for_icon));
+            source.set_icon(Some(&paintable), 8, 8);
+            button_for_icon.set_opacity(0.82);
+        });
+    }
+
+    {
+        let button_for_end = button.clone();
+        drag.connect_drag_end(move |_, _drag, _delete_data| {
+            button_for_end.set_opacity(1.0);
+        });
+    }
+
+    {
+        let button_for_cancel = button.clone();
+        drag.connect_drag_cancel(move |_, _drag, _reason| {
+            button_for_cancel.set_opacity(1.0);
+            false
+        });
+    }
+
     drag.connect_prepare(move |_, _, _| {
         let encoded = payload.encode();
         Some(gtk::gdk::ContentProvider::for_value(&encoded.to_value()))

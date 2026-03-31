@@ -190,6 +190,10 @@ pub fn build_mixer_widget(
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.set_hexpand(true);
     root.set_vexpand(true);
+    root.set_margin_top(14);
+    root.set_margin_start(14);
+    root.set_margin_end(14);
+    root.set_margin_bottom(12);
 
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let output_label = gtk::Label::new(Some("Output"));
@@ -257,6 +261,13 @@ pub fn build_mixer_widget(
     top.append(&output_dropdown);
     top.append(&input_label);
     top.append(&input_dropdown);
+    top.set_halign(gtk::Align::Center);
+
+    let top_wrap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    top_wrap.set_hexpand(true);
+    top_wrap.set_halign(gtk::Align::Center);
+    top_wrap.set_margin_top(8);
+    top_wrap.append(&top);
 
     let banner = gtk::Label::new(None);
     banner.add_css_class("error");
@@ -270,7 +281,10 @@ pub fn build_mixer_widget(
     channels_row.set_vexpand(true);
     channels_row.set_valign(gtk::Align::Fill);
     channels_row.set_homogeneous(true);
-    let mut chip_lists: BTreeMap<Channel, gtk::Box> = BTreeMap::new();
+    channels_row.set_margin_start(6);
+    channels_row.set_margin_end(6);
+    channels_row.set_margin_bottom(6);
+    let mut chip_lists: BTreeMap<Channel, gtk::FlowBox> = BTreeMap::new();
 
     let channels = [
         Channel::Main,
@@ -300,13 +314,22 @@ pub fn build_mixer_widget(
         if let Some(section_class) = chip_drop_zone_class(channel) {
             let zone_shell = gtk::Box::new(gtk::Orientation::Vertical, 6);
             zone_shell.set_hexpand(true);
-            zone_shell.set_vexpand(true);
+            zone_shell.set_vexpand(false);
+            zone_shell.set_margin_top(8);
+            zone_shell.set_valign(gtk::Align::End);
 
-            let chip_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            let chip_list = gtk::FlowBox::new();
             chip_list.add_css_class("chip-drop-zone");
+            chip_list.add_css_class("chip-grid");
             chip_list.add_css_class(section_class);
             chip_list.set_hexpand(true);
-            chip_list.set_vexpand(true);
+            chip_list.set_vexpand(false);
+            chip_list.set_valign(gtk::Align::Start);
+            chip_list.set_selection_mode(gtk::SelectionMode::None);
+            chip_list.set_max_children_per_line(2);
+            chip_list.set_min_children_per_line(2);
+            chip_list.set_column_spacing(3);
+            chip_list.set_row_spacing(3);
             zone_shell.append(&chip_list);
             chip_lists.insert(channel, chip_list.clone());
 
@@ -314,7 +337,7 @@ pub fn build_mixer_widget(
                 let state = model.lock().expect("mixer lock");
                 let chips = state.chips.get(&channel).cloned().unwrap_or_default();
                 for chip in chips {
-                    chip_list.append(&build_chip_widget(&chip));
+                    chip_list.insert(&build_chip_widget(&chip), -1);
                 }
             }
 
@@ -322,7 +345,21 @@ pub fn build_mixer_widget(
             {
                 let tx = command_tx.clone();
                 let model = model.clone();
+                let chip_list_for_enter = chip_list.clone();
+                let chip_list_for_leave = chip_list.clone();
+                let chip_list_for_drop = chip_list.clone();
+
+                drop.connect_enter(move |_, _, _| {
+                    chip_list_for_enter.add_css_class("chip-drop-zone-hover");
+                    gtk::gdk::DragAction::MOVE
+                });
+
+                drop.connect_leave(move |_| {
+                    chip_list_for_leave.remove_css_class("chip-drop-zone-hover");
+                });
+
                 drop.connect_drop(move |_, value, _, _| {
+                    chip_list_for_drop.remove_css_class("chip-drop-zone-hover");
                     if let Ok(raw) = value.get::<String>()
                         && let Some(payload) = DndPayload::decode(&raw)
                     {
@@ -356,7 +393,7 @@ pub fn build_mixer_widget(
         channels_row.append(&channel_col);
     }
 
-    root.append(&top);
+    root.append(&top_wrap);
     root.append(&banner);
     root.append(&channels_row);
 
@@ -447,7 +484,7 @@ pub fn build_mixer_widget(
                     }
                     let chips = chips_snapshot.get(channel).cloned().unwrap_or_default();
                     for chip in chips {
-                        list_box.append(&build_chip_widget(&chip));
+                        list_box.insert(&build_chip_widget(&chip), -1);
                     }
                 }
                 last_chips_snapshot = chips_snapshot;

@@ -1,6 +1,7 @@
 use std::time::Duration;
 use std::{
     cell::RefCell,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -9,12 +10,12 @@ use adw::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::GuiLauncher;
-use crate::config::persistence::{Paths, load_config};
+use crate::config::persistence::{load_config, Paths};
 use crate::config::schema::Palette;
 use crate::core::messages::{CoreCommand, CoreEvent};
-use crate::gui::mixer_tab::{MixerTab, build_mixer_widget};
-use crate::gui::settings_tab::{SettingsTab, build_settings_widget};
-use crate::gui::soundboard_tab::{SoundboardTab, build_soundboard_widget};
+use crate::gui::mixer_tab::{build_mixer_widget, MixerTab};
+use crate::gui::settings_tab::{build_settings_widget, SettingsTab};
+use crate::gui::soundboard_tab::{build_soundboard_widget, SoundboardTab};
 
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -137,6 +138,16 @@ pub fn run_gtk_app(
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&switcher));
 
+        let brand = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        brand.add_css_class("brand-badge");
+        let brand_mark = build_brand_logo();
+        brand_mark.add_css_class("brand-mark");
+        let brand_name = gtk::Label::new(Some("Venturi"));
+        brand_name.add_css_class("brand-name");
+        brand.append(&brand_mark);
+        brand.append(&brand_name);
+        header.pack_start(&brand);
+
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
         content.append(&stack);
@@ -229,11 +240,44 @@ fn install_mixer_css(palette: Option<&Palette>) {
         color: alpha(@window_fg_color, 0.98);
     }}
 
+    .brand-badge {{
+        margin-left: 4px;
+    }}
+
+    .brand-mark {{
+        font-size: 1.18em;
+    }}
+
+    .brand-name {{
+        font-weight: 700;
+        color: alpha(@window_fg_color, 0.94);
+    }}
+
     .chip-drop-zone {{
         border-radius: 12px;
-        min-height: 136px;
-        padding: 8px;
+        min-height: 92px;
+        padding: 4px;
         background-color: alpha(@window_fg_color, 0.06);
+        border: none;
+        box-shadow: none;
+    }}
+
+    .chip-drop-zone-hover {{
+        background-color: alpha(@accent_color, 0.16);
+        border: 1px solid alpha(@accent_color, 0.36);
+    }}
+
+    .chip-grid flowboxchild {{
+        padding: 0;
+        margin: 0;
+        background: transparent;
+        border: none;
+    }}
+
+    .chip-grid flowboxchild:hover,
+    .chip-grid flowboxchild:selected,
+    .chip-grid flowboxchild:focus {{
+        background: transparent;
         border: none;
         box-shadow: none;
     }}
@@ -282,6 +326,21 @@ fn install_mixer_css(palette: Option<&Palette>) {
         border-radius: 8px;
     }}
 
+    .chip-button {{
+        padding: 1px 4px;
+        min-height: 0;
+        font-size: 0.86em;
+        border-radius: 8px;
+        background-image: none;
+        box-shadow: none;
+    }}
+
+    .chip-button:hover {{
+        background-image: none;
+        box-shadow: none;
+        border-color: alpha(@window_fg_color, 0.42);
+    }}
+
     .chip-text,
     .chip-status,
     .chip-main label,
@@ -303,6 +362,25 @@ fn install_mixer_css(palette: Option<&Palette>) {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+fn build_brand_logo() -> gtk::Image {
+    let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/venturi-logo.svg"),
+        PathBuf::from("/app/share/icons/hicolor/scalable/apps/org.venturi.Venturi.svg"),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            let image = gtk::Image::from_file(candidate);
+            image.set_pixel_size(28);
+            return image;
+        }
+    }
+
+    let image = gtk::Image::from_icon_name("org.venturi.Venturi");
+    image.set_pixel_size(28);
+    image
 }
 
 fn color_or_theme(rgb: Option<(u8, u8, u8)>, fallback: &str, alpha: f32) -> String {

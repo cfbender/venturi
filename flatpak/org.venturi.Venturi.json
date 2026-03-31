@@ -17,6 +17,7 @@
           "cargo build --release",
           "install -Dm755 target/release/venturi /app/bin/venturi",
           "install -Dm644 data/venturi.desktop /app/share/applications/org.venturi.Venturi.desktop",
+          "install -Dm644 data/org.venturi.Venturi.svg /app/share/icons/hicolor/scalable/apps/org.venturi.Venturi.svg",
           "install -Dm644 data/org.venturi.Venturi.metainfo.xml /app/share/metainfo/org.venturi.Venturi.metainfo.xml"
         ],
       "sources": [

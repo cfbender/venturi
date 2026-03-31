@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="venturiGradient" x1="52" y1="42" x2="204" y2="214" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8BA4B0"/>
+      <stop offset="0.5" stop-color="#87A987"/>
+      <stop offset="1" stop-color="#938AA9"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="128" cy="128" r="110" fill="#181920"/>
+
+  <!-- Cohesive ring kept fully inside badge -->
+  <circle
+    cx="128"
+    cy="128"
+    r="64"
+    stroke="url(#venturiGradient)"
+    stroke-width="14"
+    opacity="0.94"
+  />
+
+  <!-- Centered V with clean join -->
+  <path
+    d="M96 86 L124 172 L132 172 L160 86"
+    stroke="url(#venturiGradient)"
+    stroke-width="14"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+</svg>

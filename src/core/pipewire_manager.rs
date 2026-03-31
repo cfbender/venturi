@@ -55,6 +55,14 @@ fn resolve_selected_input_name(selected_input: Option<&str>) -> Result<Option<St
     }
 }
 
+fn config_device_value(device: &str) -> String {
+    if device.eq_ignore_ascii_case(fallback_to_default_device()) {
+        "default".to_string()
+    } else {
+        device.to_string()
+    }
+}
+
 pub struct PipeWireManager {
     handle: std::thread::JoinHandle<()>,
 }
@@ -76,6 +84,7 @@ struct CoreRuntimeState {
     hotkey_adapter: DynHotkeyAdapter,
     last_snapshot: Snapshot,
     overrides: BTreeMap<String, crate::core::messages::Channel>,
+    selected_output: Option<String>,
     selected_input: Option<String>,
     output_loopback_module: Option<String>,
     virtual_mic_module: Option<String>,
@@ -111,6 +120,15 @@ impl CoreRuntimeState {
         } else {
             Some(runtime_config.audio.input_device.clone())
         };
+        let selected_output = if runtime_config
+            .audio
+            .output_device
+            .eq_ignore_ascii_case("default")
+        {
+            Some(fallback_to_default_device().to_string())
+        } else {
+            Some(runtime_config.audio.output_device.clone())
+        };
 
         let mut state = Self {
             routing_mode,
@@ -124,6 +142,7 @@ impl CoreRuntimeState {
             hotkey_adapter,
             last_snapshot: Snapshot::default(),
             overrides: BTreeMap::new(),
+            selected_output: None,
             selected_input,
             output_loopback_module: None,
             virtual_mic_module: None,
@@ -155,6 +174,14 @@ impl CoreRuntimeState {
                     )));
                 }
             }
+        }
+
+        if let Some(output_name) = selected_output
+            && let Err(err) = state.handle_set_output_device(&output_name)
+        {
+            let _ = event_tx.send(CoreEvent::Error(format!(
+                "failed to restore output routing to {output_name}: {err}"
+            )));
         }
 
         state
@@ -283,6 +310,10 @@ impl CoreRuntimeState {
     }
 
     fn handle_set_output_device(&mut self, device: &str) -> Result<(), String> {
+        if self.selected_output.as_deref() == Some(device) {
+            return Ok(());
+        }
+
         if let Some(prev_module) = self.output_loopback_module.take()
             && let Err(err) = unload_pactl_module(&prev_module)
         {
@@ -302,6 +333,11 @@ impl CoreRuntimeState {
                 }
             }
         }
+
+        self.selected_output = Some(device.to_string());
+        self.runtime_config.audio.output_device = config_device_value(device);
+        save_config(&self.paths, &self.runtime_config)
+            .map_err(|err| format!("failed to persist output device selection: {err}"))?;
         Ok(())
     }
 
@@ -336,6 +372,10 @@ impl CoreRuntimeState {
                 return Err(format!("failed to resolve selected input source: {err}"));
             }
         }
+
+        self.runtime_config.audio.input_device = config_device_value(device);
+        save_config(&self.paths, &self.runtime_config)
+            .map_err(|err| format!("failed to persist input device selection: {err}"))?;
         Ok(())
     }
 
