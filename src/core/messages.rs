@@ -19,6 +19,7 @@ pub enum CoreCommand {
     PlaySound(u32),
     StopSound(u32),
     Ping,
+    SetMeteringEnabled(bool),
     Shutdown,
 }
 

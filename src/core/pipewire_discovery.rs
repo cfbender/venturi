@@ -7,6 +7,7 @@ use crate::core::messages::{DeviceEntry, DeviceKind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamInfo {
     pub id: u32,
+    pub meter_target: u32,
     pub app_key: String,
     pub display_name: String,
     pub media_role: Option<String>,
@@ -17,6 +18,8 @@ pub(crate) struct Snapshot {
     pub devices: Vec<DeviceEntry>,
     pub output_ids: BTreeMap<String, u32>,
     pub input_ids: BTreeMap<String, u32>,
+    pub output_meter_targets: BTreeMap<String, u32>,
+    pub input_meter_targets: BTreeMap<String, u32>,
     pub streams: BTreeMap<u32, StreamInfo>,
 }
 
@@ -48,6 +51,8 @@ pub(crate) fn parse_pw_dump(
     let mut inputs = BTreeMap::new();
     let mut output_ids = BTreeMap::new();
     let mut input_ids = BTreeMap::new();
+    let mut output_meter_targets = BTreeMap::new();
+    let mut input_meter_targets = BTreeMap::new();
     let mut streams = BTreeMap::new();
 
     for item in arr {
@@ -64,6 +69,8 @@ pub(crate) fn parse_pw_dump(
         let Some(props) = props else {
             continue;
         };
+
+        let meter_target = parse_object_serial(props).or(id);
 
         let media_class = props
             .get("media.class")
@@ -97,6 +104,9 @@ pub(crate) fn parse_pw_dump(
             if let Some(node_id) = id {
                 output_ids.insert(node_name.to_string(), node_id);
             }
+            if let Some(target_id) = meter_target {
+                output_meter_targets.insert(node_name.to_string(), target_id);
+            }
         }
 
         if media_class.contains("Source") && !node_name.is_empty() {
@@ -108,6 +118,9 @@ pub(crate) fn parse_pw_dump(
             }
             if let Some(node_id) = id {
                 input_ids.insert(node_name.to_string(), node_id);
+            }
+            if let Some(target_id) = meter_target {
+                input_meter_targets.insert(node_name.to_string(), target_id);
             }
             if hidden_inputs.contains(&node_name) {
                 continue;
@@ -152,6 +165,7 @@ pub(crate) fn parse_pw_dump(
                 stream_id,
                 StreamInfo {
                     id: stream_id,
+                    meter_target: meter_target.unwrap_or(stream_id),
                     app_key: if binary.is_empty() {
                         display_name.to_ascii_lowercase()
                     } else {
@@ -172,6 +186,8 @@ pub(crate) fn parse_pw_dump(
         devices,
         output_ids,
         input_ids,
+        output_meter_targets,
+        input_meter_targets,
         streams,
     })
 }
@@ -195,6 +211,14 @@ fn preferred_display_name(
         return prettify_node_name(node_name);
     }
     "Unknown App".to_string()
+}
+
+fn parse_object_serial(props: &serde_json::Map<String, Value>) -> Option<u32> {
+    let value = props.get("object.serial")?;
+    value
+        .as_u64()
+        .and_then(|raw| u32::try_from(raw).ok())
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<u32>().ok()))
 }
 
 fn is_generic_name(name: &str) -> bool {
@@ -392,5 +416,44 @@ mod tests {
             output.label,
             "Navi 48 HDMI/DP Audio Controller Digital Stereo (HDMI 2)"
         );
+    }
+
+    #[test]
+    fn parse_pw_dump_uses_object_serial_for_meter_targets() {
+        let empty: [&'static str; 0] = [];
+        let raw = r#"[
+          {
+            "id": 128,
+            "info": {
+              "props": {
+                "media.class": "Audio/Sink",
+                "node.name": "Venturi-Output",
+                "object.serial": "37284"
+              }
+            }
+          },
+          {
+            "id": 197,
+            "info": {
+              "props": {
+                "media.class": "Stream/Output/Audio",
+                "object.serial": "42330",
+                "application.name": "paplay",
+                "application.process.binary": "paplay"
+              }
+            }
+          }
+        ]"#;
+
+        let snapshot =
+            parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
+
+        assert_eq!(snapshot.output_ids.get("Venturi-Output"), Some(&128));
+        assert_eq!(
+            snapshot.output_meter_targets.get("Venturi-Output"),
+            Some(&37284)
+        );
+        let stream = snapshot.streams.get(&197).expect("stream exists");
+        assert_eq!(stream.meter_target, 42330);
     }
 }

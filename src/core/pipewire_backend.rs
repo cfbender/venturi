@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::process::Command;
+use std::process::{Child, ChildStdout, Stdio};
 
 const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
 const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
@@ -56,6 +58,58 @@ pub(crate) fn run_pactl(args: &[String]) -> Result<String, String> {
     }
 }
 
+pub(crate) struct PwTargetSampler {
+    child: Child,
+    stdout: ChildStdout,
+}
+
+impl PwTargetSampler {
+    pub(crate) fn spawn(target_node_id: u32) -> Result<Self, String> {
+        let args = vec![
+            "--target".to_string(),
+            target_node_id.to_string(),
+            "--rate".to_string(),
+            "48000".to_string(),
+            "--channels".to_string(),
+            "2".to_string(),
+            "--format".to_string(),
+            "s16".to_string(),
+            "--raw".to_string(),
+            "-".to_string(),
+        ];
+
+        let mut child = Command::new("pw-record")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn pw-record sampler: {e}"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture pw-record stdout".to_string())?;
+
+        Ok(Self { child, stdout })
+    }
+
+    pub(crate) fn sample_levels(&mut self, sample_count: u32) -> Result<(f32, f32), String> {
+        let byte_len = sample_count.saturating_mul(4) as usize;
+        let mut raw = vec![0_u8; byte_len];
+        self.stdout
+            .read_exact(&mut raw)
+            .map_err(|e| format!("failed reading pw-record sampler output: {e}"))?;
+        Ok(compute_stereo_peak_from_s16le(raw.as_slice()))
+    }
+}
+
+impl Drop for PwTargetSampler {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 pub(crate) fn unload_pactl_module(module_id: &str) -> Result<(), String> {
     if module_id.is_empty() {
         return Ok(());
@@ -69,6 +123,20 @@ pub(crate) fn current_default_source_name() -> Result<Option<String>, String> {
     let raw = run_pactl(&args)?;
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("Default Source:") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn current_default_sink_name() -> Result<Option<String>, String> {
+    let args = vec!["info".to_string()];
+    let raw = run_pactl(&args)?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("Default Sink:") {
             let name = rest.trim();
             if !name.is_empty() {
                 return Ok(Some(name.to_string()));
@@ -327,6 +395,22 @@ fn quote_proplist_value(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn compute_stereo_peak_from_s16le(raw: &[u8]) -> (f32, f32) {
+    let mut left_peak = 0.0f32;
+    let mut right_peak = 0.0f32;
+
+    for frame in raw.chunks_exact(4) {
+        let left = i16::from_le_bytes([frame[0], frame[1]]);
+        let right = i16::from_le_bytes([frame[2], frame[3]]);
+        let left_norm = (left as f32).abs() / i16::MAX as f32;
+        let right_norm = (right as f32).abs() / i16::MAX as f32;
+        left_peak = left_peak.max(left_norm);
+        right_peak = right_peak.max(right_norm);
+    }
+
+    (left_peak.clamp(0.0, 1.0), right_peak.clamp(0.0, 1.0))
+}
+
 fn unload_legacy_venturi_sinks(legacy_sink_names: &[&str]) -> Result<(), String> {
     let args = vec![
         "list".to_string(),
@@ -386,8 +470,8 @@ mod tests {
     use super::{
         build_monitor_loopback_plan, build_virtual_device_description_property,
         build_virtual_module_device_description_properties,
-        collect_virtual_device_module_unload_ids, sink_description_for, source_description_for,
-        MonitorLoopbackPlan,
+        collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
+        sink_description_for, source_description_for, MonitorLoopbackPlan,
     };
 
     #[test]
@@ -497,5 +581,17 @@ mod tests {
             unload_ids,
             vec!["536870921".to_string(), "536870922".to_string()]
         );
+    }
+
+    #[test]
+    fn computes_stereo_peak_levels_from_s16le_pcm() {
+        let raw: [u8; 12] = [
+            0x00, 0x00, 0x00, 0x00, // frame 1: silence
+            0xff, 0x3f, 0x00, 0x20, // frame 2: left ~0.5, right ~0.25
+            0x00, 0x20, 0xff, 0x5f, // frame 3: left ~0.25, right ~0.75
+        ];
+        let (left, right) = compute_stereo_peak_from_s16le(raw.as_slice());
+        assert!((left - 0.5).abs() < 0.02);
+        assert!((right - 0.75).abs() < 0.02);
     }
 }

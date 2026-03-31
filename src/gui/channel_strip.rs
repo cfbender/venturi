@@ -6,6 +6,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+const TRACK_TOP_INSET_PX: i32 = 8;
+const METER_TOP_INSET_PX: i32 = 12;
+const TRACK_BOTTOM_INSET_PX: i32 = 0;
+const SLIDER_BOTTOM_OFFSET_ADJUST_PX: i32 = -10;
+
 #[derive(Debug, Clone)]
 pub struct ChannelStrip {
     pub channel: Channel,
@@ -43,6 +48,13 @@ impl ChannelStrip {
 }
 
 pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) -> gtk::Box {
+    build_strip_widget_with_meter(strip, command_tx).0
+}
+
+pub fn build_strip_widget_with_meter(
+    strip: ChannelStrip,
+    command_tx: Sender<CoreCommand>,
+) -> (gtk::Box, gtk::ProgressBar) {
     let state = Rc::new(RefCell::new(strip));
     let channel = state.borrow().channel;
 
@@ -60,11 +72,25 @@ pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) 
     let meter = gtk::ProgressBar::new();
     meter.set_fraction(0.0);
     meter.set_show_text(false);
+    meter.set_orientation(gtk::Orientation::Vertical);
+    meter.set_inverted(true);
+    meter.set_vexpand(true);
+    meter.set_halign(gtk::Align::Center);
+    meter.set_valign(gtk::Align::Fill);
+    meter.set_size_request(6, -1);
+    meter.set_margin_top(METER_TOP_INSET_PX);
+    meter.set_margin_bottom(TRACK_BOTTOM_INSET_PX);
+    meter.set_can_target(false);
+    meter.set_visible(false);
+    meter.add_css_class("slider-meter");
+    meter.add_css_class(meter_css_class_for(channel));
 
     let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
     slider.set_value(state.borrow().volume_linear as f64);
     slider.set_inverted(true);
     slider.set_vexpand(true);
+    slider.set_margin_top(TRACK_TOP_INSET_PX);
+    slider.set_margin_bottom(SLIDER_BOTTOM_OFFSET_ADJUST_PX);
 
     match channel {
         Channel::Main => slider.add_css_class("slider-main"),
@@ -111,10 +137,41 @@ pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) 
         });
     }
 
+    let slider_overlay = gtk::Overlay::new();
+    slider_overlay.set_hexpand(true);
+    slider_overlay.set_vexpand(true);
+    slider_overlay.set_child(Some(&slider));
+    slider_overlay.add_overlay(&meter);
+
     root.append(&header);
-    root.append(&meter);
-    root.append(&slider);
+    root.append(&slider_overlay);
     root.append(&db_label);
     root.append(&mute);
-    root
+    (root, meter)
+}
+
+fn meter_css_class_for(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Main => "meter-main",
+        Channel::Mic => "meter-mic",
+        Channel::Game => "meter-game",
+        Channel::Media => "meter-media",
+        Channel::Chat => "meter-chat",
+        Channel::Aux => "meter-aux",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::messages::Channel;
+
+    #[test]
+    fn maps_channel_to_meter_css_class() {
+        assert_eq!(super::meter_css_class_for(Channel::Main), "meter-main");
+        assert_eq!(super::meter_css_class_for(Channel::Mic), "meter-mic");
+        assert_eq!(super::meter_css_class_for(Channel::Game), "meter-game");
+        assert_eq!(super::meter_css_class_for(Channel::Media), "meter-media");
+        assert_eq!(super::meter_css_class_for(Channel::Chat), "meter-chat");
+        assert_eq!(super::meter_css_class_for(Channel::Aux), "meter-aux");
+    }
 }

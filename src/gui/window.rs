@@ -1,6 +1,6 @@
 use std::time::Duration;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
@@ -76,6 +76,10 @@ fn ui_selected_device_from_config(raw: &str) -> Option<String> {
         return Some("Default".to_string());
     }
     Some(raw.to_string())
+}
+
+fn should_metering_be_enabled(window_visible: bool, _window_active: bool) -> bool {
+    window_visible
 }
 
 #[derive(Debug, Clone, Default)]
@@ -174,17 +178,61 @@ pub fn run_gtk_app(
             .content(&content)
             .build();
 
+        {
+            let command_tx_for_hide = command_tx_outer.clone();
+            window.connect_hide(move |_| {
+                let _ = command_tx_for_hide.send(CoreCommand::SetMeteringEnabled(false));
+            });
+        }
+
+        {
+            let command_tx_for_show = command_tx_outer.clone();
+            window.connect_show(move |_| {
+                let _ = command_tx_for_show.send(CoreCommand::SetMeteringEnabled(true));
+            });
+        }
+
+        {
+            let command_tx_for_unmap = command_tx_outer.clone();
+            window.connect_unmap(move |_| {
+                let _ = command_tx_for_unmap.send(CoreCommand::SetMeteringEnabled(false));
+            });
+        }
+
+        {
+            let command_tx_for_map = command_tx_outer.clone();
+            window.connect_map(move |_| {
+                let _ = command_tx_for_map.send(CoreCommand::SetMeteringEnabled(true));
+            });
+        }
+
+        {
+            let command_tx_for_close = command_tx_outer.clone();
+            window.connect_close_request(move |window| {
+                let _ = command_tx_for_close.send(CoreCommand::SetMeteringEnabled(false));
+                window.hide();
+                gtk::glib::Propagation::Stop
+            });
+        }
+
         let vm = vm.clone();
         let mixer_model_for_events = mixer_model.clone();
         let event_rx = event_rx_outer.clone();
         let window_for_events = window.clone();
+        let command_tx_for_events = command_tx_outer.clone();
+        let last_metering_enabled = Rc::new(Cell::new(None::<bool>));
+        let last_metering_enabled_for_events = last_metering_enabled.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
             while let Ok(event) = event_rx.try_recv() {
                 if matches!(event, CoreEvent::ToggleWindowRequested) {
                     if window_for_events.is_visible() {
+                        let _ = command_tx_for_events.send(CoreCommand::SetMeteringEnabled(false));
+                        last_metering_enabled_for_events.set(Some(false));
                         window_for_events.hide();
                     } else {
                         window_for_events.present();
+                        let _ = command_tx_for_events.send(CoreCommand::SetMeteringEnabled(true));
+                        last_metering_enabled_for_events.set(Some(true));
                     }
                     continue;
                 }
@@ -194,10 +242,22 @@ pub fn run_gtk_app(
                     state.apply_event(&event);
                 }
             }
+
+            let desired_metering = should_metering_be_enabled(
+                window_for_events.is_visible(),
+                window_for_events.is_active(),
+            );
+            if last_metering_enabled_for_events.get() != Some(desired_metering) {
+                let _ =
+                    command_tx_for_events.send(CoreCommand::SetMeteringEnabled(desired_metering));
+                last_metering_enabled_for_events.set(Some(desired_metering));
+            }
+
             gtk::glib::ControlFlow::Continue
         });
 
         window.present();
+        let _ = command_tx_outer.send(CoreCommand::SetMeteringEnabled(true));
     });
 
     app.run();
@@ -308,6 +368,30 @@ fn install_mixer_css(palette: Option<&Palette>) {
     .slider-media highlight {{ background: {slider_media}; }}
     .slider-chat highlight {{ background: {slider_chat}; }}
     .slider-aux highlight {{ background: {slider_aux}; }}
+
+    .slider-meter {{
+        min-width: 6px;
+        opacity: 0.95;
+        background: transparent;
+        margin: 0;
+        padding: 0;
+    }}
+
+    .slider-meter trough {{
+        background: transparent;
+        border: none;
+        padding: 0;
+        margin: 0;
+        min-height: 0;
+        min-width: 6px;
+    }}
+
+    .meter-main trough progress {{ background: {slider_main}; border-radius: 0; min-width: 6px; min-height: 0; margin: 0; padding: 0; }}
+    .meter-mic trough progress {{ background: {slider_mic}; border-radius: 0; min-width: 6px; min-height: 0; margin: 0; padding: 0; }}
+    .meter-game trough progress {{ background: {slider_game}; border-radius: 0; min-width: 6px; min-height: 0; margin: 0; padding: 0; }}
+    .meter-media trough progress {{ background: {slider_media}; border-radius: 0; min-width: 6px; min-height: 0; margin: 0; padding: 0; }}
+    .meter-chat trough progress {{ background: {slider_chat}; border-radius: 0; min-width: 6px; min-height: 0; margin: 0; padding: 0; }}
+    .meter-aux trough progress {{ background: {slider_aux}; border-radius: 0; min-width: 6px; min-height: 0; margin: 0; padding: 0; }}
 
     .chip-main {{
         background-color: {chip_main_bg};
@@ -434,7 +518,7 @@ fn parse_hex_color(raw: &str) -> Option<(u8, u8, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hex_color, ui_selected_device_from_config};
+    use super::{parse_hex_color, should_metering_be_enabled, ui_selected_device_from_config};
 
     #[test]
     fn parses_six_digit_hex_colors() {
@@ -467,5 +551,13 @@ mod tests {
             Some("alsa_output.foo".to_string())
         );
         assert_eq!(ui_selected_device_from_config(""), None);
+    }
+
+    #[test]
+    fn enables_metering_when_window_is_visible() {
+        assert!(should_metering_be_enabled(true, true));
+        assert!(should_metering_be_enabled(true, false));
+        assert!(!should_metering_be_enabled(false, true));
+        assert!(!should_metering_be_enabled(false, false));
     }
 }

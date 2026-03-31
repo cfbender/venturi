@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::rc::Rc;
 
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::messages::{DeviceEntry, DeviceKind};
+use crate::core::meter::decay_peak;
 use crate::gui::app_chip::{AppChip, ChipStatus, DndPayload, build_chip_widget};
-use crate::gui::channel_strip::{ChannelStrip, build_strip_widget};
+use crate::gui::channel_strip::{ChannelStrip, build_strip_widget_with_meter};
 use gtk::prelude::*;
 
 pub const NO_DEVICES_FOUND: &str = "No devices found";
@@ -90,6 +94,7 @@ pub struct MixerTab {
     pub devices: DeviceListModel,
     pub banner: Option<String>,
     pub toast: Option<String>,
+    pub levels: BTreeMap<Channel, (f32, f32)>,
     ui_dirty: Arc<AtomicBool>,
 }
 
@@ -128,6 +133,7 @@ impl MixerTab {
             },
             banner: None,
             toast: None,
+            levels: BTreeMap::new(),
             ui_dirty: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -160,6 +166,12 @@ impl MixerTab {
             }
             CoreEvent::Error(msg) => {
                 self.banner = Some(msg.clone());
+                self.ui_dirty.store(true, Ordering::Relaxed);
+            }
+            CoreEvent::LevelsUpdate(levels) => {
+                for (channel, (left, right)) in levels {
+                    self.levels.insert(*channel, (*left, *right));
+                }
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
             _ => {}
@@ -202,6 +214,7 @@ pub fn build_mixer_widget(
     command_tx: crossbeam_channel::Sender<CoreCommand>,
 ) -> gtk::Box {
     const EMPTY_STRS: [&str; 0] = [];
+    const METER_UI_TICK_MS: u64 = 33;
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.set_hexpand(true);
@@ -243,15 +256,24 @@ pub fn build_mixer_widget(
     let input_dropdown = gtk::DropDown::builder().model(&in_model).build();
     output_dropdown.add_css_class("device-dropdown");
     input_dropdown.add_css_class("device-dropdown");
+    let suppress_device_notify = Rc::new(Cell::new(false));
 
     {
         let tx = command_tx.clone();
         let model = model.clone();
+        let suppress_device_notify = suppress_device_notify.clone();
         output_dropdown.connect_selected_notify(move |dd| {
+            if suppress_device_notify.get() {
+                return;
+            }
             let idx = dd.selected() as usize;
             if let Ok(mut state) = model.try_lock()
                 && let Some(chosen) = state.devices.output_devices.get(idx).cloned()
-                && state.devices.selected_output.as_deref() != Some(chosen.as_str())
+                && should_apply_device_selection_change(
+                    false,
+                    state.devices.selected_output.as_deref(),
+                    chosen.as_str(),
+                )
             {
                 state.devices.set_selected_output(chosen.clone());
                 state.mark_ui_dirty();
@@ -263,11 +285,19 @@ pub fn build_mixer_widget(
     {
         let tx = command_tx.clone();
         let model = model.clone();
+        let suppress_device_notify = suppress_device_notify.clone();
         input_dropdown.connect_selected_notify(move |dd| {
+            if suppress_device_notify.get() {
+                return;
+            }
             let idx = dd.selected() as usize;
             if let Ok(mut state) = model.try_lock()
                 && let Some(chosen) = state.devices.input_devices.get(idx).cloned()
-                && state.devices.selected_input.as_deref() != Some(chosen.as_str())
+                && should_apply_device_selection_change(
+                    false,
+                    state.devices.selected_input.as_deref(),
+                    chosen.as_str(),
+                )
             {
                 state.devices.set_selected_input(chosen.clone());
                 state.mark_ui_dirty();
@@ -304,6 +334,7 @@ pub fn build_mixer_widget(
     channels_row.set_margin_end(6);
     channels_row.set_margin_bottom(6);
     let mut chip_lists: BTreeMap<Channel, gtk::FlowBox> = BTreeMap::new();
+    let mut meter_widgets: BTreeMap<Channel, gtk::ProgressBar> = BTreeMap::new();
 
     let channels = [
         Channel::Main,
@@ -328,7 +359,9 @@ pub fn build_mixer_widget(
         channel_col.set_vexpand(true);
         channel_col.set_valign(gtk::Align::Fill);
         channel_col.add_css_class("channel-surface");
-        channel_col.append(&build_strip_widget(strip, command_tx.clone()));
+        let (strip_widget, meter) = build_strip_widget_with_meter(strip, command_tx.clone());
+        channel_col.append(&strip_widget);
+        meter_widgets.insert(channel, meter);
 
         if let Some(section_class) = chip_drop_zone_class(channel) {
             let zone_shell = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -425,9 +458,36 @@ pub fn build_mixer_widget(
     let mut last_out_selected: Option<u32> = None;
     let mut last_in_selected: Option<u32> = None;
     let mut last_chips_snapshot: BTreeMap<Channel, Vec<AppChip>> = BTreeMap::new();
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(350), move || {
+    let mut last_meter_levels: BTreeMap<Channel, f32> = BTreeMap::new();
+    let mut last_meter_tick = Instant::now();
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(METER_UI_TICK_MS), move || {
         if let Ok(state) = model_for_refresh.try_lock() {
-            if !state.take_ui_dirty() {
+            let levels_snapshot = state.levels.clone();
+            let ui_dirty = state.take_ui_dirty();
+
+            let now = Instant::now();
+            let elapsed_ms = now.duration_since(last_meter_tick).as_millis() as u32;
+            last_meter_tick = now;
+            for channel in [
+                Channel::Main,
+                Channel::Mic,
+                Channel::Game,
+                Channel::Media,
+                Channel::Chat,
+                Channel::Aux,
+            ] {
+                let (left, right) = levels_snapshot.get(&channel).copied().unwrap_or((0.0, 0.0));
+                let current = meter_display_level(left.max(right));
+                let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
+                let next = decay_peak(previous, current, elapsed_ms);
+                if let Some(widget) = meter_widgets.get(&channel) {
+                    widget.set_fraction(next as f64);
+                    widget.set_visible(meter_should_be_visible(next));
+                }
+                last_meter_levels.insert(channel, next);
+            }
+
+            if !ui_dirty {
                 return gtk::glib::ControlFlow::Continue;
             }
 
@@ -463,19 +523,23 @@ pub fn build_mixer_widget(
             }
 
             if out_devices != last_out_devices {
+                suppress_device_notify.set(true);
                 out_model.splice(0, out_model.n_items(), &EMPTY_STRS);
                 for dev in &out_devices {
                     out_model.append(&display_device_label(&out_labels_by_id, dev));
                 }
                 last_out_devices = out_devices;
+                suppress_device_notify.set(false);
             }
 
             if in_devices != last_in_devices {
+                suppress_device_notify.set(true);
                 in_model.splice(0, in_model.n_items(), &EMPTY_STRS);
                 for dev in &in_devices {
                     in_model.append(&display_device_label(&in_labels_by_id, dev));
                 }
                 last_in_devices = in_devices;
+                suppress_device_notify.set(false);
             }
 
             let next_out_selected = selected_out.map(|idx| idx as u32);
@@ -483,7 +547,9 @@ pub fn build_mixer_widget(
                 if let Some(idx) = next_out_selected
                     && output_dropdown.selected() != idx
                 {
+                    suppress_device_notify.set(true);
                     output_dropdown.set_selected(idx);
+                    suppress_device_notify.set(false);
                 }
                 last_out_selected = next_out_selected;
             }
@@ -493,7 +559,9 @@ pub fn build_mixer_widget(
                 if let Some(idx) = next_in_selected
                     && input_dropdown.selected() != idx
                 {
+                    suppress_device_notify.set(true);
                     input_dropdown.set_selected(idx);
+                    suppress_device_notify.set(false);
                 }
                 last_in_selected = next_in_selected;
             }
@@ -510,6 +578,7 @@ pub fn build_mixer_widget(
                 }
                 last_chips_snapshot = chips_snapshot;
             }
+
         }
         gtk::glib::ControlFlow::Continue
     });
@@ -536,9 +605,28 @@ fn display_device_label(labels_by_id: &BTreeMap<String, String>, raw_id: &str) -
         .unwrap_or_else(|| friendly_device_label(raw_id))
 }
 
+fn meter_display_level(linear_peak: f32) -> f32 {
+    linear_peak.clamp(0.0, 1.0).sqrt()
+}
+
+fn meter_should_be_visible(level: f32) -> bool {
+    level > 0.01
+}
+
+fn should_apply_device_selection_change(
+    is_programmatic_update: bool,
+    current_selected: Option<&str>,
+    chosen: &str,
+) -> bool {
+    !is_programmatic_update && current_selected != Some(chosen)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DeviceListModel;
+    use super::{
+        DeviceListModel, meter_display_level, meter_should_be_visible,
+        should_apply_device_selection_change,
+    };
     use crate::core::messages::{DeviceEntry, DeviceKind};
 
     #[test]
@@ -571,5 +659,39 @@ mod tests {
             model.selected_input.as_deref(),
             Some("alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback")
         );
+    }
+
+    #[test]
+    fn meter_display_level_uses_perceptual_curve() {
+        assert_eq!(meter_display_level(0.0), 0.0);
+        assert!((meter_display_level(0.01) - 0.1).abs() < 0.0001);
+        assert!((meter_display_level(0.25) - 0.5).abs() < 0.0001);
+        assert_eq!(meter_display_level(1.5), 1.0);
+    }
+
+    #[test]
+    fn hides_meter_when_signal_is_near_silence() {
+        assert!(!meter_should_be_visible(0.0));
+        assert!(!meter_should_be_visible(0.009));
+        assert!(meter_should_be_visible(0.02));
+    }
+
+    #[test]
+    fn ignores_programmatic_or_duplicate_device_selection_events() {
+        assert!(!should_apply_device_selection_change(
+            true,
+            Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo"),
+            "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo",
+        ));
+        assert!(!should_apply_device_selection_change(
+            false,
+            Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo"),
+            "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo",
+        ));
+        assert!(should_apply_device_selection_change(
+            false,
+            Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo"),
+            "alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1",
+        ));
     }
 }
