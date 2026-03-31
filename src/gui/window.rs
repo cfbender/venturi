@@ -10,12 +10,12 @@ use adw::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::GuiLauncher;
-use crate::config::persistence::{load_config, load_state, Paths};
+use crate::config::persistence::{Paths, load_config, load_state};
 use crate::config::schema::Palette;
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
-use crate::gui::mixer_tab::{build_mixer_widget, MixerTab};
-use crate::gui::settings_tab::{build_settings_widget, SettingsTab};
-use crate::gui::soundboard_tab::{build_soundboard_widget, SoundboardTab};
+use crate::gui::mixer_tab::{MixerTab, build_mixer_widget};
+use crate::gui::settings_tab::{SettingsTab, build_settings_widget};
+use crate::gui::soundboard_tab::{SoundboardTab, build_soundboard_widget};
 
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -160,10 +160,10 @@ pub fn run_gtk_app(
         let persisted_state = load_state(&paths);
         install_mixer_css(config.palette.as_ref());
 
-        if let Some(dev_data_dir) = resolve_dev_data_dir(Path::new(env!("CARGO_MANIFEST_DIR"))) {
-            if let Some(display) = gtk::gdk::Display::default() {
-                gtk::IconTheme::for_display(&display).add_search_path(&dev_data_dir);
-            }
+        if let Some(dev_data_dir) = resolve_dev_data_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+            && let Some(display) = gtk::gdk::Display::default()
+        {
+            gtk::IconTheme::for_display(&display).add_search_path(&dev_data_dir);
         }
 
         let config_path = paths.config_file().display().to_string();

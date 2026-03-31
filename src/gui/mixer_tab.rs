@@ -9,7 +9,7 @@ use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::messages::{DeviceEntry, DeviceKind};
 use crate::core::meter::decay_peak;
 use crate::gui::app_chip::{AppChip, ChipStatus, DndPayload, build_chip_widget};
-use crate::gui::channel_strip::{ChannelStrip, build_strip_widget_with_meter};
+use crate::gui::channel_strip::{ChannelStrip, SliderHandle, build_strip_widget_with_meter};
 use gtk::prelude::*;
 
 pub const NO_DEVICES_FOUND: &str = "No devices found";
@@ -174,6 +174,12 @@ impl MixerTab {
                 }
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
+            CoreEvent::VolumeChanged(channel, volume) => {
+                if let Some(strip) = self.strips.get_mut(channel) {
+                    strip.volume_linear = *volume;
+                }
+                self.ui_dirty.store(true, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -332,6 +338,7 @@ pub fn build_mixer_widget(
     channels_row.set_margin_bottom(6);
     let mut chip_lists: BTreeMap<Channel, gtk::FlowBox> = BTreeMap::new();
     let mut meter_widgets: BTreeMap<Channel, gtk::ProgressBar> = BTreeMap::new();
+    let mut slider_widgets: BTreeMap<Channel, SliderHandle> = BTreeMap::new();
 
     let channels = [
         Channel::Main,
@@ -356,9 +363,11 @@ pub fn build_mixer_widget(
         channel_col.set_vexpand(true);
         channel_col.set_valign(gtk::Align::Fill);
         channel_col.add_css_class("channel-surface");
-        let (strip_widget, meter) = build_strip_widget_with_meter(strip, command_tx.clone());
+        let (strip_widget, meter, slider_handle) =
+            build_strip_widget_with_meter(strip, command_tx.clone());
         channel_col.append(&strip_widget);
         meter_widgets.insert(channel, meter);
+        slider_widgets.insert(channel, slider_handle);
 
         if let Some(section_class) = chip_drop_zone_class(channel) {
             let zone_shell = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -485,6 +494,22 @@ pub fn build_mixer_widget(
                         widget.set_visible(meter_should_be_visible(next));
                     }
                     last_meter_levels.insert(channel, next);
+                }
+
+                // Volume sync — update sliders from model state
+                for (channel, handle) in &slider_widgets {
+                    if handle.is_dragging.get() {
+                        continue;
+                    }
+                    if let Some(strip_data) = state.strips.get(channel) {
+                        let model_volume = strip_data.volume_linear as f64;
+                        let current = handle.scale.value();
+                        if (current - model_volume).abs() > 0.005 {
+                            handle.suppress_signal.set(true);
+                            handle.scale.set_value(model_volume);
+                            handle.suppress_signal.set(false);
+                        }
+                    }
                 }
 
                 if !ui_dirty {
@@ -624,10 +649,11 @@ fn should_apply_device_selection_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceListModel, meter_display_level, meter_should_be_visible,
+        DeviceListModel, MixerTab, meter_display_level, meter_should_be_visible,
         should_apply_device_selection_change,
     };
-    use crate::core::messages::{DeviceEntry, DeviceKind};
+    use crate::core::messages::{Channel, CoreEvent, DeviceEntry, DeviceKind};
+    use crate::gui::channel_strip::ChannelStrip;
 
     #[test]
     fn retains_persisted_selected_ids_when_devices_refresh() {
@@ -695,5 +721,25 @@ mod tests {
             Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo"),
             "alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1",
         ));
+    }
+
+    #[test]
+    fn apply_volume_changed_updates_strip_model() {
+        let mut mixer = MixerTab::default();
+        mixer.strips.insert(
+            Channel::Main,
+            ChannelStrip {
+                channel: Channel::Main,
+                icon: "🔊",
+                label: "Main",
+                volume_linear: 0.5,
+                muted: false,
+            },
+        );
+
+        mixer.apply_event(&CoreEvent::VolumeChanged(Channel::Main, 0.75));
+
+        let strip = mixer.strips.get(&Channel::Main).unwrap();
+        assert!((strip.volume_linear - 0.75).abs() < 0.001);
     }
 }

@@ -2,7 +2,7 @@ use crate::core::messages::{Channel, CoreCommand};
 use crate::core::volume::apply_mute;
 use crossbeam_channel::Sender;
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,26 @@ impl ChannelStrip {
     }
 }
 
+/// Handle to a channel strip's slider widget with suppression flags for
+/// coordinating programmatic updates vs user interaction.
+pub struct SliderHandle {
+    pub scale: gtk::Scale,
+    pub suppress_signal: Rc<Cell<bool>>,
+    pub is_dragging: Rc<Cell<bool>>,
+}
+
+#[cfg(test)]
+impl SliderHandle {
+    /// Create a SliderHandle with dummy scale for testing flag behavior.
+    fn new_for_test() -> Self {
+        Self {
+            scale: gtk::Scale::default(),
+            suppress_signal: Rc::new(Cell::new(false)),
+            is_dragging: Rc::new(Cell::new(false)),
+        }
+    }
+}
+
 pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) -> gtk::Box {
     build_strip_widget_with_meter(strip, command_tx).0
 }
@@ -55,7 +75,7 @@ pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) 
 pub fn build_strip_widget_with_meter(
     strip: ChannelStrip,
     command_tx: Sender<CoreCommand>,
-) -> (gtk::Box, gtk::ProgressBar) {
+) -> (gtk::Box, gtk::ProgressBar, SliderHandle) {
     let state = Rc::new(RefCell::new(strip));
     let channel = state.borrow().channel;
 
@@ -104,6 +124,8 @@ pub fn build_strip_widget_with_meter(
 
     let db_label = gtk::Label::new(Some(&state.borrow().volume_text()));
     let last_sent_at = Rc::new(RefCell::new(Instant::now() - Duration::from_secs(1)));
+    let suppress_signal = Rc::new(Cell::new(false));
+    let is_dragging = Rc::new(Cell::new(false));
 
     let mute = gtk::ToggleButton::with_label("Mute");
     mute.set_active(state.borrow().muted);
@@ -113,7 +135,11 @@ pub fn build_strip_widget_with_meter(
         let tx = command_tx.clone();
         let db_label = db_label.clone();
         let last_sent_at = last_sent_at.clone();
+        let suppress_clone = suppress_signal.clone();
         slider.connect_value_changed(move |scale| {
+            if suppress_clone.get() {
+                return;
+            }
             let mut state = state.borrow_mut();
             let now = Instant::now();
             let cmd = state.set_volume_command(scale.value() as f32);
@@ -131,8 +157,14 @@ pub fn build_strip_widget_with_meter(
         let tx = command_tx.clone();
         let db_label = db_label.clone();
         let last_sent_at = last_sent_at.clone();
+        let is_dragging_press = is_dragging.clone();
+        let is_dragging_release = is_dragging.clone();
         let release = gtk::GestureClick::new();
+        release.connect_pressed(move |_, _, _, _| {
+            is_dragging_press.set(true);
+        });
         release.connect_released(move |_, _, _, _| {
+            is_dragging_release.set(false);
             let state = state.borrow();
             let now = Instant::now();
             if should_emit_volume_update(*last_sent_at.borrow(), now, true) {
@@ -166,7 +198,14 @@ pub fn build_strip_widget_with_meter(
     root.append(&slider_overlay);
     root.append(&db_label);
     root.append(&mute);
-    (root, meter)
+
+    let handle = SliderHandle {
+        scale: slider.clone(),
+        suppress_signal,
+        is_dragging,
+    };
+
+    (root, meter, handle)
 }
 
 fn should_emit_volume_update(last_sent_at: Instant, now: Instant, is_release: bool) -> bool {
@@ -206,5 +245,13 @@ mod tests {
 
         assert!(!super::should_emit_volume_update(just_sent, now, false));
         assert!(super::should_emit_volume_update(just_sent, now, true));
+    }
+
+    #[test]
+    fn slider_handle_suppression_flags_default_to_false() {
+        let _ = gtk::init();
+        let handle = super::SliderHandle::new_for_test();
+        assert!(!handle.suppress_signal.get());
+        assert!(!handle.is_dragging.get());
     }
 }

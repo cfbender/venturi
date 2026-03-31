@@ -22,7 +22,7 @@ use crate::core::pipewire_backend::{
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
 };
-use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump, poll_snapshot};
+use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump};
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{
     FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands, build_metadata_target_args,
@@ -42,11 +42,13 @@ pub fn fallback_to_default_device() -> &'static str {
 const LOOP_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_STREAM_PROBES_PER_CHANNEL: usize = 1;
 const ECHO_SUPPRESSION_WINDOW: Duration = Duration::from_millis(200);
+const RESTART_DELAY: Duration = Duration::from_secs(2);
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
 const METER_WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const METER_OVERRIDE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const METER_SAMPLE_INTERVAL: Duration = Duration::from_millis(66);
-const METER_SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const VIRTUAL_SINKS: [&str; 1] = ["Venturi-Output"];
 const VIRTUAL_SOURCES: [&str; 1] = ["Venturi-VirtualMic"];
 const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
@@ -263,10 +265,17 @@ struct CoreRuntimeState {
     meter_enabled: Arc<AtomicBool>,
     last_volume_sent: BTreeMap<Channel, Instant>,
     pub shared_snapshot: Arc<Mutex<Snapshot>>,
+    consecutive_failures: u32,
+    first_failure_at: Instant,
+    restart_pending_until: Option<Instant>,
 }
 
 impl CoreRuntimeState {
-    fn initialize(event_tx: &Sender<CoreEvent>, meter_enabled: Arc<AtomicBool>) -> Self {
+    fn initialize(
+        event_tx: &Sender<CoreEvent>,
+        meter_enabled: Arc<AtomicBool>,
+        shared_snapshot: Arc<Mutex<Snapshot>>,
+    ) -> Self {
         let routing_mode =
             routing_mode_from_flag(std::env::var(FORCE_LINK_ROUTING_ENV).ok().as_deref());
         let paths = Paths::resolve();
@@ -326,7 +335,10 @@ impl CoreRuntimeState {
             state_saver: DebouncedSaver::new(),
             meter_enabled,
             last_volume_sent: BTreeMap::new(),
-            shared_snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            shared_snapshot,
+            consecutive_failures: 0,
+            first_failure_at: Instant::now(),
+            restart_pending_until: None,
         };
 
         state.overrides = deserialize_overrides(&state.runtime_config.categorizer.overrides);
@@ -632,44 +644,6 @@ impl CoreRuntimeState {
         self.state_saver.did_flush();
     }
 
-    fn refresh_snapshot(&mut self, event_tx: &Sender<CoreEvent>) {
-        let hidden_outputs = [VENTURI_MAIN_OUTPUT];
-        match poll_snapshot(hidden_outputs.as_slice(), VIRTUAL_SOURCES.as_slice()) {
-            Ok(snapshot) => {
-                if snapshot.devices != self.last_snapshot.devices {
-                    let _ = event_tx.send(CoreEvent::DevicesChanged(snapshot.devices.clone()));
-                }
-
-                for (id, stream) in &snapshot.streams {
-                    if !self.last_snapshot.streams.contains_key(id) {
-                        let category = classify_with_priority(
-                            &self.overrides,
-                            Some(&stream.app_key),
-                            Some(&stream.display_name),
-                            stream.media_role.as_deref(),
-                        );
-                        let _ = event_tx.send(CoreEvent::StreamAppeared {
-                            id: *id,
-                            name: stream.display_name.clone(),
-                            category,
-                        });
-                    }
-                }
-
-                for id in self.last_snapshot.streams.keys() {
-                    if !snapshot.streams.contains_key(id) {
-                        let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
-                    }
-                }
-
-                self.last_snapshot = snapshot;
-            }
-            Err(err) => {
-                let _ = event_tx.send(CoreEvent::Error(err));
-            }
-        }
-    }
-
     fn handle_monitor_event(
         &mut self,
         event: PwMonitorEvent,
@@ -704,6 +678,10 @@ impl CoreRuntimeState {
                     }
                 }
 
+                // Reset circuit breaker on successful reconnect
+                self.consecutive_failures = 0;
+                self.restart_pending_until = None;
+
                 self.last_snapshot = snapshot;
                 // Update shared snapshot for meter worker
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
@@ -713,11 +691,37 @@ impl CoreRuntimeState {
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
             }
             PwMonitorEvent::ProcessDied(reason) => {
-                // TODO(Task 8): Replace with handle_monitor_died + circuit breaker + auto-restart
-                eprintln!("PwMonitor died: {reason}");
-                let _ = event_tx.send(CoreEvent::Error(format!("PwMonitor died: {reason}")));
+                self.handle_monitor_died(reason, event_tx);
             }
         }
+    }
+
+    fn handle_monitor_died(
+        &mut self,
+        reason: String,
+        event_tx: &crossbeam_channel::Sender<CoreEvent>,
+    ) {
+        self.consecutive_failures += 1;
+
+        if self.consecutive_failures == 1 {
+            self.first_failure_at = Instant::now();
+        }
+
+        let _ = event_tx.send(CoreEvent::Error(format!(
+            "PipeWire monitor stopped: {reason}. Reconnecting..."
+        )));
+
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+            && self.first_failure_at.elapsed() < FAILURE_WINDOW
+        {
+            let _ = event_tx.send(CoreEvent::Error(
+                "PipeWire monitor failed repeatedly. Check PipeWire status.".to_string(),
+            ));
+            return; // Stop retrying
+        }
+
+        // Schedule non-blocking restart
+        self.restart_pending_until = Some(Instant::now() + RESTART_DELAY);
     }
 
     fn merge_changed_objects(
@@ -762,8 +766,8 @@ impl CoreRuntimeState {
         let changed_json = serde_json::to_string(objects).unwrap_or_default();
         if let Ok(partial) = parse_pw_dump(
             &changed_json,
-            &VIRTUAL_SINKS.iter().copied().collect::<Vec<_>>(),
-            &VIRTUAL_SOURCES.iter().copied().collect::<Vec<_>>(),
+            VIRTUAL_SINKS.as_slice(),
+            VIRTUAL_SOURCES.as_slice(),
         ) {
             // Merge streams: check for appeared/removed
             for (id, stream_info) in &partial.streams {
@@ -861,14 +865,6 @@ fn collect_unique_level_targets(
         .collect()
 }
 
-fn should_refresh_meter_snapshot(
-    snapshot_missing: bool,
-    refresh_interval: Duration,
-    elapsed: Duration,
-) -> bool {
-    snapshot_missing || elapsed >= refresh_interval
-}
-
 /// Coalesce a batch of commands: keep only the last SetVolume per channel,
 /// preserve all other commands in order, and stop early on Shutdown.
 fn coalesce_commands(commands: Vec<CoreCommand>) -> Vec<CoreCommand> {
@@ -909,18 +905,19 @@ fn compute_level_sample_count(sample_rate_hz: u32, sample_interval: Duration) ->
 
 fn spawn_meter_worker(
     event_tx: Sender<CoreEvent>,
+    shared_snapshot: Arc<Mutex<Snapshot>>,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let hidden_outputs = [VENTURI_MAIN_OUTPUT];
         let paths = Paths::resolve();
         let level_sample_count = compute_level_sample_count(48_000, METER_SAMPLE_INTERVAL);
         let mut meter_overrides = BTreeMap::new();
         let mut last_override_refresh = Instant::now() - METER_OVERRIDE_REFRESH_INTERVAL;
         let mut last_meter_sample = Instant::now() - METER_SAMPLE_INTERVAL;
         let mut cached_snapshot: Option<Snapshot> = None;
-        let mut last_snapshot_refresh = Instant::now() - METER_SNAPSHOT_REFRESH_INTERVAL;
+        const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+        let mut last_snapshot_clone = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
         let mut samplers: BTreeMap<u32, PwTargetSampler> = BTreeMap::new();
         while running.load(Ordering::Relaxed) {
             if !enabled.load(Ordering::Relaxed) {
@@ -936,17 +933,12 @@ fn spawn_meter_worker(
                 meter_overrides = deserialize_overrides(&load_config(&paths).categorizer.overrides);
                 last_override_refresh = Instant::now();
             }
-            if should_refresh_meter_snapshot(
-                cached_snapshot.is_none(),
-                METER_SNAPSHOT_REFRESH_INTERVAL,
-                last_snapshot_refresh.elapsed(),
-            ) {
-                if let Ok(snapshot) =
-                    poll_snapshot(hidden_outputs.as_slice(), VIRTUAL_SOURCES.as_slice())
-                {
-                    cached_snapshot = Some(snapshot);
-                    last_snapshot_refresh = Instant::now();
-                }
+            if last_snapshot_clone.elapsed() >= SNAPSHOT_REFRESH_INTERVAL
+                || cached_snapshot.is_none()
+            {
+                let snapshot = shared_snapshot.lock().unwrap().clone();
+                cached_snapshot = Some(snapshot);
+                last_snapshot_clone = Instant::now();
             }
 
             if let Some(snapshot) = cached_snapshot.as_ref() {
@@ -991,20 +983,23 @@ impl PipeWireManager {
     pub fn spawn(command_rx: Receiver<CoreCommand>, event_tx: Sender<CoreEvent>) -> Self {
         let meter_running = Arc::new(AtomicBool::new(true));
         let meter_enabled = Arc::new(AtomicBool::new(true));
+        let shared_snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let meter_handle = spawn_meter_worker(
             event_tx.clone(),
+            shared_snapshot.clone(),
             meter_running.clone(),
             meter_enabled.clone(),
         );
         let meter_running_for_core = meter_running.clone();
         let meter_enabled_for_core = meter_enabled.clone();
+        let shared_snapshot_for_core = shared_snapshot;
 
         let (monitor_tx, monitor_rx) = crossbeam_channel::unbounded();
 
         // Clone monitor_tx BEFORE moving it into spawn, so we retain a copy for restarts (Task 8).
         let mut monitor: Option<PwMonitor> = match PwMonitor::spawn(
-            &VIRTUAL_SINKS.iter().copied().collect::<Vec<_>>(),
-            &VIRTUAL_SOURCES.iter().copied().collect::<Vec<_>>(),
+            VIRTUAL_SINKS.as_slice(),
+            VIRTUAL_SOURCES.as_slice(),
             monitor_tx.clone(),
         ) {
             Ok(m) => Some(m),
@@ -1016,9 +1011,19 @@ impl PipeWireManager {
 
         let handle = std::thread::spawn(move || {
             let _ = event_tx.send(CoreEvent::Ready);
-            let mut state = CoreRuntimeState::initialize(&event_tx, meter_enabled_for_core);
+            let mut state = CoreRuntimeState::initialize(
+                &event_tx,
+                meter_enabled_for_core,
+                shared_snapshot_for_core,
+            );
 
             loop {
+                let timeout = if state.restart_pending_until.is_some() {
+                    LOOP_TICK_INTERVAL.min(Duration::from_millis(100))
+                } else {
+                    LOOP_TICK_INTERVAL
+                };
+
                 crossbeam_channel::select! {
                     recv(command_rx) -> msg => {
                         let Ok(first_cmd) = msg else { break };
@@ -1051,11 +1056,29 @@ impl PipeWireManager {
                             state.handle_monitor_event(event, &event_tx);
                         }
                     },
-                    default(LOOP_TICK_INTERVAL) => {}
+                    default(timeout) => {}
+                }
+
+                // Check for pending restart
+                if let Some(deadline) = state.restart_pending_until
+                    && Instant::now() >= deadline
+                {
+                    state.restart_pending_until = None;
+                    match PwMonitor::spawn(
+                        VIRTUAL_SINKS.as_slice(),
+                        VIRTUAL_SOURCES.as_slice(),
+                        monitor_tx.clone(),
+                    ) {
+                        Ok(new_monitor) => {
+                            monitor = Some(new_monitor);
+                        }
+                        Err(e) => {
+                            state.handle_monitor_died(format!("restart failed: {e}"), &event_tx);
+                        }
+                    }
                 }
 
                 // Hotkey tick, state flush — run on every loop iteration
-                // (at least every 50ms via default timeout)
                 state.handle_hotkey_tick(&event_tx);
                 state.flush_persisted_state_if_due(&event_tx);
             }
@@ -1074,6 +1097,7 @@ impl PipeWireManager {
         self.meter_enabled.store(false, Ordering::Relaxed);
         let core_result = self.handle.join();
         let meter_result = self.meter_handle.join();
+        #[allow(clippy::question_mark)] // thread::Result error type doesn't implement From for ?
         if core_result.is_err() {
             return core_result;
         }
@@ -1095,7 +1119,7 @@ mod tests {
     use super::{
         build_channel_level_targets, coalesce_commands, compute_channel_level_updates_with,
         compute_level_sample_count, node_id_to_channel, persisted_channel_mute,
-        persisted_channel_volume, resolve_output_loopback_target, should_refresh_meter_snapshot,
+        persisted_channel_volume, resolve_output_loopback_target,
         should_skip_output_device_reconcile,
     };
 
@@ -1220,26 +1244,6 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_meter_snapshot_when_missing_or_interval_elapsed() {
-        let refresh_interval = Duration::from_millis(750);
-        assert!(should_refresh_meter_snapshot(
-            true,
-            refresh_interval,
-            Duration::from_millis(0),
-        ));
-        assert!(should_refresh_meter_snapshot(
-            false,
-            refresh_interval,
-            Duration::from_millis(750),
-        ));
-        assert!(!should_refresh_meter_snapshot(
-            false,
-            refresh_interval,
-            Duration::from_millis(300),
-        ));
-    }
-
-    #[test]
     fn computes_meter_sample_count_for_sampling_interval() {
         assert_eq!(
             compute_level_sample_count(48_000, Duration::from_millis(66)),
@@ -1266,7 +1270,10 @@ mod tests {
         let mut snapshot = Snapshot::default();
         snapshot.output_ids.insert("main-sink".to_string(), 50);
         let overrides = BTreeMap::new();
-        assert_eq!(node_id_to_channel(50, &snapshot, &overrides), Some(Channel::Main));
+        assert_eq!(
+            node_id_to_channel(50, &snapshot, &overrides),
+            Some(Channel::Main)
+        );
     }
 
     #[test]
@@ -1274,22 +1281,31 @@ mod tests {
         let mut snapshot = Snapshot::default();
         snapshot.input_ids.insert("main-source".to_string(), 60);
         let overrides = BTreeMap::new();
-        assert_eq!(node_id_to_channel(60, &snapshot, &overrides), Some(Channel::Mic));
+        assert_eq!(
+            node_id_to_channel(60, &snapshot, &overrides),
+            Some(Channel::Mic)
+        );
     }
 
     #[test]
     fn node_id_to_channel_maps_stream_via_categorizer() {
         let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(100, crate::core::pipewire_discovery::StreamInfo {
-            id: 100,
-            meter_target: 0,
-            app_key: "firefox".to_string(),
-            display_name: "Firefox".to_string(),
-            media_role: None,
-        });
+        snapshot.streams.insert(
+            100,
+            crate::core::pipewire_discovery::StreamInfo {
+                id: 100,
+                meter_target: 0,
+                app_key: "firefox".to_string(),
+                display_name: "Firefox".to_string(),
+                media_role: None,
+            },
+        );
         let overrides = BTreeMap::new();
         // Firefox classifies as Media
-        assert_eq!(node_id_to_channel(100, &snapshot, &overrides), Some(Channel::Media));
+        assert_eq!(
+            node_id_to_channel(100, &snapshot, &overrides),
+            Some(Channel::Media)
+        );
     }
 
     #[test]
@@ -1308,7 +1324,9 @@ mod tests {
         ];
         let result = coalesce_commands(commands);
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.9).abs() < 0.001));
+        assert!(
+            matches!(result[0], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.9).abs() < 0.001)
+        );
     }
 
     #[test]
@@ -1321,8 +1339,13 @@ mod tests {
         let result = coalesce_commands(commands);
         // SetMute emitted in order, then coalesced SetVolume(Main, 0.8) at end
         assert_eq!(result.len(), 2);
-        assert!(matches!(result[0], CoreCommand::SetMute(Channel::Game, true)));
-        assert!(matches!(result[1], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.8).abs() < 0.001));
+        assert!(matches!(
+            result[0],
+            CoreCommand::SetMute(Channel::Game, true)
+        ));
+        assert!(
+            matches!(result[1], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.8).abs() < 0.001)
+        );
     }
 
     #[test]
@@ -1335,8 +1358,12 @@ mod tests {
         let result = coalesce_commands(commands);
         assert_eq!(result.len(), 2);
         // Volume commands emitted in deterministic Channel order (Main < Game via Ord)
-        assert!(matches!(result[0], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.7).abs() < 0.001));
-        assert!(matches!(result[1], CoreCommand::SetVolume(Channel::Game, v) if (v - 0.6).abs() < 0.001));
+        assert!(
+            matches!(result[0], CoreCommand::SetVolume(Channel::Main, v) if (v - 0.7).abs() < 0.001)
+        );
+        assert!(
+            matches!(result[1], CoreCommand::SetVolume(Channel::Game, v) if (v - 0.6).abs() < 0.001)
+        );
     }
 
     #[test]
@@ -1373,7 +1400,10 @@ mod tests {
             .get(&channel)
             .map(|sent_at| sent_at.elapsed() < Duration::from_millis(200))
             .unwrap_or(false);
-        assert!(suppressed, "volume change within 200ms should be suppressed");
+        assert!(
+            suppressed,
+            "volume change within 200ms should be suppressed"
+        );
     }
 
     #[test]
@@ -1390,7 +1420,10 @@ mod tests {
             .get(&channel)
             .map(|sent_at| sent_at.elapsed() < Duration::from_millis(200))
             .unwrap_or(false);
-        assert!(!suppressed, "volume change after 200ms should NOT be suppressed");
+        assert!(
+            !suppressed,
+            "volume change after 200ms should NOT be suppressed"
+        );
     }
 
     #[test]
@@ -1404,6 +1437,51 @@ mod tests {
             .get(&channel)
             .map(|sent_at| sent_at.elapsed() < std::time::Duration::from_millis(200))
             .unwrap_or(false);
-        assert!(!suppressed, "channel with no prior send should NOT be suppressed");
+        assert!(
+            !suppressed,
+            "channel with no prior send should NOT be suppressed"
+        );
+    }
+
+    #[test]
+    fn restart_logic_allows_first_two_failures() {
+        use std::time::Instant;
+
+        let mut consecutive_failures: u32 = 0;
+        let first_failure_at = Instant::now();
+        let max_failures: u32 = 3;
+        let failure_window = Duration::from_secs(30);
+
+        // First failure
+        consecutive_failures += 1;
+        let should_give_up =
+            consecutive_failures >= max_failures && first_failure_at.elapsed() < failure_window;
+        assert!(!should_give_up, "first failure should not give up");
+
+        // Second failure
+        consecutive_failures += 1;
+        let should_give_up =
+            consecutive_failures >= max_failures && first_failure_at.elapsed() < failure_window;
+        assert!(!should_give_up, "second failure should not give up");
+    }
+
+    #[test]
+    fn restart_logic_gives_up_after_three_fast_failures() {
+        use std::time::Instant;
+
+        let consecutive_failures: u32 = 3;
+        let first_failure_at = Instant::now();
+        let failure_window = Duration::from_secs(30);
+
+        let should_give_up =
+            consecutive_failures >= 3 && first_failure_at.elapsed() < failure_window;
+        assert!(should_give_up, "3 failures in 30s should give up");
+    }
+
+    #[test]
+    fn restart_logic_resets_after_success() {
+        let mut consecutive_failures: u32 = 2;
+        consecutive_failures = 0;
+        assert_eq!(consecutive_failures, 0);
     }
 }

@@ -1,6 +1,5 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::process::Command;
 
 use crate::core::messages::{DeviceEntry, DeviceKind};
 
@@ -22,20 +21,6 @@ pub(crate) struct Snapshot {
     pub input_meter_targets: BTreeMap<String, u32>,
     pub streams: BTreeMap<u32, StreamInfo>,
     pub volumes: BTreeMap<u32, f32>,
-}
-
-pub(crate) fn poll_snapshot(
-    hidden_outputs: &[&str],
-    hidden_inputs: &[&str],
-) -> Result<Snapshot, String> {
-    let output = Command::new("pw-dump")
-        .output()
-        .map_err(|e| format!("failed to run pw-dump: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("pw-dump exited with {}", output.status));
-    }
-    let raw = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    parse_pw_dump(&raw, hidden_outputs, hidden_inputs)
 }
 
 /// Extract the maximum linear volume from a PipeWire node's channelVolumes property.
@@ -204,10 +189,10 @@ pub(crate) fn parse_pw_dump(
     // Extract volumes for all nodes
     let mut volumes = BTreeMap::new();
     for item in arr {
-        if let Some(id) = item.get("id").and_then(|v| v.as_u64()) {
-            if let Some(vol) = extract_volume(item) {
-                volumes.insert(id as u32, vol);
-            }
+        if let Some(id) = item.get("id").and_then(|v| v.as_u64())
+            && let Some(vol) = extract_volume(item)
+        {
+            volumes.insert(id as u32, vol);
         }
     }
 
@@ -336,14 +321,18 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
-        assert!(snapshot
-            .devices
-            .iter()
-            .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.pci"));
-        assert!(snapshot
-            .devices
-            .iter()
-            .any(|d| d.kind == DeviceKind::Input && d.id == "venturi_virtual_mic"));
+        assert!(
+            snapshot
+                .devices
+                .iter()
+                .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.pci")
+        );
+        assert!(
+            snapshot
+                .devices
+                .iter()
+                .any(|d| d.kind == DeviceKind::Input && d.id == "venturi_virtual_mic")
+        );
     }
 
     #[test]
@@ -358,10 +347,12 @@ mod tests {
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), hidden.as_slice()).expect("parse snapshot");
         assert!(!snapshot.devices.iter().any(|d| d.id.contains(".monitor")));
-        assert!(!snapshot
-            .devices
-            .iter()
-            .any(|d| d.kind == DeviceKind::Input && d.id == "Venturi-VirtualMic"));
+        assert!(
+            !snapshot
+                .devices
+                .iter()
+                .any(|d| d.kind == DeviceKind::Input && d.id == "Venturi-VirtualMic")
+        );
         assert!(snapshot.input_ids.contains_key("Venturi-VirtualMic"));
     }
 
@@ -409,10 +400,12 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
-        assert!(snapshot
-            .devices
-            .iter()
-            .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.real"));
+        assert!(
+            snapshot
+                .devices
+                .iter()
+                .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.real")
+        );
         assert!(!snapshot.devices.iter().any(|d| d.id.contains("loopback")));
         assert!(snapshot.streams.is_empty());
     }

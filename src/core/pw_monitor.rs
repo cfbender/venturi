@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::Sender;
 use serde_json::Value;
 
-use super::pipewire_discovery::{parse_pw_dump, Snapshot};
+use super::pipewire_discovery::{Snapshot, parse_pw_dump};
 
 /// Events delivered from the pw-dump monitor reader thread to the core loop.
 #[derive(Debug)]
