@@ -1,7 +1,7 @@
 use std::time::Duration;
 use std::{
     cell::{Cell, RefCell},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -10,12 +10,12 @@ use adw::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::GuiLauncher;
-use crate::config::persistence::{Paths, load_config, load_state};
+use crate::config::persistence::{load_config, load_state, Paths};
 use crate::config::schema::Palette;
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
-use crate::gui::mixer_tab::{MixerTab, build_mixer_widget};
-use crate::gui::settings_tab::{SettingsTab, build_settings_widget};
-use crate::gui::soundboard_tab::{SoundboardTab, build_soundboard_widget};
+use crate::gui::mixer_tab::{build_mixer_widget, MixerTab};
+use crate::gui::settings_tab::{build_settings_widget, SettingsTab};
+use crate::gui::soundboard_tab::{build_soundboard_widget, SoundboardTab};
 
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -153,11 +153,18 @@ pub fn run_gtk_app(
     let event_rx_outer = event_rx.clone();
 
     app.connect_activate(move |app| {
+        gtk::Window::set_default_icon_name("org.venturi.Venturi");
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
         let paths = Paths::resolve();
         let config = load_config(&paths);
         let persisted_state = load_state(&paths);
         install_mixer_css(config.palette.as_ref());
+
+        if let Some(dev_data_dir) = resolve_dev_data_dir(Path::new(env!("CARGO_MANIFEST_DIR"))) {
+            if let Some(display) = gtk::gdk::Display::default() {
+                gtk::IconTheme::for_display(&display).add_search_path(&dev_data_dir);
+            }
+        }
 
         let config_path = paths.config_file().display().to_string();
         let vm = Rc::new(RefCell::new(MainWindow::new(
@@ -510,20 +517,12 @@ fn install_mixer_css(palette: Option<&Palette>) {
     );
 }
 
+fn resolve_dev_data_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    let dir = manifest_dir.join("data");
+    dir.exists().then_some(dir)
+}
+
 fn build_brand_logo() -> gtk::Image {
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/venturi-logo.svg"),
-        PathBuf::from("/app/share/icons/hicolor/scalable/apps/org.venturi.Venturi.svg"),
-    ];
-
-    for candidate in candidates {
-        if candidate.exists() {
-            let image = gtk::Image::from_file(candidate);
-            image.set_pixel_size(28);
-            return image;
-        }
-    }
-
     let image = gtk::Image::from_icon_name("org.venturi.Venturi");
     image.set_pixel_size(28);
     image
@@ -628,5 +627,21 @@ mod tests {
             .unwrap_or_else(|| ChannelStrip::new(Channel::Main, "🔊", "Main"));
         assert!((main.volume_linear - persisted.volumes.main).abs() < 0.0001);
         assert_eq!(main.muted, persisted.muted.main);
+    }
+
+    #[test]
+    fn resolve_dev_data_dir_returns_some_when_data_exists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(temp.path().join("data")).expect("create data dir");
+
+        let resolved = super::resolve_dev_data_dir(temp.path());
+        assert_eq!(resolved, Some(temp.path().join("data")));
+    }
+
+    #[test]
+    fn resolve_dev_data_dir_returns_none_when_data_missing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let resolved = super::resolve_dev_data_dir(temp.path());
+        assert_eq!(resolved, None);
     }
 }

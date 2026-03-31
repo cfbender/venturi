@@ -86,7 +86,7 @@ impl ksni::Tray for VenturiTray {
     }
 
     fn icon_name(&self) -> String {
-        "audio-card-symbolic".to_string()
+        "org.venturi.Venturi".to_string()
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -108,5 +108,22 @@ impl ksni::Tray for VenturiTray {
             }
             .into(),
         ]
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use crossbeam_channel::unbounded;
+
+    use super::VenturiTray;
+
+    #[test]
+    fn tray_reports_venturi_icon_name() {
+        let (tx, _rx) = unbounded();
+        let tray = VenturiTray { command_tx: tx };
+        assert_eq!(
+            <VenturiTray as ksni::Tray>::icon_name(&tray),
+            "org.venturi.Venturi"
+        );
     }
 }
