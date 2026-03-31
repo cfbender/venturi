@@ -24,8 +24,8 @@ pub(crate) struct Snapshot {
 }
 
 pub(crate) fn poll_snapshot(
-    hidden_outputs: &[&'static str],
-    hidden_inputs: &[&'static str],
+    hidden_outputs: &[&str],
+    hidden_inputs: &[&str],
 ) -> Result<Snapshot, String> {
     let output = Command::new("pw-dump")
         .output()
@@ -39,8 +39,8 @@ pub(crate) fn poll_snapshot(
 
 pub(crate) fn parse_pw_dump(
     raw: &str,
-    hidden_outputs: &[&'static str],
-    hidden_inputs: &[&'static str],
+    hidden_outputs: &[&str],
+    hidden_inputs: &[&str],
 ) -> Result<Snapshot, String> {
     let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     let arr = value
@@ -306,18 +306,14 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
-        assert!(
-            snapshot
-                .devices
-                .iter()
-                .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.pci")
-        );
-        assert!(
-            snapshot
-                .devices
-                .iter()
-                .any(|d| d.kind == DeviceKind::Input && d.id == "venturi_virtual_mic")
-        );
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.pci"));
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Input && d.id == "venturi_virtual_mic"));
     }
 
     #[test]
@@ -332,12 +328,10 @@ mod tests {
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), hidden.as_slice()).expect("parse snapshot");
         assert!(!snapshot.devices.iter().any(|d| d.id.contains(".monitor")));
-        assert!(
-            !snapshot
-                .devices
-                .iter()
-                .any(|d| d.kind == DeviceKind::Input && d.id == "Venturi-VirtualMic")
-        );
+        assert!(!snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Input && d.id == "Venturi-VirtualMic"));
         assert!(snapshot.input_ids.contains_key("Venturi-VirtualMic"));
     }
 
@@ -385,12 +379,10 @@ mod tests {
 
         let snapshot =
             parse_pw_dump(raw, empty.as_slice(), empty.as_slice()).expect("parse snapshot");
-        assert!(
-            snapshot
-                .devices
-                .iter()
-                .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.real")
-        );
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|d| d.kind == DeviceKind::Output && d.id == "alsa_output.real"));
         assert!(!snapshot.devices.iter().any(|d| d.id.contains("loopback")));
         assert!(snapshot.streams.is_empty());
     }
