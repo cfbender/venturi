@@ -1,6 +1,7 @@
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,8 @@ use crate::core::pipewire_backend::{
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
 };
-use crate::core::pipewire_discovery::{Snapshot, poll_snapshot};
+use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump, poll_snapshot};
+use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{
     FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands, build_metadata_target_args,
     routing_mode_from_flag,
@@ -37,11 +39,9 @@ pub fn fallback_to_default_device() -> &'static str {
     "Default"
 }
 
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LOOP_TICK_INTERVAL: Duration = Duration::from_millis(50);
-const LEVEL_POLL_INTERVAL: Duration = Duration::from_millis(180);
 const MAX_STREAM_PROBES_PER_CHANNEL: usize = 1;
-const ENABLE_LEVEL_POLLING: bool = false;
+const ECHO_SUPPRESSION_WINDOW: Duration = Duration::from_millis(200);
 const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
 const METER_WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const METER_OVERRIDE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -261,6 +261,8 @@ struct CoreRuntimeState {
     runtime_state: crate::config::schema::State,
     state_saver: DebouncedSaver,
     meter_enabled: Arc<AtomicBool>,
+    last_volume_sent: BTreeMap<Channel, Instant>,
+    pub shared_snapshot: Arc<Mutex<Snapshot>>,
 }
 
 impl CoreRuntimeState {
@@ -323,6 +325,8 @@ impl CoreRuntimeState {
             runtime_state,
             state_saver: DebouncedSaver::new(),
             meter_enabled,
+            last_volume_sent: BTreeMap::new(),
+            shared_snapshot: Arc::new(Mutex::new(Snapshot::default())),
         };
 
         state.overrides = deserialize_overrides(&state.runtime_config.categorizer.overrides);
@@ -384,6 +388,7 @@ impl CoreRuntimeState {
                     &mut self.last_sink_volume_by_target,
                     &mut self.last_source_volume_by_target,
                 );
+                self.last_volume_sent.insert(channel, Instant::now());
                 set_persisted_channel_volume(&mut self.runtime_state, channel, volume);
                 self.state_saver.mark_dirty(Instant::now());
             }
@@ -664,6 +669,121 @@ impl CoreRuntimeState {
             }
         }
     }
+
+    fn handle_monitor_event(
+        &mut self,
+        event: PwMonitorEvent,
+        event_tx: &crossbeam_channel::Sender<CoreEvent>,
+    ) {
+        match event {
+            PwMonitorEvent::InitialSnapshot(snapshot) => {
+                // Diff devices
+                if snapshot.devices != self.last_snapshot.devices {
+                    let _ = event_tx.send(CoreEvent::DevicesChanged(snapshot.devices.clone()));
+                }
+                // Diff streams (appeared)
+                for (id, stream) in &snapshot.streams {
+                    if !self.last_snapshot.streams.contains_key(id) {
+                        let category = classify_with_priority(
+                            &self.overrides,
+                            Some(&stream.app_key),
+                            Some(&stream.display_name),
+                            stream.media_role.as_deref(),
+                        );
+                        let _ = event_tx.send(CoreEvent::StreamAppeared {
+                            id: *id,
+                            name: stream.display_name.clone(),
+                            category,
+                        });
+                    }
+                }
+                // Diff streams (removed)
+                for id in self.last_snapshot.streams.keys() {
+                    if !snapshot.streams.contains_key(id) {
+                        let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
+                    }
+                }
+
+                self.last_snapshot = snapshot;
+                // Update shared snapshot for meter worker
+                *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
+            }
+            PwMonitorEvent::ObjectsChanged(objects) => {
+                self.merge_changed_objects(&objects, event_tx);
+                *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
+            }
+            PwMonitorEvent::ProcessDied(reason) => {
+                // TODO(Task 8): Replace with handle_monitor_died + circuit breaker + auto-restart
+                eprintln!("PwMonitor died: {reason}");
+                let _ = event_tx.send(CoreEvent::Error(format!("PwMonitor died: {reason}")));
+            }
+        }
+    }
+
+    fn merge_changed_objects(
+        &mut self,
+        objects: &[serde_json::Value],
+        event_tx: &crossbeam_channel::Sender<CoreEvent>,
+    ) {
+        for obj in objects {
+            let Some(id) = obj.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else {
+                continue;
+            };
+
+            // Check for volume changes
+            if let Some(new_vol) = extract_volume(obj) {
+                let old_vol = self.last_snapshot.volumes.get(&id).copied();
+                let vol_changed = old_vol
+                    .map(|old| (old - new_vol).abs() >= 0.01)
+                    .unwrap_or(true);
+
+                if vol_changed {
+                    self.last_snapshot.volumes.insert(id, new_vol);
+
+                    if let Some(channel) =
+                        node_id_to_channel(id, &self.last_snapshot, &self.overrides)
+                    {
+                        // Echo suppression
+                        let suppressed = self
+                            .last_volume_sent
+                            .get(&channel)
+                            .map(|sent_at| sent_at.elapsed() < ECHO_SUPPRESSION_WINDOW)
+                            .unwrap_or(false);
+
+                        if !suppressed {
+                            let _ = event_tx.send(CoreEvent::VolumeChanged(channel, new_vol));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Incremental structural diffing: re-parse changed objects for device/stream changes.
+        let changed_json = serde_json::to_string(objects).unwrap_or_default();
+        if let Ok(partial) = parse_pw_dump(
+            &changed_json,
+            &VIRTUAL_SINKS.iter().copied().collect::<Vec<_>>(),
+            &VIRTUAL_SOURCES.iter().copied().collect::<Vec<_>>(),
+        ) {
+            // Merge streams: check for appeared/removed
+            for (id, stream_info) in &partial.streams {
+                if !self.last_snapshot.streams.contains_key(id) {
+                    let category = classify_with_priority(
+                        &self.overrides,
+                        Some(&stream_info.app_key),
+                        Some(&stream_info.display_name),
+                        stream_info.media_role.as_deref(),
+                    );
+                    let _ = event_tx.send(CoreEvent::StreamAppeared {
+                        id: *id,
+                        name: stream_info.display_name.clone(),
+                        category,
+                    });
+                }
+                self.last_snapshot.streams.insert(*id, stream_info.clone());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -878,40 +998,66 @@ impl PipeWireManager {
         );
         let meter_running_for_core = meter_running.clone();
         let meter_enabled_for_core = meter_enabled.clone();
+
+        let (monitor_tx, monitor_rx) = crossbeam_channel::unbounded();
+
+        // Clone monitor_tx BEFORE moving it into spawn, so we retain a copy for restarts (Task 8).
+        let mut monitor: Option<PwMonitor> = match PwMonitor::spawn(
+            &VIRTUAL_SINKS.iter().copied().collect::<Vec<_>>(),
+            &VIRTUAL_SOURCES.iter().copied().collect::<Vec<_>>(),
+            monitor_tx.clone(),
+        ) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("Failed to start PwMonitor: {e}");
+                None
+            }
+        };
+
         let handle = std::thread::spawn(move || {
             let _ = event_tx.send(CoreEvent::Ready);
             let mut state = CoreRuntimeState::initialize(&event_tx, meter_enabled_for_core);
-            let mut last_snapshot_poll = Instant::now() - POLL_INTERVAL;
-            let mut last_level_poll = Instant::now() - LEVEL_POLL_INTERVAL;
 
             loop {
-                match command_rx.recv_timeout(LOOP_TICK_INTERVAL) {
-                    Ok(command) => match state.handle_core_command(command, &event_tx) {
-                        Ok(CommandLoopControl::Continue) => {}
-                        Ok(CommandLoopControl::Shutdown) => {
-                            state.flush_persisted_state_now(&event_tx);
-                            break;
+                crossbeam_channel::select! {
+                    recv(command_rx) -> msg => {
+                        let Ok(first_cmd) = msg else { break };
+                        let mut commands = vec![first_cmd];
+                        while let Ok(cmd) = command_rx.try_recv() {
+                            commands.push(cmd);
                         }
-                        Err(err) => {
-                            let _ = event_tx
-                                .send(CoreEvent::Error(format!("command handling failed: {err}")));
+                        let coalesced = coalesce_commands(commands);
+                        for cmd in coalesced {
+                            match state.handle_core_command(cmd, &event_tx) {
+                                Ok(CommandLoopControl::Continue) => {}
+                                Ok(CommandLoopControl::Shutdown) => {
+                                    state.flush_persisted_state_now(&event_tx);
+                                    if let Some(m) = monitor.take() {
+                                        m.kill();
+                                    }
+                                    meter_running_for_core.store(false, Ordering::Relaxed);
+                                    return;
+                                }
+                                Err(err) => {
+                                    let _ = event_tx.send(CoreEvent::Error(
+                                        format!("command handling failed: {err}"),
+                                    ));
+                                }
+                            }
                         }
                     },
-                    Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {}
+                    recv(monitor_rx) -> msg => {
+                        if let Ok(event) = msg {
+                            state.handle_monitor_event(event, &event_tx);
+                        }
+                    },
+                    default(LOOP_TICK_INTERVAL) => {}
                 }
 
+                // Hotkey tick, state flush — run on every loop iteration
+                // (at least every 50ms via default timeout)
                 state.handle_hotkey_tick(&event_tx);
                 state.flush_persisted_state_if_due(&event_tx);
-
-                if last_snapshot_poll.elapsed() >= POLL_INTERVAL {
-                    state.refresh_snapshot(&event_tx);
-                    last_snapshot_poll = Instant::now();
-                }
-
-                if ENABLE_LEVEL_POLLING && last_level_poll.elapsed() >= LEVEL_POLL_INTERVAL {
-                    last_level_poll = Instant::now();
-                }
             }
             meter_running_for_core.store(false, Ordering::Relaxed);
         });
@@ -1210,5 +1356,54 @@ mod tests {
     fn coalesce_empty_batch_returns_empty() {
         let result = coalesce_commands(vec![]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn echo_suppression_blocks_recent_volume_changes() {
+        use std::time::{Duration, Instant};
+
+        let mut last_volume_sent: BTreeMap<Channel, Instant> = BTreeMap::new();
+        let channel = Channel::Main;
+
+        // Simulate: we just sent a volume command
+        last_volume_sent.insert(channel, Instant::now());
+
+        // Check suppression — should be suppressed (within 200ms)
+        let suppressed = last_volume_sent
+            .get(&channel)
+            .map(|sent_at| sent_at.elapsed() < Duration::from_millis(200))
+            .unwrap_or(false);
+        assert!(suppressed, "volume change within 200ms should be suppressed");
+    }
+
+    #[test]
+    fn echo_suppression_allows_old_volume_changes() {
+        use std::time::{Duration, Instant};
+
+        let mut last_volume_sent: BTreeMap<Channel, Instant> = BTreeMap::new();
+        let channel = Channel::Main;
+
+        // Simulate: we sent a volume command 300ms ago
+        last_volume_sent.insert(channel, Instant::now() - Duration::from_millis(300));
+
+        let suppressed = last_volume_sent
+            .get(&channel)
+            .map(|sent_at| sent_at.elapsed() < Duration::from_millis(200))
+            .unwrap_or(false);
+        assert!(!suppressed, "volume change after 200ms should NOT be suppressed");
+    }
+
+    #[test]
+    fn echo_suppression_allows_unseen_channels() {
+        use std::time::Instant;
+
+        let last_volume_sent: BTreeMap<Channel, Instant> = BTreeMap::new();
+        let channel = Channel::Game;
+
+        let suppressed = last_volume_sent
+            .get(&channel)
+            .map(|sent_at| sent_at.elapsed() < std::time::Duration::from_millis(200))
+            .unwrap_or(false);
+        assert!(!suppressed, "channel with no prior send should NOT be suppressed");
     }
 }
