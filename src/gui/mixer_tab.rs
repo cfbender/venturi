@@ -140,21 +140,17 @@ impl MixerTab {
 
     pub fn apply_event(&mut self, event: &CoreEvent) {
         match event {
-            CoreEvent::StreamAppeared { id, name, category } => {
-                let chip = AppChip {
-                    stream_id: *id,
-                    app_key: name.to_ascii_lowercase(),
-                    display_name: name.clone(),
-                    channel: *category,
-                    status: crate::gui::app_chip::ChipStatus::Idle,
-                };
-                self.chips.entry(*category).or_default().push(chip);
+            CoreEvent::StreamAppeared {
+                id,
+                app_key,
+                name,
+                category,
+            } => {
+                self.upsert_chip_stream(*id, app_key, name, *category);
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
             CoreEvent::StreamRemoved(id) => {
-                for chips in self.chips.values_mut() {
-                    chips.retain(|chip| chip.stream_id != *id);
-                }
+                self.remove_chip_stream(*id);
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
             CoreEvent::DevicesChanged(devices) => {
@@ -188,6 +184,120 @@ impl MixerTab {
         self.devices.reset_to_default_on_disconnect();
         self.toast = Some("Device disconnected. Reset to Default.".to_string());
         self.ui_dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn upsert_chip_stream(&mut self, stream_id: u32, app_key: &str, name: &str, category: Channel) {
+        self.remove_chip_stream(stream_id);
+
+        let mut found = None;
+        for (channel, chips) in &self.chips {
+            if let Some(idx) = chips.iter().position(|chip| chip.app_key == app_key) {
+                found = Some((*channel, idx));
+                break;
+            }
+        }
+
+        if let Some((existing_channel, chip_index)) = found {
+            let mut chip = self
+                .chips
+                .get_mut(&existing_channel)
+                .expect("existing chip bucket")
+                .remove(chip_index);
+
+            if !chip.stream_ids.contains(&stream_id) {
+                chip.stream_ids.push(stream_id);
+                chip.stream_ids.sort_unstable();
+            }
+            chip.stream_id = chip.stream_ids.first().copied().unwrap_or(stream_id);
+            chip.display_name = name.to_string();
+            chip.channel = category;
+            self.chips.entry(category).or_default().push(chip);
+            self.remove_empty_chip_bucket(existing_channel);
+            return;
+        }
+
+        let chip = AppChip {
+            stream_id,
+            stream_ids: vec![stream_id],
+            app_key: app_key.to_string(),
+            display_name: name.to_string(),
+            channel: category,
+            status: crate::gui::app_chip::ChipStatus::Idle,
+        };
+        self.chips.entry(category).or_default().push(chip);
+    }
+
+    fn remove_chip_stream(&mut self, stream_id: u32) {
+        let mut found = None;
+        for (channel, chips) in &self.chips {
+            if let Some(idx) = chips
+                .iter()
+                .position(|chip| chip.stream_ids.contains(&stream_id))
+            {
+                found = Some((*channel, idx));
+                break;
+            }
+        }
+
+        let Some((channel, chip_index)) = found else {
+            return;
+        };
+
+        let mut remove_channel = false;
+        if let Some(chips) = self.chips.get_mut(&channel)
+            && let Some(chip) = chips.get_mut(chip_index)
+        {
+            chip.stream_ids.retain(|id| *id != stream_id);
+            if chip.stream_ids.is_empty() {
+                chips.remove(chip_index);
+            } else {
+                chip.stream_id = chip.stream_ids[0];
+            }
+            remove_channel = chips.is_empty();
+        }
+
+        if remove_channel {
+            self.chips.remove(&channel);
+        }
+    }
+
+    fn move_chip_to_channel(&mut self, stream_id: u32, channel: Channel) -> Vec<u32> {
+        let mut found = None;
+        for (current_channel, chips) in &self.chips {
+            if let Some(idx) = chips.iter().position(|chip| {
+                chip.stream_id == stream_id || chip.stream_ids.contains(&stream_id)
+            }) {
+                found = Some((*current_channel, idx));
+                break;
+            }
+        }
+
+        let Some((current_channel, chip_index)) = found else {
+            return Vec::new();
+        };
+
+        if current_channel == channel {
+            return Vec::new();
+        }
+
+        let mut chip = self
+            .chips
+            .get_mut(&current_channel)
+            .expect("existing chip bucket")
+            .remove(chip_index);
+        let stream_ids = chip.stream_ids.clone();
+        chip.channel = channel;
+        chip.status = ChipStatus::Idle;
+        self.chips.entry(channel).or_default().push(chip);
+        self.remove_empty_chip_bucket(current_channel);
+        self.mark_ui_dirty();
+        stream_ids
+    }
+
+    fn remove_empty_chip_bucket(&mut self, channel: Channel) {
+        if self.chips.get(&channel).is_some_and(Vec::is_empty) {
+            self.chips.remove(&channel);
+        }
     }
 
     pub fn mark_ui_dirty(&self) {
@@ -421,22 +531,20 @@ pub fn build_mixer_widget(
                     if let Ok(raw) = value.get::<String>()
                         && let Some(payload) = DndPayload::decode(&raw)
                     {
-                        let _ = tx.send(CoreCommand::MoveStream {
-                            stream_id: payload.stream_id,
-                            channel,
-                        });
+                        let mut moved_stream_ids = Vec::new();
                         if let Ok(mut state) = model.try_lock() {
-                            for chips in state.chips.values_mut() {
-                                if let Some(idx) =
-                                    chips.iter().position(|c| c.stream_id == payload.stream_id)
-                                {
-                                    let mut chip = chips.remove(idx);
-                                    chip.channel = channel;
-                                    chip.status = ChipStatus::Idle;
-                                    state.chips.entry(channel).or_default().push(chip);
-                                    state.mark_ui_dirty();
-                                    break;
-                                }
+                            moved_stream_ids =
+                                state.move_chip_to_channel(payload.stream_id, channel);
+                        }
+
+                        for stream_id in moved_stream_ids {
+                            let _ = tx.send(CoreCommand::MoveStream { stream_id, channel });
+                        }
+
+                        if payload.origin == channel {
+                            // Keep drop feedback feeling responsive when dropping in same zone.
+                            if let Ok(state) = model.try_lock() {
+                                state.mark_ui_dirty();
                             }
                         }
                         return true;
@@ -775,5 +883,83 @@ mod tests {
 
         assert_eq!(next_slider, None);
         assert_eq!(next_label, "26%");
+    }
+
+    #[test]
+    fn aggregates_streams_with_same_app_key_into_single_chip() {
+        let mut mixer = MixerTab::default();
+
+        mixer.apply_event(&CoreEvent::StreamAppeared {
+            id: 100,
+            app_key: "discord".to_string(),
+            name: "Discord".to_string(),
+            category: Channel::Chat,
+        });
+        mixer.apply_event(&CoreEvent::StreamAppeared {
+            id: 101,
+            app_key: "discord".to_string(),
+            name: "Discord".to_string(),
+            category: Channel::Chat,
+        });
+
+        let chips = mixer.chips.get(&Channel::Chat).expect("chat chips exist");
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].stream_id, 100);
+        assert_eq!(chips[0].stream_ids, vec![100, 101]);
+    }
+
+    #[test]
+    fn stream_removed_keeps_aggregated_chip_until_last_stream_is_gone() {
+        let mut mixer = MixerTab::default();
+
+        mixer.apply_event(&CoreEvent::StreamAppeared {
+            id: 100,
+            app_key: "discord".to_string(),
+            name: "Discord".to_string(),
+            category: Channel::Chat,
+        });
+        mixer.apply_event(&CoreEvent::StreamAppeared {
+            id: 101,
+            app_key: "discord".to_string(),
+            name: "Discord".to_string(),
+            category: Channel::Chat,
+        });
+
+        mixer.apply_event(&CoreEvent::StreamRemoved(100));
+
+        let chips = mixer.chips.get(&Channel::Chat).expect("chat chips exist");
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].stream_id, 101);
+        assert_eq!(chips[0].stream_ids, vec![101]);
+
+        mixer.apply_event(&CoreEvent::StreamRemoved(101));
+
+        assert!(!mixer.chips.contains_key(&Channel::Chat));
+    }
+
+    #[test]
+    fn move_chip_to_channel_returns_all_stream_ids_for_app() {
+        let mut mixer = MixerTab::default();
+
+        mixer.apply_event(&CoreEvent::StreamAppeared {
+            id: 200,
+            app_key: "youtube-music-desktop-app".to_string(),
+            name: "YouTube Music".to_string(),
+            category: Channel::Media,
+        });
+        mixer.apply_event(&CoreEvent::StreamAppeared {
+            id: 201,
+            app_key: "youtube-music-desktop-app".to_string(),
+            name: "YouTube Music".to_string(),
+            category: Channel::Media,
+        });
+
+        let moved_streams = mixer.move_chip_to_channel(200, Channel::Game);
+
+        assert_eq!(moved_streams, vec![200, 201]);
+        assert!(!mixer.chips.contains_key(&Channel::Media));
+        let game_chips = mixer.chips.get(&Channel::Game).expect("game chips exist");
+        assert_eq!(game_chips.len(), 1);
+        assert_eq!(game_chips[0].stream_ids, vec![200, 201]);
     }
 }

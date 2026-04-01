@@ -389,6 +389,7 @@ fn apply_structural_monitor_delta(
             );
             let _ = event_tx.send(CoreEvent::StreamAppeared {
                 id,
+                app_key: stream_info.app_key.clone(),
                 name: stream_info.display_name.clone(),
                 category,
             });
@@ -619,7 +620,8 @@ fn should_emit_observed_channel_volume(
         return true;
     };
 
-    let Some(current_channel_volume) = channel_volume_from_snapshot(snapshot, overrides, channel) else {
+    let Some(current_channel_volume) = channel_volume_from_snapshot(snapshot, overrides, channel)
+    else {
         return true;
     };
 
@@ -1239,6 +1241,7 @@ impl CoreRuntimeState {
             );
             let _ = event_tx.send(CoreEvent::StreamAppeared {
                 id: *id,
+                app_key: stream.app_key.clone(),
                 name: stream.display_name.clone(),
                 category,
             });
@@ -1268,6 +1271,7 @@ impl CoreRuntimeState {
                         );
                         let _ = event_tx.send(CoreEvent::StreamAppeared {
                             id: *id,
+                            app_key: stream.app_key.clone(),
                             name: stream.display_name.clone(),
                             category,
                         });

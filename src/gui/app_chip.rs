@@ -11,6 +11,7 @@ pub enum ChipStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppChip {
     pub stream_id: u32,
+    pub stream_ids: Vec<u32>,
     pub app_key: String,
     pub display_name: String,
     pub channel: Channel,
@@ -56,7 +57,12 @@ impl DndPayload {
 }
 
 pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
-    let label = gtk::Label::new(Some(&chip.display_name));
+    let chip_label = if chip.stream_ids.len() > 1 {
+        format!("{} ({})", chip.display_name, chip.stream_ids.len())
+    } else {
+        chip.display_name.clone()
+    };
+    let label = gtk::Label::new(Some(&chip_label));
     label.add_css_class("chip-text");
     label.set_xalign(0.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);

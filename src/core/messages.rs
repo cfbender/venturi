@@ -37,6 +37,7 @@ pub enum CoreEvent {
     ToggleWindowRequested,
     StreamAppeared {
         id: u32,
+        app_key: String,
         name: String,
         category: Channel,
     },
