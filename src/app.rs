@@ -1,6 +1,6 @@
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::config::persistence::{load_config, Paths};
+use crate::config::persistence::{Paths, load_config};
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_manager::PipeWireManager;
 use crate::gui::window::MainWindow;
@@ -120,10 +120,9 @@ where
 {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(event) = event_rx.recv_timeout(std::time::Duration::from_millis(100))
-            && predicate(&event)
-        {
-            return Ok(());
+        match event_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(event) if predicate(&event) => return Ok(()),
+            _ => (),
         }
     }
 

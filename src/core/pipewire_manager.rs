@@ -222,17 +222,39 @@ fn apply_structural_monitor_delta(
     snapshot: &mut Snapshot,
     partial: Snapshot,
     removed_ids: &[u32],
+    structural_ids: &[u32],
     overrides: &BTreeMap<String, Channel>,
     event_tx: &Sender<CoreEvent>,
 ) {
     let devices_before = snapshot.devices.clone();
+
+    let partial_stream_ids: BTreeSet<u32> = partial.streams.keys().copied().collect();
+    let partial_output_ids: BTreeSet<u32> = partial.output_ids.values().copied().collect();
+    let partial_input_ids: BTreeSet<u32> = partial.input_ids.values().copied().collect();
+    let structural: BTreeSet<u32> = structural_ids.iter().copied().collect();
+
+    for id in &structural {
+        if !partial_stream_ids.contains(id) && snapshot.streams.remove(id).is_some() {
+            let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
+        }
+        snapshot.volumes.remove(id);
+    }
+
+    snapshot
+        .output_ids
+        .retain(|_, node_id| !structural.contains(node_id) || partial_output_ids.contains(node_id));
+    snapshot
+        .input_ids
+        .retain(|_, node_id| !structural.contains(node_id) || partial_input_ids.contains(node_id));
 
     snapshot.output_ids.extend(partial.output_ids);
     snapshot.input_ids.extend(partial.input_ids);
     snapshot
         .output_meter_targets
         .extend(partial.output_meter_targets);
-    snapshot.input_meter_targets.extend(partial.input_meter_targets);
+    snapshot
+        .input_meter_targets
+        .extend(partial.input_meter_targets);
     snapshot.volumes.extend(partial.volumes);
 
     for (id, stream_info) in partial.streams {
@@ -325,6 +347,49 @@ fn build_channel_level_targets(
     }
 
     targets
+}
+
+fn build_stream_name_level_targets(
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, crate::core::messages::Channel>,
+) -> BTreeMap<crate::core::messages::Channel, Vec<String>> {
+    let mut targets = BTreeMap::new();
+
+    for stream in snapshot.streams.values() {
+        let channel = classify_with_priority(
+            overrides,
+            Some(&stream.app_key),
+            Some(&stream.display_name),
+            stream.media_role.as_deref(),
+        );
+        if matches!(
+            channel,
+            crate::core::messages::Channel::Game
+                | crate::core::messages::Channel::Media
+                | crate::core::messages::Channel::Chat
+                | crate::core::messages::Channel::Aux
+        ) && !stream.is_corked
+            && let Some(node_name) = &stream.node_name
+        {
+            targets
+                .entry(channel)
+                .or_insert_with(Vec::new)
+                .push(node_name.clone());
+        }
+    }
+
+    targets
+}
+
+fn retain_primary_numeric_meter_targets(
+    targets: &mut BTreeMap<crate::core::messages::Channel, Vec<u32>>,
+) {
+    targets.retain(|channel, _| {
+        matches!(
+            channel,
+            crate::core::messages::Channel::Main | crate::core::messages::Channel::Mic
+        )
+    });
 }
 
 pub struct PipeWireManager {
@@ -750,7 +815,9 @@ impl CoreRuntimeState {
     /// itself even if the original events were dropped during startup.
     fn resend_initial_state(&self, event_tx: &crossbeam_channel::Sender<CoreEvent>) {
         if !self.last_snapshot.devices.is_empty() {
-            let _ = event_tx.send(CoreEvent::DevicesChanged(self.last_snapshot.devices.clone()));
+            let _ = event_tx.send(CoreEvent::DevicesChanged(
+                self.last_snapshot.devices.clone(),
+            ));
         }
         for (id, stream) in &self.last_snapshot.streams {
             let category = classify_with_priority(
@@ -853,6 +920,7 @@ impl CoreRuntimeState {
         event_tx: &crossbeam_channel::Sender<CoreEvent>,
     ) {
         let mut removed_ids = Vec::new();
+        let mut structural_ids = Vec::new();
 
         for obj in objects {
             let Some(id) = obj.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else {
@@ -862,6 +930,19 @@ impl CoreRuntimeState {
             let removed = obj.get("info").is_none_or(serde_json::Value::is_null);
             if removed {
                 removed_ids.push(id);
+            }
+
+            let media_class = obj
+                .get("info")
+                .and_then(|v| v.get("props"))
+                .and_then(|v| v.get("media.class"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if media_class.contains("Sink")
+                || media_class.contains("Source")
+                || matches!(media_class, "Stream/Output/Audio" | "Audio/Stream/Output")
+            {
+                structural_ids.push(id);
             }
 
             // Check for volume changes
@@ -903,6 +984,7 @@ impl CoreRuntimeState {
                 &mut self.last_snapshot,
                 partial,
                 &removed_ids,
+                &structural_ids,
                 &self.overrides,
                 event_tx,
             );
@@ -978,6 +1060,20 @@ fn limit_channel_level_targets(
     limited
 }
 
+fn limit_channel_level_name_targets(
+    targets: &BTreeMap<crate::core::messages::Channel, Vec<String>>,
+    per_channel_limit: usize,
+) -> BTreeMap<crate::core::messages::Channel, Vec<String>> {
+    let mut limited = BTreeMap::new();
+    for (channel, ids) in targets {
+        limited.insert(
+            *channel,
+            ids.iter().take(per_channel_limit).cloned().collect(),
+        );
+    }
+    limited
+}
+
 fn collect_unique_level_targets(
     targets: &BTreeMap<crate::core::messages::Channel, Vec<u32>>,
 ) -> BTreeSet<u32> {
@@ -985,6 +1081,50 @@ fn collect_unique_level_targets(
         .values()
         .flat_map(|ids| ids.iter().copied())
         .collect()
+}
+
+fn collect_unique_name_level_targets(
+    targets: &BTreeMap<crate::core::messages::Channel, Vec<String>>,
+) -> BTreeSet<String> {
+    targets
+        .values()
+        .flat_map(|ids| ids.iter().cloned())
+        .collect()
+}
+
+fn compute_channel_level_updates_for_name_targets_with<F>(
+    targets: &BTreeMap<crate::core::messages::Channel, Vec<String>>,
+    mut sample_target: F,
+) -> Vec<(crate::core::messages::Channel, (f32, f32))>
+where
+    F: FnMut(&str) -> Option<(f32, f32)>,
+{
+    let mut updates = Vec::new();
+
+    for channel in [
+        crate::core::messages::Channel::Main,
+        crate::core::messages::Channel::Mic,
+        crate::core::messages::Channel::Game,
+        crate::core::messages::Channel::Media,
+        crate::core::messages::Channel::Chat,
+        crate::core::messages::Channel::Aux,
+    ] {
+        let mut left_peak = 0.0f32;
+        let mut right_peak = 0.0f32;
+
+        if let Some(ids) = targets.get(&channel) {
+            for id in ids {
+                if let Some((left, right)) = sample_target(id.as_str()) {
+                    left_peak = left_peak.max(left);
+                    right_peak = right_peak.max(right);
+                }
+            }
+        }
+
+        updates.push((channel, (left_peak, right_peak)));
+    }
+
+    updates
 }
 
 /// Coalesce a batch of commands: keep only the last SetVolume per channel,
@@ -1041,6 +1181,7 @@ fn spawn_meter_worker(
         const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
         let mut last_snapshot_clone = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
         let mut samplers: BTreeMap<u32, PwTargetSampler> = BTreeMap::new();
+        let mut stream_name_samplers: BTreeMap<String, PwTargetSampler> = BTreeMap::new();
         while running.load(Ordering::Relaxed) {
             if !enabled.load(Ordering::Relaxed) {
                 std::thread::sleep(METER_WORKER_IDLE_INTERVAL);
@@ -1064,23 +1205,39 @@ fn spawn_meter_worker(
             }
 
             if let Some(snapshot) = cached_snapshot.as_ref() {
-                let targets = limit_channel_level_targets(
+                let mut targets = limit_channel_level_targets(
                     &build_channel_level_targets(snapshot, &meter_overrides),
                     MAX_STREAM_PROBES_PER_CHANNEL,
                 );
+                retain_primary_numeric_meter_targets(&mut targets);
                 let required_targets = collect_unique_level_targets(&targets);
+
+                let stream_name_targets = limit_channel_level_name_targets(
+                    &build_stream_name_level_targets(snapshot, &meter_overrides),
+                    MAX_STREAM_PROBES_PER_CHANNEL,
+                );
+                let required_stream_names = collect_unique_name_level_targets(&stream_name_targets);
 
                 samplers.retain(|target, _| required_targets.contains(target));
                 for target in &required_targets {
                     if !samplers.contains_key(target)
-                        && let Ok(sampler) = PwTargetSampler::spawn(*target)
+                        && let Ok(sampler) = PwTargetSampler::spawn(&target.to_string())
                     {
                         samplers.insert(*target, sampler);
                     }
                 }
 
+                stream_name_samplers.retain(|target, _| required_stream_names.contains(target));
+                for target in &required_stream_names {
+                    if !stream_name_samplers.contains_key(target)
+                        && let Ok(sampler) = PwTargetSampler::spawn(target)
+                    {
+                        stream_name_samplers.insert(target.clone(), sampler);
+                    }
+                }
+
                 let mut failed_targets = BTreeSet::new();
-                let updates =
+                let mut updates =
                     compute_channel_level_updates_for_targets_with(&targets, |target_id| {
                         let sampler = samplers.get_mut(&target_id)?;
                         match sampler.sample_levels(level_sample_count) {
@@ -1091,8 +1248,38 @@ fn spawn_meter_worker(
                             }
                         }
                     });
+
+                let mut failed_stream_names = BTreeSet::new();
+                let stream_name_updates = compute_channel_level_updates_for_name_targets_with(
+                    &stream_name_targets,
+                    |target_name| {
+                        let sampler = stream_name_samplers.get_mut(target_name)?;
+                        match sampler.sample_levels(level_sample_count) {
+                            Ok(levels) => Some(levels),
+                            Err(_) => {
+                                failed_stream_names.insert(target_name.to_string());
+                                None
+                            }
+                        }
+                    },
+                );
+
+                for channel in [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux] {
+                    if stream_name_targets.contains_key(&channel)
+                        && let Some((_, stream_levels)) =
+                            stream_name_updates.iter().find(|(ch, _)| *ch == channel)
+                        && let Some((_, numeric_levels)) =
+                            updates.iter_mut().find(|(ch, _)| *ch == channel)
+                    {
+                        *numeric_levels = *stream_levels;
+                    }
+                }
+
                 for target in failed_targets {
                     samplers.remove(&target);
+                }
+                for target in failed_stream_names {
+                    stream_name_samplers.remove(&target);
                 }
                 let _ = event_tx.send(CoreEvent::LevelsUpdate(updates));
             }
@@ -1237,9 +1424,10 @@ mod tests {
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
 
     use super::{
-        apply_structural_monitor_delta, build_channel_level_targets, coalesce_commands,
-        compute_channel_level_updates_with, compute_level_sample_count, node_id_to_channel,
-        persisted_channel_mute, persisted_channel_volume, resolve_output_loopback_target,
+        apply_structural_monitor_delta, build_channel_level_targets,
+        build_stream_name_level_targets, coalesce_commands, compute_channel_level_updates_with,
+        compute_level_sample_count, node_id_to_channel, persisted_channel_mute,
+        persisted_channel_volume, resolve_output_loopback_target,
         should_skip_output_device_reconcile,
     };
 
@@ -1263,6 +1451,8 @@ mod tests {
             StreamInfo {
                 id: 900,
                 meter_target: 9900,
+                node_name: Some("discord-node".to_string()),
+                is_corked: false,
                 app_key: "discord".to_string(),
                 display_name: "Discord".to_string(),
                 media_role: Some("communication".to_string()),
@@ -1273,8 +1463,22 @@ mod tests {
             StreamInfo {
                 id: 901,
                 meter_target: 9901,
+                node_name: Some("spotify-node".to_string()),
+                is_corked: false,
                 app_key: "spotify".to_string(),
                 display_name: "Spotify".to_string(),
+                media_role: Some("music".to_string()),
+            },
+        );
+        snapshot.streams.insert(
+            902,
+            StreamInfo {
+                id: 902,
+                meter_target: 9902,
+                node_name: Some("paused-node".to_string()),
+                is_corked: true,
+                app_key: "paused-app".to_string(),
+                display_name: "Paused App".to_string(),
                 media_role: Some("music".to_string()),
             },
         );
@@ -1331,6 +1535,8 @@ mod tests {
             StreamInfo {
                 id: 901,
                 meter_target: 9901,
+                node_name: Some("zen-node".to_string()),
+                is_corked: false,
                 app_key: "zen-bin".to_string(),
                 display_name: "Zen".to_string(),
                 media_role: None,
@@ -1361,6 +1567,46 @@ mod tests {
 
         assert!(media.0 > 0.0 || media.1 > 0.0);
         assert_eq!(aux, (0.0, 0.0));
+    }
+
+    #[test]
+    fn stream_name_targets_use_stream_node_names() {
+        let mut snapshot = Snapshot::default();
+        snapshot.streams.insert(
+            900,
+            StreamInfo {
+                id: 900,
+                meter_target: 9900,
+                node_name: Some("discord-node".to_string()),
+                is_corked: false,
+                app_key: "discord".to_string(),
+                display_name: "Discord".to_string(),
+                media_role: Some("communication".to_string()),
+            },
+        );
+        snapshot.streams.insert(
+            901,
+            StreamInfo {
+                id: 901,
+                meter_target: 9901,
+                node_name: Some("spotify-node".to_string()),
+                is_corked: false,
+                app_key: "spotify".to_string(),
+                display_name: "Spotify".to_string(),
+                media_role: Some("music".to_string()),
+            },
+        );
+
+        let targets = build_stream_name_level_targets(&snapshot, &BTreeMap::new());
+
+        assert_eq!(
+            targets.get(&Channel::Chat),
+            Some(&vec!["discord-node".to_string()])
+        );
+        assert_eq!(
+            targets.get(&Channel::Media),
+            Some(&vec!["spotify-node".to_string()])
+        );
     }
 
     #[test]
@@ -1415,6 +1661,8 @@ mod tests {
             crate::core::pipewire_discovery::StreamInfo {
                 id: 100,
                 meter_target: 0,
+                node_name: Some("firefox-node".to_string()),
+                is_corked: false,
                 app_key: "firefox".to_string(),
                 display_name: "Firefox".to_string(),
                 media_role: None,
@@ -1438,7 +1686,9 @@ mod tests {
     #[test]
     fn structural_delta_updates_main_and_mic_node_mappings() {
         let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Output".to_string(), 225);
+        snapshot
+            .output_ids
+            .insert("Venturi-Output".to_string(), 225);
         snapshot
             .input_ids
             .insert("Venturi-VirtualMic".to_string(), 331);
@@ -1453,24 +1703,34 @@ mod tests {
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let overrides = BTreeMap::new();
         let no_removed_ids: [u32; 0] = [];
+        let structural_ids = [225_u32, 412_u32];
         apply_structural_monitor_delta(
             &mut snapshot,
             partial,
             no_removed_ids.as_slice(),
+            structural_ids.as_slice(),
             &overrides,
             &event_tx,
         );
 
         assert_eq!(snapshot.output_ids.get("Venturi-Output"), Some(&412));
         assert_eq!(snapshot.input_ids.get("Venturi-VirtualMic"), Some(&225));
-        assert_eq!(node_id_to_channel(412, &snapshot, &overrides), Some(Channel::Main));
-        assert_eq!(node_id_to_channel(225, &snapshot, &overrides), Some(Channel::Mic));
+        assert_eq!(
+            node_id_to_channel(412, &snapshot, &overrides),
+            Some(Channel::Main)
+        );
+        assert_eq!(
+            node_id_to_channel(225, &snapshot, &overrides),
+            Some(Channel::Mic)
+        );
     }
 
     #[test]
     fn structural_delta_prunes_removed_device_ids_and_emits_devices_changed() {
         let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Output".to_string(), 225);
+        snapshot
+            .output_ids
+            .insert("Venturi-Output".to_string(), 225);
         snapshot.devices.push(DeviceEntry {
             kind: DeviceKind::Output,
             id: "Venturi-Output".to_string(),
@@ -1481,10 +1741,12 @@ mod tests {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let overrides = BTreeMap::new();
         let removed_ids = [225_u32];
+        let no_structural_ids: [u32; 0] = [];
         apply_structural_monitor_delta(
             &mut snapshot,
             partial,
             removed_ids.as_slice(),
+            no_structural_ids.as_slice(),
             &overrides,
             &event_tx,
         );
@@ -1500,6 +1762,67 @@ mod tests {
             })
             .expect("DevicesChanged should be emitted after pruning removed output");
         assert!(devices_changed.is_empty());
+    }
+
+    #[test]
+    fn structural_delta_prunes_stream_when_id_reassigned_to_mic_source() {
+        let mut snapshot = Snapshot::default();
+        snapshot.streams.insert(
+            225,
+            StreamInfo {
+                id: 225,
+                meter_target: 225,
+                node_name: Some("spotify-node".to_string()),
+                is_corked: false,
+                app_key: "spotify".to_string(),
+                display_name: "Spotify".to_string(),
+                media_role: Some("music".to_string()),
+            },
+        );
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 331);
+        snapshot
+            .input_meter_targets
+            .insert("Venturi-VirtualMic".to_string(), 331);
+
+        let mut partial = Snapshot::default();
+        partial
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 225);
+        partial
+            .input_meter_targets
+            .insert("Venturi-VirtualMic".to_string(), 225);
+
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let overrides = BTreeMap::new();
+        let no_removed_ids: [u32; 0] = [];
+        let structural_ids = [225_u32];
+        apply_structural_monitor_delta(
+            &mut snapshot,
+            partial,
+            no_removed_ids.as_slice(),
+            structural_ids.as_slice(),
+            &overrides,
+            &event_tx,
+        );
+
+        assert!(
+            !snapshot.streams.contains_key(&225),
+            "stream id should be pruned when reassigned to source"
+        );
+
+        let targets = build_channel_level_targets(&snapshot, &overrides);
+        assert_eq!(targets.get(&Channel::Mic), Some(&vec![225]));
+        assert!(
+            !targets.contains_key(&Channel::Media),
+            "media target must not persist with reassigned mic source id"
+        );
+
+        let removed = event_rx
+            .try_iter()
+            .any(|event| matches!(event, CoreEvent::StreamRemoved(225)));
+        assert!(removed, "StreamRemoved should be emitted for reassigned id");
     }
 
     #[test]

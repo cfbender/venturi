@@ -1,129 +1,151 @@
 # Venturi Core Runtime Architecture
 
-This document explains how Venturi's runtime is structured so contributors can reason about behavior changes quickly.
+This document captures the current runtime architecture and hard-earned lessons from recent PipeWire monitor + metering work.
 
-## Core Idea
+## Runtime Model
 
-Venturi is a message-driven system with two threads:
+Venturi is a message-driven system with these active runtimes:
 
-1. **Core thread** — PipeWire/system integration and side effects.
-2. **GUI thread** — GTK view-model and widgets.
+1. **Core manager thread** (`PipeWireManager`) — owns orchestration and side effects.
+2. **GUI thread** (GTK main loop) — owns `MixerTab` model + widgets.
+3. **PwMonitor reader thread** (`pw-dump --monitor`) — feeds structural/volume deltas to core.
+4. **Meter worker thread** — samples `pw-record` targets and emits `LevelsUpdate`.
 
-Communication uses typed channels:
+Channel contracts:
 
 - GUI → Core: `CoreCommand`
 - Core → GUI: `CoreEvent`
 
-## Startup Sequence
+## Startup Handshake (Important)
 
-1. `main.rs` creates `AppRunner` and chooses daemon vs GUI mode.
-2. `AppRunner` creates command/event channels and spawns `PipeWireManager`.
-3. `PipeWireManager::spawn` sends `CoreEvent::Ready` and initializes `CoreRuntimeState`.
-4. `CoreRuntimeState::initialize` performs:
-   - XDG path resolution and config load
-   - hotkey backend selection/registration
-   - virtual device provisioning (`Venturi-Output`, `Venturi-VirtualMic`)
-   - initial virtual-mic rewiring to selected/default physical input
-5. Non-daemon mode starts GUI and optional tray.
+1. `AppRunner` creates channels and spawns `PipeWireManager`.
+2. Core emits `CoreEvent::Ready`.
+3. App sends `CoreCommand::Ping`; core responds with `CoreEvent::Pong`.
+4. GUI launches and starts receiving events.
+5. After `window.present()`, GUI sends:
+   - `CoreCommand::SetMeteringEnabled(true)`
+   - `CoreCommand::RequestSnapshot`
 
-## Module Boundaries
+### Why `RequestSnapshot` exists
 
-### `src/core/pipewire_manager.rs`
+`wait_for_event` in `app.rs` only waits for specific events (`Ready` / `Pong`) and drops unrelated ones during bootstrap. That means early `DevicesChanged`/`StreamAppeared` events can be lost before GUI listeners are live.
 
-Owns runtime orchestration. It should contain **loop control and state transitions**, not low-level process helpers.
+`RequestSnapshot` triggers `resend_initial_state()` in core to re-emit current devices/streams once the GUI is ready.
 
-Key items:
+## Core Loop
 
-- `CoreRuntimeState` — mutable state for one manager thread.
-- `handle_core_command` — command dispatch.
-- `handle_hotkey_tick` — maps hotkey events to commands.
-- `refresh_snapshot` — poll + diff + emit events.
+`PipeWireManager::spawn` runs a `crossbeam_channel::select!` loop across:
 
-### `src/core/pipewire_discovery.rs`
+- `command_rx` (GUI commands)
+- `monitor_rx` (`PwMonitorEvent`s)
+- timeout tick (`LOOP_TICK_INTERVAL`)
 
-Pure-ish discovery/parsing layer.
+Loop responsibilities:
 
-- `Snapshot`
-- `StreamInfo`
-- `parse_pw_dump(...)`
-- `poll_snapshot(...)`
+- Coalesce `SetVolume` bursts (`coalesce_commands`)
+- Handle command side effects (`handle_core_command`)
+- Apply monitor updates (`handle_monitor_event`)
+- Handle monitor restart backoff/circuit breaker
+- Flush persisted state and tick hotkeys
 
-Responsibilities:
+## Snapshot Ownership & Structural Deltas
 
-- Parse `pw-dump` JSON into normalized state.
-- Hide internal virtual nodes from user selectors when requested.
-- Normalize stream display naming (e.g., prefer `application.process.binary` when app name is generic WebRTC text).
+`CoreRuntimeState.last_snapshot` is the authoritative map for:
 
-### `src/core/pipewire_backend.rs`
+- device selectors (`devices`)
+- control routing maps (`output_ids`, `input_ids`)
+- meter target maps (`output_meter_targets`, `input_meter_targets`)
+- app streams (`streams`)
+- per-node volumes (`volumes`)
 
-Side-effect backend for process invocations.
+`merge_changed_objects` + `apply_structural_monitor_delta` must keep this coherent under PipeWire ID churn.
 
-- `run_wpctl`, `run_pactl`, `run_pw_metadata`, `run_pw_link`
-- virtual module management (`ensure_virtual_devices`, `rewire_virtual_mic_source`, loopback load/unload)
+### Guardrail
 
-Responsibilities:
+When IDs are reassigned/reused, prune stale mappings/streams/volumes first, then upsert new structures. Otherwise you can issue commands to dead node IDs and see errors like:
 
-- Execute external commands.
-- Return explicit `Result` errors so manager can emit `CoreEvent::Error`.
+- `Object '<id>' not found`
 
-### `src/core/pipewire_channel_control.rs`
+## Metering Architecture
 
-Channel-level volume/mute logic.
+### Target semantics that matter
 
-- `apply_channel_volume(...)`
-- `apply_channel_mute(...)`
-- `ChannelControlTargets`
+`pw-record --target` is reliable with **object serial or node name**. Numeric node ID behavior can be inconsistent in practice across object classes.
 
-Responsibilities:
+Current strategy:
 
-- Map semantic channels (`Main`, `Mic`, `Game`, `Media`, `Chat`, `Aux`) to concrete control targets.
-- Apply scoping rules consistently.
+- **Main/Mic meters:** targets from `output_meter_targets` / `input_meter_targets`, with sink/source values parsed as `serial.or(id)`.
+- **Per-app meters (Game/Media/Chat/Aux):** stream `node_name` targets.
+- **Corked streams:** ignored for per-app stream-name sampling (`pulse.corked == true`).
+- Numeric stream sampling is not used for per-app meters to avoid cross-channel coupling and dead samples.
 
-## CoreRuntimeState Data Structure
+Meter worker internals:
 
-`CoreRuntimeState` tracks thread-local mutable state:
+- refreshes snapshot from shared cache (`Arc<Mutex<Snapshot>>`)
+- builds channel targets from snapshot + categorizer overrides
+- maintains sampler caches per target
+- emits `CoreEvent::LevelsUpdate`
 
-- Routing mode (`metadata-first` / fallback links)
-- Loaded config and categorizer overrides
-- Selected input device and active module IDs
-- Last snapshot for diff-based event emission
-- Per-target dedupe maps for volume/mute writes
-- Hotkey binding state and backend adapter
+## Shared Snapshot Boundary
 
-Rule: no state is shared across threads; only commands/events cross thread boundaries.
+Core and meter worker share `Arc<Mutex<Snapshot>>` only for read-copy metering use. Core writes; meter worker clones.
 
-## Event Loop Flow
+This is the only intentional shared state between runtime threads.
 
-Each tick in `PipeWireManager`:
+## Routing & Channel Control Boundaries
 
-1. `recv_timeout(POLL_INTERVAL)` for `CoreCommand`
-2. `handle_core_command(...)`
-3. `handle_hotkey_tick(...)`
-4. `refresh_snapshot(...)`
+### `Main`
 
-This preserves a stable cadence where user actions and periodic discovery both make progress.
+- Control target: `Venturi-Output` sink
+- Physical device selection is separate and handled by loopback reconciliation from `Venturi-Output.monitor` to selected output
 
-## Device and Stream Behavior
+### `Mic`
 
-- OS-visible output target in Venturi is `Venturi-Output` (internal sink).
-- Physical output selector controls a loopback from `Venturi-Output.monitor` to selected device.
-- Virtual input is `Venturi-VirtualMic`; selected physical input is rewired into this source.
-- Internal monitor sources and virtual internal nodes are filtered out of GUI selectors.
+- Control target: `Venturi-VirtualMic` source
+- Selected physical input is rewired into this virtual mic source
 
-## Failure Handling Pattern
+### App channels (`Game`, `Media`, `Chat`, `Aux`)
 
-Manager methods return `Result<_, String>` for side-effect failures.
+- Control target: per-stream node IDs (`stream.id`)
+- Classification source: `classify_with_priority(overrides, binary, app_name, media_role)`
 
-On error, the manager emits `CoreEvent::Error(...)` and continues loop operation when possible.
+## Failure Handling
 
-## Contributor Guidelines
+Monitor process failures are handled with backoff and a circuit breaker:
 
-When adding behavior:
+- restart delay
+- consecutive failure tracking in a time window
+- give-up path emits `CoreEvent::Error`
+- successful `InitialSnapshot` resets failure counters
 
-1. Add/update command/event contract first (`messages.rs`).
-2. Put parsing/discovery changes in `pipewire_discovery.rs`.
-3. Put system command logic in `pipewire_backend.rs`.
-4. Keep orchestration/state transitions in `pipewire_manager.rs`.
-5. Add targeted tests closest to the changed module.
+## Operational Gotchas (from real regressions)
 
-This keeps manager readable and prevents new side-effect code from creeping into orchestration paths.
+1. **Do not re-enqueue events in `wait_for_event`.**
+   Re-sending non-matching events to the same channel can create an event feedback loop and starve command processing.
+
+2. **Keep bootstrap replay explicit.**
+   Use `RequestSnapshot` after GUI activation instead of clever channel replay hacks.
+
+3. **Treat PipeWire IDs as volatile.**
+   Structural monitor delta merge must aggressively prune stale references.
+
+4. **Meter target type is part of correctness.**
+   Serial/name vs id selection can make the difference between real levels and silence/cross-coupling.
+
+5. **Stale GUI process can fake regressions.**
+   GTK `GApplication` uniqueness means an old instance can receive activation while new `cargo run` exits immediately.
+   If behavior looks impossible, verify no stale Venturi process is running.
+
+## Contributor Checklist for Runtime Changes
+
+When changing runtime behavior:
+
+1. Update command/event contract first (`messages.rs`).
+2. Keep parsing/discovery in `pipewire_discovery.rs`.
+3. Keep command/process side effects in `pipewire_backend.rs`.
+4. Keep loop/state transitions in `pipewire_manager.rs`.
+5. Add regression tests near touched logic (startup replay, structural delta pruning, target precedence).
+6. Verify with:
+   - `cargo check`
+   - `cargo test --lib`
+   - `cargo clippy -- -D warnings`

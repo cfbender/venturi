@@ -64,10 +64,10 @@ pub(crate) struct PwTargetSampler {
 }
 
 impl PwTargetSampler {
-    pub(crate) fn spawn(target_node_id: u32) -> Result<Self, String> {
+    pub(crate) fn spawn(target: &str) -> Result<Self, String> {
         let args = vec![
             "--target".to_string(),
-            target_node_id.to_string(),
+            target.to_string(),
             "--rate".to_string(),
             "48000".to_string(),
             "--channels".to_string(),

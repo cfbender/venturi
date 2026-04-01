@@ -7,6 +7,8 @@ use crate::core::messages::{DeviceEntry, DeviceKind};
 pub(crate) struct StreamInfo {
     pub id: u32,
     pub meter_target: u32,
+    pub node_name: Option<String>,
+    pub is_corked: bool,
     pub app_key: String,
     pub display_name: String,
     pub media_role: Option<String>,
@@ -74,7 +76,7 @@ pub(crate) fn parse_pw_dump(
             continue;
         };
 
-        let meter_target = parse_object_serial(props).or(id);
+        let serial_target = parse_object_serial(props);
 
         let media_class = props
             .get("media.class")
@@ -108,6 +110,9 @@ pub(crate) fn parse_pw_dump(
             if let Some(node_id) = id {
                 output_ids.insert(node_name.to_string(), node_id);
             }
+            // `pw-record --target` resolves by object serial or node name. Prefer serial for
+            // sink/source meters and fall back to id only if serial is unavailable.
+            let meter_target = serial_target.or(id);
             if let Some(target_id) = meter_target {
                 output_meter_targets.insert(node_name.to_string(), target_id);
             }
@@ -123,6 +128,7 @@ pub(crate) fn parse_pw_dump(
             if let Some(node_id) = id {
                 input_ids.insert(node_name.to_string(), node_id);
             }
+            let meter_target = serial_target.or(id);
             if let Some(target_id) = meter_target {
                 input_meter_targets.insert(node_name.to_string(), target_id);
             }
@@ -165,11 +171,23 @@ pub(crate) fn parse_pw_dump(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
 
+            // For per-app stream meters, prefer object.serial target.
+            let meter_target = serial_target.or(id);
+            let is_corked = props
+                .get("pulse.corked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             streams.insert(
                 stream_id,
                 StreamInfo {
                     id: stream_id,
                     meter_target: meter_target.unwrap_or(stream_id),
+                    node_name: if node_name.is_empty() {
+                        None
+                    } else {
+                        Some(node_name.to_string())
+                    },
+                    is_corked,
                     app_key: if binary.is_empty() {
                         display_name.to_ascii_lowercase()
                     } else {
@@ -377,6 +395,7 @@ mod tests {
         let stream = snapshot.streams.get(&44).expect("stream exists");
         assert_eq!(stream.display_name, "Discord");
         assert_eq!(stream.app_key, "discord");
+        assert_eq!(stream.node_name, None);
     }
 
     #[test]
@@ -442,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_pw_dump_uses_object_serial_for_meter_targets() {
+    fn parse_pw_dump_uses_class_specific_meter_target_precedence() {
         let empty: [&'static str; 0] = [];
         let raw = r#"[
           {
@@ -478,6 +497,7 @@ mod tests {
         );
         let stream = snapshot.streams.get(&197).expect("stream exists");
         assert_eq!(stream.meter_target, 42330);
+        assert_eq!(stream.node_name, None);
     }
 
     #[test]
