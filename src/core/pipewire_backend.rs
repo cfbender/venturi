@@ -186,7 +186,10 @@ pub(crate) fn rewire_virtual_mic_source(
     master_source: &str,
     virtual_source_name: &str,
 ) -> Result<String, String> {
-    if let Some(module_id) = find_virtual_mic_module_id(virtual_source_name)? {
+    if let Some((module_id, existing_master)) = find_virtual_mic_module(virtual_source_name)? {
+        if existing_master.as_deref() == Some(master_source) {
+            return Ok(module_id);
+        }
         unload_pactl_module(&module_id)?;
     }
 
@@ -362,6 +365,9 @@ fn collect_virtual_device_module_unload_ids(
     virtual_sinks: &[&str],
     virtual_sources: &[&str],
 ) -> Vec<String> {
+    let mut seen_virtual_sinks = BTreeSet::new();
+    let mut seen_virtual_sources = BTreeSet::new();
+
     modules_raw
         .lines()
         .filter_map(|line| {
@@ -369,20 +375,28 @@ fn collect_virtual_device_module_unload_ids(
             let module_id = cols.next()?;
             let module_name = cols.next()?;
 
-            if module_name == "module-null-sink"
-                && virtual_sinks
-                    .iter()
-                    .any(|sink| line.contains(&format!("sink_name={sink}")))
-            {
-                return Some(module_id.to_string());
+            if module_name == "module-null-sink" {
+                let sink_name = line
+                    .split_whitespace()
+                    .find_map(|token| token.strip_prefix("sink_name="))?;
+                if virtual_sinks.contains(&sink_name) {
+                    if seen_virtual_sinks.insert(sink_name.to_string()) {
+                        return None;
+                    }
+                    return Some(module_id.to_string());
+                }
             }
 
-            if module_name == "module-remap-source"
-                && virtual_sources
-                    .iter()
-                    .any(|source| line.contains(&format!("source_name={source}")))
-            {
-                return Some(module_id.to_string());
+            if module_name == "module-remap-source" {
+                let source_name = line
+                    .split_whitespace()
+                    .find_map(|token| token.strip_prefix("source_name="))?;
+                if virtual_sources.contains(&source_name) {
+                    if seen_virtual_sources.insert(source_name.to_string()) {
+                        return None;
+                    }
+                    return Some(module_id.to_string());
+                }
             }
 
             None
@@ -443,7 +457,9 @@ fn unload_legacy_venturi_sinks(legacy_sink_names: &[&str]) -> Result<(), String>
     Ok(())
 }
 
-fn find_virtual_mic_module_id(virtual_source_name: &str) -> Result<Option<String>, String> {
+fn find_virtual_mic_module(
+    virtual_source_name: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
     let args = vec![
         "list".to_string(),
         "short".to_string(),
@@ -451,18 +467,45 @@ fn find_virtual_mic_module_id(virtual_source_name: &str) -> Result<Option<String
     ];
     let raw = run_pactl(&args)?;
 
-    for line in raw.lines() {
-        if line.contains("module-remap-source")
-            && line.contains(&format!("source_name={virtual_source_name}"))
-        {
-            let mut cols = line.split_whitespace();
-            if let Some(id) = cols.next() {
-                return Ok(Some(id.to_string()));
-            }
+    Ok(find_virtual_mic_module_in_modules_raw(
+        &raw,
+        virtual_source_name,
+    ))
+}
+
+fn find_virtual_mic_module_in_modules_raw(
+    modules_raw: &str,
+    virtual_source_name: &str,
+) -> Option<(String, Option<String>)> {
+    for line in modules_raw.lines() {
+        let mut cols = line.split_whitespace();
+        let Some(module_id) = cols.next() else {
+            continue;
+        };
+        let Some(module_name) = cols.next() else {
+            continue;
+        };
+
+        if module_name != "module-remap-source" {
+            continue;
         }
+
+        let source_name = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("source_name="));
+        if source_name != Some(virtual_source_name) {
+            continue;
+        }
+
+        let master_source = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("master="))
+            .map(str::to_string);
+
+        return Some((module_id.to_string(), master_source));
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(test)]
@@ -472,7 +515,7 @@ mod tests {
         build_virtual_device_description_property,
         build_virtual_module_device_description_properties,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
-        sink_description_for, source_description_for,
+        find_virtual_mic_module_in_modules_raw, sink_description_for, source_description_for,
     };
 
     #[test]
@@ -562,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn collects_venturi_virtual_module_ids_for_recreation() {
+    fn does_not_collect_single_virtual_device_modules_for_unload() {
         let modules = r#"
 536870921 module-remap-source master=alsa_input.foo source_name=Venturi-VirtualMic source_properties=device.description="Venturi"
 536870922 module-null-sink sink_name=Venturi-Output sink_properties=device.description=Venturi-Output
@@ -578,10 +621,57 @@ mod tests {
             virtual_sources.as_slice(),
         );
 
+        assert!(unload_ids.is_empty());
+    }
+
+    #[test]
+    fn collects_duplicate_virtual_device_module_ids_for_unload() {
+        let modules = r#"
+536870920 module-remap-source master=alsa_input.a source_name=Venturi-VirtualMic
+536870921 module-remap-source master=alsa_input.b source_name=Venturi-VirtualMic
+536870922 module-null-sink sink_name=Venturi-Output
+536870923 module-null-sink sink_name=Venturi-Output
+536870999 module-remap-source master=alsa_input.foo source_name=OtherSource
+"#;
+        let virtual_sinks = ["Venturi-Output"];
+        let virtual_sources = ["Venturi-VirtualMic"];
+
+        let unload_ids = collect_virtual_device_module_unload_ids(
+            modules,
+            virtual_sinks.as_slice(),
+            virtual_sources.as_slice(),
+        );
+
         assert_eq!(
             unload_ids,
-            vec!["536870921".to_string(), "536870922".to_string()]
+            vec!["536870921".to_string(), "536870923".to_string()]
         );
+    }
+
+    #[test]
+    fn finds_virtual_mic_module_with_current_master_source() {
+        let modules = r#"
+536870920 module-remap-source master=alsa_input.a source_name=Venturi-VirtualMic
+536870921 module-remap-source master=alsa_input.b source_name=OtherSource
+"#;
+
+        let info = find_virtual_mic_module_in_modules_raw(modules, "Venturi-VirtualMic");
+
+        assert_eq!(
+            info,
+            Some(("536870920".to_string(), Some("alsa_input.a".to_string())))
+        );
+    }
+
+    #[test]
+    fn does_not_find_virtual_mic_module_for_other_source_names() {
+        let modules = r#"
+536870920 module-remap-source master=alsa_input.a source_name=OtherSource
+"#;
+
+        let info = find_virtual_mic_module_in_modules_raw(modules, "Venturi-VirtualMic");
+
+        assert_eq!(info, None);
     }
 
     #[test]
