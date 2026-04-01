@@ -45,6 +45,18 @@ cargo build --release
 ```
 
 ### Flatpak
+Install dependencies:
+```bash
+pip install aiohttp tomlkit
+flatpak install flathub org.gnome.Sdk//49
+flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//25.0
+```
+
+And download the flatpak-builder script and run to generate cargo-sources.json:
+```bash
+wget https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/refs/heads/master/cargo/flatpak-cargo-generator.py
+python3 flatpak-cargo-generator.py ./Cargo.lock -o flatpak/cargo-sources.json
+```
 
 ```bash
 flatpak-builder --force-clean flatpak-build flatpak/org.venturi.Venturi.json
