@@ -13,14 +13,18 @@
     "--filesystem=xdg-run/pipewire-0"
   ],
   "build-options": {
-    "append-path": "/usr/lib/sdk/rust-stable/bin"
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/venturi/cargo"
+    }
   },
   "modules": [
     {
       "name": "venturi",
       "buildsystem": "simple",
       "build-commands": [
-        "cargo build --release",
+        "cargo --offline fetch --manifest-path Cargo.toml --verbose",
+        "cargo --offline build --release --verbose",
         "install -Dm755 target/release/venturi /app/bin/venturi",
         "install -Dm644 data/venturi.desktop /app/share/applications/org.venturi.Venturi.desktop",
         "install -Dm644 data/org.venturi.Venturi.svg /app/share/icons/hicolor/scalable/apps/org.venturi.Venturi.svg",
@@ -30,7 +34,8 @@
         {
           "type": "dir",
           "path": ".."
-        }
+        },
+        "cargo-sources.json"
       ]
     }
   ]

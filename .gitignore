@@ -1,3 +1,4 @@
 .superpowers
 target/
 docs/superpowers
+flatpak/cargo-sources.json
