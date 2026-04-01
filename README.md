@@ -15,7 +15,15 @@ A Linux audio mixer for PipeWire with channel-based routing, virtual devices, an
 
 ## Install
 
-### From source
+### mise
+
+Add the following to `mise.toml`:
+```toml
+[tools]
+"cargo:https://github.com/cfbender/venturi" = "latest"
+```
+
+### cargo install
 
 Requires Rust (stable) and system libraries for PipeWire, GTK 4, and libadwaita.
 
@@ -37,27 +45,24 @@ sudo dnf install pipewire-devel gtk4-devel libadwaita-devel clang
 sudo pacman -S pipewire gtk4 libadwaita clang
 ```
 
-Then build and run:
+Then install:
 
 ```bash
-cargo build --release
-./target/release/venturi
+cargo install --path .
 ```
 
-### Flatpak
-Install dependencies:
-```bash
-pip install aiohttp tomlkit
-```
+### Desktop integration (app launcher + autostart)
 
-And download the flatpak-builder script and run to generate cargo-sources.json:
-```bash
-wget https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/refs/heads/master/cargo/flatpak-cargo-generator.py
-python3 flatpak-cargo-generator.py ./Cargo.lock -o flatpak/cargo-sources.json
-```
+After installing with mise or cargo, run the install script to add Venturi to your app launcher and start it on login (in daemon/tray mode):
 
 ```bash
-flatpak-builder --force-clean --disable-rofiles-fuse --install-deps-from=flathub --install flatpak-build flatpak/org.venturi.Venturi.json
+./scripts/install-desktop.sh
+```
+
+The script auto-detects your binary (mise, cargo, or local build) and writes the absolute path into the desktop entries. To remove:
+
+```bash
+./scripts/install-desktop.sh remove
 ```
 
 ### Debian package (.deb)
@@ -68,11 +73,11 @@ cargo deb
 sudo dpkg -i target/debian/venturi_*.deb
 ```
 
-### AppImage
+### From source
 
 ```bash
-cargo install cargo-appimage
-cargo appimage
+cargo build --release
+./target/release/venturi
 ```
 
 ## Usage

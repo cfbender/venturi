@@ -15,16 +15,6 @@ fn deb_assets_include_app_icon_svg() {
 }
 
 #[test]
-fn appimage_builder_uses_app_icon_name_and_copies_svg_to_hicolor() {
-    let recipe = read_repo_file("AppImageBuilder.yml");
-    assert!(recipe.contains("icon: org.venturi.Venturi"));
-    assert!(recipe.contains("mkdir -p \"$TARGET_APPDIR/usr/share/icons/hicolor/scalable/apps\""));
-    assert!(recipe.contains(
-        "cp data/org.venturi.Venturi.svg \"$TARGET_APPDIR/usr/share/icons/hicolor/scalable/apps/\""
-    ));
-}
-
-#[test]
 fn duplicate_brand_logo_svg_is_removed() {
     let duplicate = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/venturi-logo.svg");
     assert!(
