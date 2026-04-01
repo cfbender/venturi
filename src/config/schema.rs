@@ -54,6 +54,8 @@ pub struct SoundPad {
     pub name: String,
     pub file: String,
     pub icon: String,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

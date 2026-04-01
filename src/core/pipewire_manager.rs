@@ -13,7 +13,7 @@ use crate::core::hotkeys::{
 };
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::pipewire_backend::{
-    PwTargetSampler, current_default_sink_name, current_default_source_name,
+    PwPlayProcess, PwTargetSampler, current_default_sink_name, current_default_source_name,
     ensure_virtual_devices, reconcile_monitor_loopback_modules, rewire_virtual_mic_source,
     run_pw_link, run_pw_metadata, run_pw_metadata_capture, unload_pactl_module,
 };
@@ -51,6 +51,7 @@ const METER_OVERRIDE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const METER_SAMPLE_INTERVAL: Duration = Duration::from_millis(66);
 const VIRTUAL_SINKS: [&str; 1] = ["Venturi-Output"];
 const VIRTUAL_SOURCES: [&str; 1] = ["Venturi-VirtualMic"];
+const VENTURI_VIRTUAL_MIC_INPUT_TARGET: &str = "input.Venturi-VirtualMic";
 const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
 const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
 const LEGACY_VENTURI_SINKS: [&str; 6] = [
@@ -66,6 +67,48 @@ const VENTURI_CHANNEL_GAME_VOLUME_KEY: &str = "venturi.channel.game.volume";
 const VENTURI_CHANNEL_MEDIA_VOLUME_KEY: &str = "venturi.channel.media.volume";
 const VENTURI_CHANNEL_CHAT_VOLUME_KEY: &str = "venturi.channel.chat.volume";
 const VENTURI_CHANNEL_AUX_VOLUME_KEY: &str = "venturi.channel.aux.volume";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SoundboardPlaybackRoute {
+    VirtualMicInput,
+    MainOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundboardPlaybackMode {
+    Full,
+    Preview,
+}
+
+const SOUNDBOARD_PLAYBACK_ROUTES_FULL: [SoundboardPlaybackRoute; 2] = [
+    SoundboardPlaybackRoute::VirtualMicInput,
+    SoundboardPlaybackRoute::MainOutput,
+];
+
+const SOUNDBOARD_PLAYBACK_ROUTES_PREVIEW: [SoundboardPlaybackRoute; 1] =
+    [SoundboardPlaybackRoute::MainOutput];
+
+fn soundboard_playback_routes(mode: SoundboardPlaybackMode) -> &'static [SoundboardPlaybackRoute] {
+    match mode {
+        SoundboardPlaybackMode::Full => SOUNDBOARD_PLAYBACK_ROUTES_FULL.as_slice(),
+        SoundboardPlaybackMode::Preview => SOUNDBOARD_PLAYBACK_ROUTES_PREVIEW.as_slice(),
+    }
+}
+
+fn soundboard_playback_target_for_route(route: SoundboardPlaybackRoute) -> &'static str {
+    match route {
+        SoundboardPlaybackRoute::VirtualMicInput => VENTURI_VIRTUAL_MIC_INPUT_TARGET,
+        SoundboardPlaybackRoute::MainOutput => VENTURI_MAIN_OUTPUT,
+    }
+}
+
+#[cfg(test)]
+fn soundboard_playback_targets(mode: SoundboardPlaybackMode) -> Vec<&'static str> {
+    soundboard_playback_routes(mode)
+        .iter()
+        .map(|route| soundboard_playback_target_for_route(*route))
+        .collect()
+}
 
 fn resolve_selected_input_name(selected_input: Option<&str>) -> Result<Option<String>, String> {
     match selected_input {
@@ -726,6 +769,7 @@ struct CoreRuntimeState {
     runtime_state: crate::config::schema::State,
     state_saver: DebouncedSaver,
     channel_volume_intents: BTreeMap<Channel, f32>,
+    soundboard_players: BTreeMap<(u32, SoundboardPlaybackRoute), PwPlayProcess>,
     meter_enabled: Arc<AtomicBool>,
     last_volume_sent: BTreeMap<Channel, LastSentVolume>,
     pub shared_snapshot: Arc<Mutex<Snapshot>>,
@@ -807,6 +851,7 @@ impl CoreRuntimeState {
             runtime_state,
             state_saver: DebouncedSaver::new(),
             channel_volume_intents,
+            soundboard_players: BTreeMap::new(),
             meter_enabled,
             last_volume_sent: BTreeMap::new(),
             shared_snapshot,
@@ -918,7 +963,15 @@ impl CoreRuntimeState {
                 self.meter_enabled.store(enabled, Ordering::Relaxed);
             }
             CoreCommand::Shutdown => return Ok(CommandLoopControl::Shutdown),
-            CoreCommand::PlaySound(_) | CoreCommand::StopSound(_) => {}
+            CoreCommand::PlaySound { pad_id, file } => {
+                self.handle_play_sound(pad_id, &file, SoundboardPlaybackMode::Full, event_tx);
+            }
+            CoreCommand::PreviewSound { pad_id, file } => {
+                self.handle_play_sound(pad_id, &file, SoundboardPlaybackMode::Preview, event_tx);
+            }
+            CoreCommand::StopSound(pad_id) => {
+                self.stop_sound(pad_id);
+            }
         }
         Ok(CommandLoopControl::Continue)
     }
@@ -1041,6 +1094,55 @@ impl CoreRuntimeState {
             &mut self.last_sink_mute_by_target,
             &mut self.last_source_mute_by_target,
         );
+    }
+
+    fn handle_play_sound(
+        &mut self,
+        pad_id: u32,
+        file: &str,
+        mode: SoundboardPlaybackMode,
+        event_tx: &Sender<CoreEvent>,
+    ) {
+        let trimmed_file = file.trim();
+        if trimmed_file.is_empty() {
+            let _ = event_tx.send(CoreEvent::Error(format!(
+                "cannot play soundboard pad {pad_id}: no file configured"
+            )));
+            return;
+        }
+
+        self.stop_sound(pad_id);
+
+        for route in soundboard_playback_routes(mode) {
+            let target = soundboard_playback_target_for_route(*route);
+            match PwPlayProcess::spawn(target, trimmed_file) {
+                Ok(player) => {
+                    self.soundboard_players.insert((pad_id, *route), player);
+                }
+                Err(err) => {
+                    let _ = event_tx.send(CoreEvent::Error(format!(
+                        "failed to play soundboard pad {pad_id} on {target}: {err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn stop_sound(&mut self, pad_id: u32) {
+        self.soundboard_players
+            .retain(|(existing_pad_id, _), player| {
+                if *existing_pad_id == pad_id {
+                    player.stop();
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
+    fn cleanup_soundboard_players(&mut self) {
+        self.soundboard_players
+            .retain(|_, player| !player.is_finished());
     }
 
     fn update_channel_volume_intent(
@@ -1790,6 +1892,7 @@ impl PipeWireManager {
                                     if let Some(m) = monitor.take() {
                                         m.kill();
                                     }
+                                    state.soundboard_players.clear();
                                     meter_running_for_core.store(false, Ordering::Relaxed);
                                     return;
                                 }
@@ -1831,6 +1934,7 @@ impl PipeWireManager {
                 // Hotkey tick, state flush — run on every loop iteration
                 state.handle_hotkey_tick(&event_tx);
                 state.flush_persisted_state_if_due(&event_tx);
+                state.cleanup_soundboard_players();
             }
             meter_running_for_core.store(false, Ordering::Relaxed);
         });
@@ -1865,14 +1969,27 @@ mod tests {
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
 
     use super::{
-        LastSentVolume, apply_snapshot_volume_hint, apply_structural_monitor_delta,
-        apply_volume_intents_to_snapshot, build_channel_level_targets,
-        build_stream_name_level_targets, coalesce_commands, collect_drifted_intent_channels,
-        compute_channel_level_updates_with, compute_level_sample_count, node_id_to_channel,
-        parse_channel_volume_intents, persisted_channel_mute, persisted_channel_volume,
-        resolve_output_loopback_target, should_emit_observed_channel_volume,
-        should_skip_output_device_reconcile, should_suppress_recent_echo, snapshot_channel_volumes,
+        LastSentVolume, SoundboardPlaybackMode, apply_snapshot_volume_hint,
+        apply_structural_monitor_delta, apply_volume_intents_to_snapshot,
+        build_channel_level_targets, build_stream_name_level_targets, coalesce_commands,
+        collect_drifted_intent_channels, compute_channel_level_updates_with,
+        compute_level_sample_count, node_id_to_channel, parse_channel_volume_intents,
+        persisted_channel_mute, persisted_channel_volume, resolve_output_loopback_target,
+        should_emit_observed_channel_volume, should_skip_output_device_reconcile,
+        should_suppress_recent_echo, snapshot_channel_volumes, soundboard_playback_targets,
     };
+
+    #[test]
+    fn full_soundboard_playback_targets_virtual_mic_and_main_output() {
+        let targets = soundboard_playback_targets(SoundboardPlaybackMode::Full);
+        assert_eq!(targets, vec!["input.Venturi-VirtualMic", "Venturi-Output"]);
+    }
+
+    #[test]
+    fn preview_soundboard_playback_targets_main_output_only() {
+        let targets = soundboard_playback_targets(SoundboardPlaybackMode::Preview);
+        assert_eq!(targets, vec!["Venturi-Output"]);
+    }
 
     #[test]
     fn builds_level_targets_for_main_mic_and_classified_stream_channels() {

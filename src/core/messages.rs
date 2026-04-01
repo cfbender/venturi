@@ -19,7 +19,14 @@ pub enum CoreCommand {
     SetOutputDevice(String),
     SetInputDevice(String),
     ToggleWindow,
-    PlaySound(u32),
+    PlaySound {
+        pad_id: u32,
+        file: String,
+    },
+    PreviewSound {
+        pad_id: u32,
+        file: String,
+    },
     StopSound(u32),
     Ping,
     /// Ask the core to re-send the current snapshot (devices, streams, volumes).

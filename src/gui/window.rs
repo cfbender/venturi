@@ -127,7 +127,7 @@ pub fn run_gtk_app(
 
         let config_path = paths.config_file().display().to_string();
         let vm = Rc::new(RefCell::new(MainWindow::new(
-            config_path,
+            config_path.clone(),
             format!("Venturi {}", env!("CARGO_PKG_VERSION")),
         )));
 
@@ -143,6 +143,7 @@ pub fn run_gtk_app(
                 ui_selected_device_from_config(&config.audio.output_device);
             state.mixer.devices.selected_input =
                 ui_selected_device_from_config(&config.audio.input_device);
+            state.soundboard = SoundboardTab::from_config(&config.soundboard.pads);
         }
 
         let mixer_model = Arc::new(Mutex::new(vm.borrow().mixer.clone()));
@@ -155,8 +156,11 @@ pub fn run_gtk_app(
         switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
 
         let mixer = build_mixer_widget(mixer_model.clone(), command_tx_outer.clone());
-        let soundboard =
-            build_soundboard_widget(soundboard_model.clone(), command_tx_outer.clone());
+        let soundboard = build_soundboard_widget(
+            soundboard_model.clone(),
+            command_tx_outer.clone(),
+            config_path.clone(),
+        );
         let settings = build_settings_widget(settings_model);
 
         let mixer_page = stack.add_titled(&mixer, Some("mixer"), "Mixer");
@@ -460,6 +464,50 @@ fn install_mixer_css(palette: Option<&Palette>) {
     .chip-aux label {{
         color: alpha(@window_fg_color, 0.98);
         font-weight: 600;
+    }}
+
+    .soundboard-hint {{
+        margin-bottom: 2px;
+    }}
+
+    .soundboard-grid {{
+        padding: 4px;
+    }}
+
+    .soundboard-pad-button {{
+        border-radius: 14px;
+        border: 1px solid alpha(@window_fg_color, 0.18);
+        background-color: alpha(@window_fg_color, 0.05);
+        padding: 12px;
+        min-height: 84px;
+        transition: 180ms ease-out;
+    }}
+
+    .soundboard-pad-button:hover {{
+        background-color: alpha(@window_fg_color, 0.09);
+        border-color: alpha(@window_fg_color, 0.30);
+    }}
+
+    .soundboard-pad-button:active {{
+        background-color: alpha(@window_fg_color, 0.12);
+    }}
+
+    .soundboard-preview-button {{
+        min-width: 28px;
+        min-height: 28px;
+        border-radius: 999px;
+        padding: 0;
+        border: 1px solid alpha(@window_fg_color, 0.25);
+        background-color: alpha(@window_bg_color, 0.80);
+    }}
+
+    .soundboard-preview-button:hover {{
+        border-color: alpha(@accent_color, 0.45);
+        background-color: alpha(@accent_color, 0.14);
+    }}
+
+    .soundboard-preview-button:disabled {{
+        opacity: 0.45;
     }}
     "#
     );

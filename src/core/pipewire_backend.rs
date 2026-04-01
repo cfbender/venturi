@@ -112,6 +112,47 @@ pub(crate) fn run_pactl(args: &[String]) -> Result<String, String> {
     }
 }
 
+fn build_pw_play_args(target: &str, file: &str) -> Vec<String> {
+    vec!["--target".to_string(), target.to_string(), file.to_string()]
+}
+
+pub(crate) struct PwPlayProcess {
+    child: Child,
+}
+
+impl PwPlayProcess {
+    pub(crate) fn spawn(target: &str, file: &str) -> Result<Self, String> {
+        let args = build_pw_play_args(target, file);
+        let child = Command::new("pw-play")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn pw-play: {e}"))?;
+
+        Ok(Self { child })
+    }
+
+    pub(crate) fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    pub(crate) fn is_finished(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => true,
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+}
+
+impl Drop for PwPlayProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub(crate) struct PwTargetSampler {
     child: Child,
     stdout: ChildStdout,
@@ -565,7 +606,7 @@ fn find_virtual_mic_module_in_modules_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        MonitorLoopbackPlan, build_monitor_loopback_plan,
+        MonitorLoopbackPlan, build_monitor_loopback_plan, build_pw_play_args,
         build_virtual_device_description_property,
         build_virtual_module_device_description_properties,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
@@ -751,5 +792,18 @@ mod tests {
     fn parses_wpctl_volume_output_with_muted_suffix() {
         let output = "Volume: 0.88 [MUTED]\n";
         assert_eq!(parse_wpctl_volume_output(output), Some(0.88));
+    }
+
+    #[test]
+    fn builds_pw_play_args_with_target_and_file() {
+        let args = build_pw_play_args("input.Venturi-VirtualMic", "/tmp/airhorn.wav");
+        assert_eq!(
+            args,
+            vec![
+                "--target".to_string(),
+                "input.Venturi-VirtualMic".to_string(),
+                "/tmp/airhorn.wav".to_string()
+            ]
+        );
     }
 }
