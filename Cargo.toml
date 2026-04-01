@@ -1,6 +1,6 @@
 [package]
 name = "venturi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -25,8 +25,24 @@ tempfile = "3.13"
 [package.metadata.deb]
 depends = "$auto, libpipewire-0.3-0, libgtk-4-1, libadwaita-1-0"
 assets = [
-  ["target/release/venturi", "usr/bin/", "755"],
-  ["data/venturi.desktop", "usr/share/applications/", "644"],
-  ["data/org.venturi.Venturi.metainfo.xml", "usr/share/metainfo/", "644"],
-  ["data/org.venturi.Venturi.svg", "usr/share/icons/hicolor/scalable/apps/", "644"]
+  [
+    "target/release/venturi",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "data/venturi.desktop",
+    "usr/share/applications/",
+    "644",
+  ],
+  [
+    "data/org.venturi.Venturi.metainfo.xml",
+    "usr/share/metainfo/",
+    "644",
+  ],
+  [
+    "data/org.venturi.Venturi.svg",
+    "usr/share/icons/hicolor/scalable/apps/",
+    "644",
+  ],
 ]

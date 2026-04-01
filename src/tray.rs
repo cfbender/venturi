@@ -85,12 +85,45 @@ impl ksni::Tray for VenturiTray {
         "Venturi".to_string()
     }
 
+    fn icon_theme_path(&self) -> String {
+        // Search standard XDG icon directories for the installed icon.
+        // The icon lives under hicolor/scalable/apps/org.venturi.Venturi.svg.
+        let icon_file = "hicolor/scalable/apps/org.venturi.Venturi.svg";
+
+        let xdg_data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/.local/share")
+        });
+
+        let candidates = [
+            format!("{xdg_data_home}/icons"),
+            "/usr/share/icons".to_string(),
+            "/usr/local/share/icons".to_string(),
+        ];
+
+        for dir in &candidates {
+            let path = format!("{dir}/{icon_file}");
+            if std::path::Path::new(&path).exists() {
+                return dir.clone();
+            }
+        }
+
+        String::new()
+    }
+
     fn icon_name(&self) -> String {
         "org.venturi.Venturi".to_string()
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         vec![
+            ksni::menu::StandardItem {
+                label: "Venturi".to_string(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
             ksni::menu::StandardItem {
                 label: "Show/Hide".to_string(),
                 activate: Box::new(|tray: &mut Self| {
