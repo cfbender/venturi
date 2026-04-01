@@ -287,22 +287,22 @@ fn install_mixer_css(palette: Option<&Palette>) {
     let chat = palette.and_then(|p| parse_hex_color(&p.chat));
     let aux = palette.and_then(|p| parse_hex_color(&p.aux));
 
-    let slider_main = color_or_theme(main, "alpha(@window_fg_color, 1.00)", 1.00);
-    let slider_mic = color_or_theme(mic, "alpha(@accent_color, 1.00)", 1.00);
+    let slider_main = color_or_theme(main, "alpha(#8B7AAE, 1.00)", 1.00);
+    let slider_mic = color_or_theme(mic, "alpha(#C58AA8, 1.00)", 1.00);
     let slider_game = color_or_theme(game, "alpha(@success_color, 1.00)", 1.00);
     let slider_media = color_or_theme(media, "alpha(@error_color, 1.00)", 1.00);
     let slider_chat = color_or_theme(chat, "alpha(@accent_color, 1.00)", 1.00);
     let slider_aux = color_or_theme(aux, "alpha(@warning_color, 1.00)", 1.00);
 
-    let chip_main_bg = color_or_theme(main, "alpha(@window_fg_color, 0.24)", 0.28);
-    let chip_mic_bg = color_or_theme(mic, "alpha(@accent_color, 0.24)", 0.28);
+    let chip_main_bg = color_or_theme(main, "alpha(#8B7AAE, 0.24)", 0.28);
+    let chip_mic_bg = color_or_theme(mic, "alpha(#C58AA8, 0.24)", 0.28);
     let chip_game_bg = color_or_theme(game, "alpha(@success_color, 0.24)", 0.28);
     let chip_media_bg = color_or_theme(media, "alpha(@error_color, 0.24)", 0.28);
     let chip_chat_bg = color_or_theme(chat, "alpha(@accent_color, 0.24)", 0.28);
     let chip_aux_bg = color_or_theme(aux, "alpha(@warning_color, 0.24)", 0.28);
 
-    let chip_main_border = color_or_theme(main, "alpha(@window_fg_color, 0.76)", 0.80);
-    let chip_mic_border = color_or_theme(mic, "alpha(@accent_color, 0.76)", 0.80);
+    let chip_main_border = color_or_theme(main, "alpha(#8B7AAE, 0.76)", 0.80);
+    let chip_mic_border = color_or_theme(mic, "alpha(#C58AA8, 0.76)", 0.80);
     let chip_game_border = color_or_theme(game, "alpha(@success_color, 0.76)", 0.80);
     let chip_media_border = color_or_theme(media, "alpha(@error_color, 0.76)", 0.80);
     let chip_chat_border = color_or_theme(chat, "alpha(@accent_color, 0.76)", 0.80);
