@@ -481,23 +481,24 @@ pub fn build_mixer_widget(
 
         if let Some(section_class) = chip_drop_zone_class(channel) {
             let zone_shell = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            zone_shell.add_css_class("chip-drop-zone");
+            zone_shell.add_css_class(section_class);
             zone_shell.set_hexpand(true);
             zone_shell.set_vexpand(false);
             zone_shell.set_margin_top(8);
             zone_shell.set_valign(gtk::Align::End);
 
             let chip_list = gtk::FlowBox::new();
-            chip_list.add_css_class("chip-drop-zone");
             chip_list.add_css_class("chip-grid");
-            chip_list.add_css_class(section_class);
-            chip_list.set_hexpand(true);
-            chip_list.set_vexpand(false);
-            chip_list.set_valign(gtk::Align::Start);
+            chip_list.set_hexpand(false);
+            chip_list.set_vexpand(true);
+            chip_list.set_halign(gtk::Align::Center);
+            chip_list.set_valign(gtk::Align::Center);
             chip_list.set_selection_mode(gtk::SelectionMode::None);
             chip_list.set_max_children_per_line(2);
-            chip_list.set_min_children_per_line(2);
-            chip_list.set_column_spacing(3);
-            chip_list.set_row_spacing(3);
+            chip_list.set_min_children_per_line(1);
+            chip_list.set_column_spacing(6);
+            chip_list.set_row_spacing(6);
             zone_shell.append(&chip_list);
             chip_lists.insert(channel, chip_list.clone());
 
@@ -513,21 +514,21 @@ pub fn build_mixer_widget(
             {
                 let tx = command_tx.clone();
                 let model = model.clone();
-                let chip_list_for_enter = chip_list.clone();
-                let chip_list_for_leave = chip_list.clone();
-                let chip_list_for_drop = chip_list.clone();
+                let zone_shell_for_enter = zone_shell.clone();
+                let zone_shell_for_leave = zone_shell.clone();
+                let zone_shell_for_drop = zone_shell.clone();
 
                 drop.connect_enter(move |_, _, _| {
-                    chip_list_for_enter.add_css_class("chip-drop-zone-hover");
+                    zone_shell_for_enter.add_css_class("chip-drop-zone-hover");
                     gtk::gdk::DragAction::MOVE
                 });
 
                 drop.connect_leave(move |_| {
-                    chip_list_for_leave.remove_css_class("chip-drop-zone-hover");
+                    zone_shell_for_leave.remove_css_class("chip-drop-zone-hover");
                 });
 
                 drop.connect_drop(move |_, value, _, _| {
-                    chip_list_for_drop.remove_css_class("chip-drop-zone-hover");
+                    zone_shell_for_drop.remove_css_class("chip-drop-zone-hover");
                     if let Ok(raw) = value.get::<String>()
                         && let Some(payload) = DndPayload::decode(&raw)
                     {
@@ -552,7 +553,7 @@ pub fn build_mixer_widget(
                     false
                 });
             }
-            chip_list.add_controller(drop);
+            zone_shell.add_controller(drop);
 
             channel_col.append(&zone_shell);
         }

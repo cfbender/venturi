@@ -90,12 +90,12 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
         Channel::Chat => button.add_css_class("chip-chat"),
         Channel::Aux => button.add_css_class("chip-aux"),
     }
-    button.set_halign(gtk::Align::Start);
+    button.set_halign(gtk::Align::Center);
     button.set_valign(gtk::Align::Start);
     button.set_hexpand(false);
     button.set_vexpand(false);
-    button.set_margin_start(1);
-    button.set_margin_end(1);
+    button.set_margin_start(0);
+    button.set_margin_end(0);
     button.set_margin_top(0);
     button.set_margin_bottom(0);
 

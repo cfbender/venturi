@@ -341,7 +341,7 @@ fn install_mixer_css(palette: Option<&Palette>) {
     .chip-drop-zone {{
         border-radius: 12px;
         min-height: 92px;
-        padding: 4px;
+        padding: 8px 6px;
         background-color: alpha(@window_fg_color, 0.06);
         border: none;
         box-shadow: none;
@@ -354,7 +354,7 @@ fn install_mixer_css(palette: Option<&Palette>) {
 
     .chip-grid flowboxchild {{
         padding: 0;
-        margin: 0;
+        margin: 1px 2px;
         background: transparent;
         border: none;
     }}
