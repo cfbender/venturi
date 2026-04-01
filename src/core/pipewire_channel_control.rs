@@ -122,11 +122,7 @@ pub(crate) fn apply_channel_volume(
                     }
                 }
             }
-            if any_succeeded {
-                Some(volume)
-            } else {
-                None
-            }
+            if any_succeeded { Some(volume) } else { None }
         }
     }
 }

@@ -72,6 +72,24 @@ pub(crate) fn run_pw_metadata(args: &[String]) -> Result<(), String> {
     run_command("pw-metadata", args)
 }
 
+pub(crate) fn run_pw_metadata_capture(args: &[String]) -> Result<String, String> {
+    let output = Command::new("pw-metadata")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run pw-metadata: {e}"))?;
+
+    if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|e| e.to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "pw-metadata exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ))
+    }
+}
+
 pub(crate) fn run_pw_link(args: &[String]) -> Result<(), String> {
     run_command("pw-link", args)
 }
@@ -547,11 +565,12 @@ fn find_virtual_mic_module_in_modules_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_monitor_loopback_plan, build_virtual_device_description_property,
+        MonitorLoopbackPlan, build_monitor_loopback_plan,
+        build_virtual_device_description_property,
         build_virtual_module_device_description_properties,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
         find_virtual_mic_module_in_modules_raw, parse_wpctl_volume_output, sink_description_for,
-        source_description_for, MonitorLoopbackPlan,
+        source_description_for,
     };
 
     #[test]

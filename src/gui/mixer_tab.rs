@@ -633,7 +633,8 @@ fn meter_should_be_visible(level: f32) -> bool {
 }
 
 fn sync_slider_widget_from_model(handle: &SliderHandle, strip_data: &ChannelStrip) {
-    let (next_slider_value, next_label) = compute_slider_sync_update(handle.scale.value(), strip_data);
+    let (next_slider_value, next_label) =
+        compute_slider_sync_update(handle.scale.value(), strip_data);
     if let Some(model_volume) = next_slider_value {
         handle.suppress_signal.set(true);
         handle.scale.set_value(model_volume);
@@ -645,9 +646,13 @@ fn sync_slider_widget_from_model(handle: &SliderHandle, strip_data: &ChannelStri
     }
 }
 
-fn compute_slider_sync_update(current_slider_value: f64, strip_data: &ChannelStrip) -> (Option<f64>, String) {
+fn compute_slider_sync_update(
+    current_slider_value: f64,
+    strip_data: &ChannelStrip,
+) -> (Option<f64>, String) {
     let model_volume = strip_data.volume_linear as f64;
-    let next_slider_value = ((current_slider_value - model_volume).abs() > 0.005).then_some(model_volume);
+    let next_slider_value =
+        ((current_slider_value - model_volume).abs() > 0.005).then_some(model_volume);
     (next_slider_value, strip_data.volume_text())
 }
 
@@ -663,8 +668,7 @@ fn should_apply_device_selection_change(
 mod tests {
     use super::{
         DeviceListModel, MixerTab, compute_slider_sync_update, meter_display_level,
-        meter_should_be_visible,
-        should_apply_device_selection_change,
+        meter_should_be_visible, should_apply_device_selection_change,
     };
     use crate::core::messages::{Channel, CoreEvent, DeviceEntry, DeviceKind};
     use crate::gui::channel_strip::ChannelStrip;
