@@ -1,38 +1,91 @@
 # Venturi
 
-Venturi is a Linux audio mixer for PipeWire with channel-based routing, virtual devices, and a mixer-first workflow.
+A Linux audio mixer for PipeWire with channel-based routing, virtual devices, and a mixer-first workflow.
 
-## Build Dependencies
+![Venturi mixer interface](assets/venturi.png)
 
-### Debian/Ubuntu
+## Features
+
+- **Channel-based mixing** — Main, Mic, Game, Media, Chat, and Aux channels with independent volume controls
+- **Per-app routing** — Assign applications to channels for fine-grained audio control
+- **Virtual devices** — Automatic PipeWire virtual sink/source management
+- **Soundboard** — Built-in soundboard for audio playback
+- **System tray** — Runs in the background with tray icon support
+- **Daemon mode** — Start headless and control via tray
+
+## Install
+
+### From source
+
+Requires Rust (stable) and system libraries for PipeWire, GTK 4, and libadwaita.
+
+**Debian/Ubuntu:**
 
 ```bash
 sudo apt install libpipewire-0.3-dev libgtk-4-dev libadwaita-1-dev pkg-config clang
 ```
 
-### Fedora
+**Fedora:**
 
 ```bash
 sudo dnf install pipewire-devel gtk4-devel libadwaita-devel clang
 ```
 
-### Arch
+**Arch:**
 
 ```bash
 sudo pacman -S pipewire gtk4 libadwaita clang
 ```
 
-## Build & Test
+Then build and run:
 
 ```bash
-cargo check
-cargo test
+cargo build --release
+./target/release/venturi
 ```
 
-## Run
+### Flatpak
 
 ```bash
-cargo run
+flatpak-builder --force-clean flatpak-build flatpak/org.venturi.Venturi.json
+```
+
+### Debian package (.deb)
+
+```bash
+cargo install cargo-deb
+cargo deb
+sudo dpkg -i target/debian/venturi_*.deb
+```
+
+### AppImage
+
+```bash
+cargo install cargo-appimage
+cargo appimage
+```
+
+## Usage
+
+```bash
+venturi              # Launch the mixer GUI
+venturi --daemon     # Start in daemon mode (tray only, no window)
+venturi -v           # Debug logging
+venturi -vv          # Trace logging
+```
+
+Logging can also be controlled with the `RUST_LOG` environment variable:
+
+```bash
+RUST_LOG=venturi=debug venturi
+```
+
+## Development
+
+```bash
+cargo check          # Type-check without building
+cargo test           # Run the test suite
+cargo run            # Build and launch
 cargo run -- --daemon
 ```
 
@@ -40,36 +93,6 @@ cargo run -- --daemon
 
 - Core runtime walkthrough: `docs/architecture/core-runtime.md`
 
-## Packaging
+## License
 
-### Flatpak
-
-Manifest: `flatpak/org.venturi.Venturi.json`
-
-Dry-run/lint (manifest parse only):
-
-```bash
-flatpak-builder --show-manifest flatpak-build flatpak/org.venturi.Venturi.json
-```
-
-Local build:
-
-```bash
-flatpak-builder --force-clean flatpak-build flatpak/org.venturi.Venturi.json
-```
-
-### Debian (.deb)
-
-```bash
-cargo install cargo-deb
-cargo deb
-```
-
-### AppImage
-
-Config scaffold: `AppImageBuilder.yml`
-
-```bash
-cargo install cargo-appimage
-cargo appimage
-```
+[Mozilla Public License 2.0](LICENSE)
