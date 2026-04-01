@@ -10,7 +10,6 @@ const TRACK_TOP_INSET_PX: i32 = 8;
 const METER_TOP_INSET_PX: i32 = 12;
 const TRACK_BOTTOM_INSET_PX: i32 = 0;
 const SLIDER_BOTTOM_OFFSET_ADJUST_PX: i32 = -10;
-const VOLUME_SEND_THROTTLE: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone)]
 pub struct ChannelStrip {
@@ -52,6 +51,7 @@ impl ChannelStrip {
 /// coordinating programmatic updates vs user interaction.
 pub struct SliderHandle {
     pub scale: gtk::Scale,
+    pub value_label: gtk::Label,
     pub suppress_signal: Rc<Cell<bool>>,
     pub is_dragging: Rc<Cell<bool>>,
 }
@@ -59,9 +59,10 @@ pub struct SliderHandle {
 #[cfg(test)]
 impl SliderHandle {
     /// Create a SliderHandle with dummy scale for testing flag behavior.
-    fn new_for_test() -> Self {
+    pub(crate) fn new_for_test() -> Self {
         Self {
             scale: gtk::Scale::default(),
+            value_label: gtk::Label::new(None),
             suppress_signal: Rc::new(Cell::new(false)),
             is_dragging: Rc::new(Cell::new(false)),
         }
@@ -157,6 +158,7 @@ pub fn build_strip_widget_with_meter(
         let tx = command_tx.clone();
         let db_label = db_label.clone();
         let last_sent_at = last_sent_at.clone();
+        let slider_for_release = slider.clone();
         let is_dragging_press = is_dragging.clone();
         let is_dragging_release = is_dragging.clone();
         let release = gtk::GestureClick::new();
@@ -165,10 +167,11 @@ pub fn build_strip_widget_with_meter(
         });
         release.connect_released(move |_, _, _, _| {
             is_dragging_release.set(false);
-            let state = state.borrow();
             let now = Instant::now();
+            let mut state = state.borrow_mut();
+            let cmd = release_volume_command(&mut state, slider_for_release.value());
             if should_emit_volume_update(*last_sent_at.borrow(), now, true) {
-                let _ = tx.send(CoreCommand::SetVolume(state.channel, state.volume_linear));
+                let _ = tx.send(cmd);
                 *last_sent_at.borrow_mut() = now;
             }
             db_label.set_text(&state.volume_text());
@@ -201,6 +204,7 @@ pub fn build_strip_widget_with_meter(
 
     let handle = SliderHandle {
         scale: slider.clone(),
+        value_label: db_label.clone(),
         suppress_signal,
         is_dragging,
     };
@@ -208,8 +212,13 @@ pub fn build_strip_widget_with_meter(
     (root, meter, handle)
 }
 
-fn should_emit_volume_update(last_sent_at: Instant, now: Instant, is_release: bool) -> bool {
-    is_release || now.duration_since(last_sent_at) >= VOLUME_SEND_THROTTLE
+fn should_emit_volume_update(_last_sent_at: Instant, _now: Instant, _is_release: bool) -> bool {
+    true
+}
+
+fn release_volume_command(state: &mut ChannelStrip, slider_value: f64) -> CoreCommand {
+    let clamped = slider_value.clamp(0.0, 1.0) as f32;
+    state.set_volume_command(clamped)
 }
 
 fn meter_css_class_for(channel: Channel) -> &'static str {
@@ -225,7 +234,7 @@ fn meter_css_class_for(channel: Channel) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::messages::Channel;
+    use crate::core::messages::{Channel, CoreCommand};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -239,11 +248,11 @@ mod tests {
     }
 
     #[test]
-    fn emits_volume_update_on_release_even_within_throttle_window() {
+    fn emits_volume_update_during_fast_drag_without_waiting_for_release() {
         let now = Instant::now();
         let just_sent = now - Duration::from_millis(20);
 
-        assert!(!super::should_emit_volume_update(just_sent, now, false));
+        assert!(super::should_emit_volume_update(just_sent, now, false));
         assert!(super::should_emit_volume_update(just_sent, now, true));
     }
 
@@ -253,5 +262,16 @@ mod tests {
         let handle = super::SliderHandle::new_for_test();
         assert!(!handle.suppress_signal.get());
         assert!(!handle.is_dragging.get());
+    }
+
+    #[test]
+    fn release_volume_command_uses_current_slider_value() {
+        let mut strip = super::ChannelStrip::new(Channel::Main, "🔊", "Main");
+        strip.volume_linear = 0.98;
+
+        let cmd = super::release_volume_command(&mut strip, 1.0);
+
+        assert!(matches!(cmd, CoreCommand::SetVolume(Channel::Main, v) if (v - 1.0).abs() < 0.001));
+        assert!((strip.volume_linear - 1.0).abs() < 0.001);
     }
 }

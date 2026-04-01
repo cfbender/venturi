@@ -42,6 +42,7 @@ pub fn fallback_to_default_device() -> &'static str {
 const LOOP_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_STREAM_PROBES_PER_CHANNEL: usize = 1;
 const ECHO_SUPPRESSION_WINDOW: Duration = Duration::from_millis(200);
+const ECHO_SUPPRESSION_VOLUME_EPSILON: f32 = 0.01;
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30);
@@ -95,6 +96,39 @@ fn should_skip_output_device_reconcile(
     force: bool,
 ) -> bool {
     !force && current_selection == Some(requested_device)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastSentVolume {
+    sent_at: Instant,
+    volume: f32,
+}
+
+fn should_suppress_recent_echo(
+    last_sent: Option<&LastSentVolume>,
+    observed_volume: f32,
+    suppression_window: Duration,
+    volume_epsilon: f32,
+) -> bool {
+    let Some(last_sent) = last_sent else {
+        return false;
+    };
+
+    last_sent.sent_at.elapsed() < suppression_window
+        && (last_sent.volume - observed_volume).abs() <= volume_epsilon
+}
+
+fn should_suppress_channel_volume_echo(
+    last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
+    channel: Channel,
+    observed_volume: f32,
+) -> bool {
+    should_suppress_recent_echo(
+        last_volume_sent.get(&channel),
+        observed_volume,
+        ECHO_SUPPRESSION_WINDOW,
+        ECHO_SUPPRESSION_VOLUME_EPSILON,
+    )
 }
 
 fn persisted_channel_volume(state: &crate::config::schema::State, channel: Channel) -> f32 {
@@ -156,12 +190,12 @@ fn node_id_to_channel(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, Channel>,
 ) -> Option<Channel> {
-    // Check if id matches a known output sink → Main
-    if snapshot.output_ids.values().any(|&nid| nid == id) {
+    // Only map Venturi main sink ID to Main.
+    if snapshot.output_ids.get(VENTURI_MAIN_OUTPUT).copied() == Some(id) {
         return Some(Channel::Main);
     }
-    // Check if id matches a known input source → Mic
-    if snapshot.input_ids.values().any(|&nid| nid == id) {
+    // Only map Venturi virtual mic ID to Mic.
+    if snapshot.input_ids.get(VIRTUAL_SOURCES[0]).copied() == Some(id) {
         return Some(Channel::Mic);
     }
     // Check streams → classify via categorizer
@@ -349,6 +383,96 @@ fn build_channel_level_targets(
     targets
 }
 
+fn snapshot_channel_volumes(
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, crate::core::messages::Channel>,
+) -> BTreeMap<Channel, f32> {
+    let mut channel_volumes = BTreeMap::new();
+
+    if let Some(main_id) = snapshot.output_ids.get(VENTURI_MAIN_OUTPUT)
+        && let Some(main_volume) = snapshot.volumes.get(main_id)
+    {
+        channel_volumes.insert(Channel::Main, *main_volume);
+    }
+
+    if let Some(mic_id) = snapshot.input_ids.get(VIRTUAL_SOURCES[0])
+        && let Some(mic_volume) = snapshot.volumes.get(mic_id)
+    {
+        channel_volumes.insert(Channel::Mic, *mic_volume);
+    }
+
+    for (stream_id, stream) in &snapshot.streams {
+        let Some(volume) = snapshot.volumes.get(stream_id).copied() else {
+            continue;
+        };
+
+        let channel = classify_with_priority(
+            overrides,
+            Some(&stream.app_key),
+            Some(&stream.display_name),
+            stream.media_role.as_deref(),
+        );
+        if matches!(channel, Channel::Game | Channel::Media | Channel::Chat | Channel::Aux) {
+            channel_volumes.insert(channel, volume);
+        }
+    }
+
+    channel_volumes
+}
+
+fn apply_snapshot_volume_hint(
+    snapshot: &mut Snapshot,
+    overrides: &BTreeMap<String, crate::core::messages::Channel>,
+    channel: Channel,
+    volume: f32,
+) {
+    match channel {
+        Channel::Main => {
+            if let Some(main_id) = snapshot.output_ids.get(VENTURI_MAIN_OUTPUT).copied() {
+                snapshot.volumes.insert(main_id, volume);
+            }
+        }
+        Channel::Mic => {
+            if let Some(mic_id) = snapshot.input_ids.get(VIRTUAL_SOURCES[0]).copied() {
+                snapshot.volumes.insert(mic_id, volume);
+            }
+        }
+        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
+            for (stream_id, stream) in &snapshot.streams {
+                let classified = classify_with_priority(
+                    overrides,
+                    Some(&stream.app_key),
+                    Some(&stream.display_name),
+                    stream.media_role.as_deref(),
+                );
+                if classified == channel {
+                    snapshot.volumes.insert(*stream_id, volume);
+                }
+            }
+        }
+    }
+}
+
+fn emit_snapshot_channel_volumes(
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, crate::core::messages::Channel>,
+    event_tx: &Sender<CoreEvent>,
+) {
+    let channel_volumes = snapshot_channel_volumes(snapshot, overrides);
+    for channel in [
+        Channel::Main,
+        Channel::Mic,
+        Channel::Game,
+        Channel::Media,
+        Channel::Chat,
+        Channel::Aux,
+    ] {
+        if let Some(volume) = channel_volumes.get(&channel) {
+            let _ = event_tx.send(CoreEvent::VolumeChanged(channel, *volume));
+        }
+    }
+}
+
 fn build_stream_name_level_targets(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
@@ -427,7 +551,7 @@ struct CoreRuntimeState {
     runtime_state: crate::config::schema::State,
     state_saver: DebouncedSaver,
     meter_enabled: Arc<AtomicBool>,
-    last_volume_sent: BTreeMap<Channel, Instant>,
+    last_volume_sent: BTreeMap<Channel, LastSentVolume>,
     pub shared_snapshot: Arc<Mutex<Snapshot>>,
     consecutive_failures: u32,
     first_failure_at: Instant,
@@ -555,7 +679,7 @@ impl CoreRuntimeState {
                 self.resend_initial_state(event_tx);
             }
             CoreCommand::SetVolume(channel, volume) => {
-                apply_channel_volume(
+                let applied_volume = apply_channel_volume(
                     channel,
                     volume,
                     &self.last_snapshot,
@@ -567,7 +691,22 @@ impl CoreRuntimeState {
                     &mut self.last_sink_volume_by_target,
                     &mut self.last_source_volume_by_target,
                 );
-                self.last_volume_sent.insert(channel, Instant::now());
+                if let Some(applied_volume) = applied_volume {
+                    apply_snapshot_volume_hint(
+                        &mut self.last_snapshot,
+                        &self.overrides,
+                        channel,
+                        applied_volume,
+                    );
+                    let _ = event_tx.send(CoreEvent::VolumeChanged(channel, applied_volume));
+                    self.last_volume_sent.insert(
+                        channel,
+                        LastSentVolume {
+                            sent_at: Instant::now(),
+                            volume: applied_volume,
+                        },
+                    );
+                }
                 set_persisted_channel_volume(&mut self.runtime_state, channel, volume);
                 self.state_saver.mark_dirty(Instant::now());
             }
@@ -832,6 +971,7 @@ impl CoreRuntimeState {
                 category,
             });
         }
+        emit_snapshot_channel_volumes(&self.last_snapshot, &self.overrides, event_tx);
     }
 
     fn handle_monitor_event(
@@ -875,6 +1015,7 @@ impl CoreRuntimeState {
                 self.last_snapshot = snapshot;
                 // Update shared snapshot for meter worker
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
+                emit_snapshot_channel_volumes(&self.last_snapshot, &self.overrides, event_tx);
             }
             PwMonitorEvent::ObjectsChanged(objects) => {
                 self.merge_changed_objects(&objects, event_tx);
@@ -958,12 +1099,11 @@ impl CoreRuntimeState {
                     if let Some(channel) =
                         node_id_to_channel(id, &self.last_snapshot, &self.overrides)
                     {
-                        // Echo suppression
-                        let suppressed = self
-                            .last_volume_sent
-                            .get(&channel)
-                            .map(|sent_at| sent_at.elapsed() < ECHO_SUPPRESSION_WINDOW)
-                            .unwrap_or(false);
+                        let suppressed = should_suppress_channel_volume_echo(
+                            &self.last_volume_sent,
+                            channel,
+                            new_vol,
+                        );
 
                         if !suppressed {
                             let _ = event_tx.send(CoreEvent::VolumeChanged(channel, new_vol));
@@ -1424,11 +1564,11 @@ mod tests {
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
 
     use super::{
-        apply_structural_monitor_delta, build_channel_level_targets,
+        apply_snapshot_volume_hint, apply_structural_monitor_delta, build_channel_level_targets,
         build_stream_name_level_targets, coalesce_commands, compute_channel_level_updates_with,
         compute_level_sample_count, node_id_to_channel, persisted_channel_mute,
-        persisted_channel_volume, resolve_output_loopback_target,
-        should_skip_output_device_reconcile,
+        persisted_channel_volume, resolve_output_loopback_target, snapshot_channel_volumes,
+        should_skip_output_device_reconcile, should_suppress_recent_echo, LastSentVolume,
     };
 
     #[test]
@@ -1489,6 +1629,82 @@ mod tests {
         assert_eq!(targets.get(&Channel::Mic), Some(&vec![37393]));
         assert_eq!(targets.get(&Channel::Chat), Some(&vec![9900]));
         assert_eq!(targets.get(&Channel::Media), Some(&vec![9901]));
+    }
+
+    #[test]
+    fn derives_channel_volumes_from_snapshot_for_startup_replay() {
+        let mut snapshot = Snapshot::default();
+        snapshot
+            .output_ids
+            .insert("Venturi-Output".to_string(), 128);
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 281);
+        snapshot.volumes.insert(128, 0.41);
+        snapshot.volumes.insert(281, 0.73);
+        snapshot.streams.insert(
+            901,
+            StreamInfo {
+                id: 901,
+                meter_target: 9901,
+                node_name: Some("spotify-node".to_string()),
+                is_corked: false,
+                app_key: "spotify".to_string(),
+                display_name: "Spotify".to_string(),
+                media_role: Some("music".to_string()),
+            },
+        );
+        snapshot.volumes.insert(901, 0.27);
+
+        let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
+
+        assert_eq!(volumes.get(&Channel::Main).copied(), Some(0.41));
+        assert_eq!(volumes.get(&Channel::Mic).copied(), Some(0.73));
+        assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.27));
+    }
+
+    #[test]
+    fn apply_snapshot_volume_hint_updates_targets_for_main_mic_and_classified_streams() {
+        let mut snapshot = Snapshot::default();
+        snapshot
+            .output_ids
+            .insert("Venturi-Output".to_string(), 128);
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 281);
+        snapshot.streams.insert(
+            901,
+            StreamInfo {
+                id: 901,
+                meter_target: 9901,
+                node_name: Some("spotify-node".to_string()),
+                is_corked: false,
+                app_key: "spotify".to_string(),
+                display_name: "Spotify".to_string(),
+                media_role: Some("music".to_string()),
+            },
+        );
+        snapshot.streams.insert(
+            902,
+            StreamInfo {
+                id: 902,
+                meter_target: 9902,
+                node_name: Some("discord-node".to_string()),
+                is_corked: false,
+                app_key: "discord".to_string(),
+                display_name: "Discord".to_string(),
+                media_role: Some("communication".to_string()),
+            },
+        );
+
+        apply_snapshot_volume_hint(&mut snapshot, &BTreeMap::new(), Channel::Main, 0.31);
+        apply_snapshot_volume_hint(&mut snapshot, &BTreeMap::new(), Channel::Mic, 0.62);
+        apply_snapshot_volume_hint(&mut snapshot, &BTreeMap::new(), Channel::Media, 0.47);
+
+        assert_eq!(snapshot.volumes.get(&128).copied(), Some(0.31));
+        assert_eq!(snapshot.volumes.get(&281).copied(), Some(0.62));
+        assert_eq!(snapshot.volumes.get(&901).copied(), Some(0.47));
+        assert_eq!(snapshot.volumes.get(&902).copied(), None);
     }
 
     #[test]
@@ -1634,7 +1850,7 @@ mod tests {
     #[test]
     fn node_id_to_channel_maps_output_sink_to_main() {
         let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("main-sink".to_string(), 50);
+        snapshot.output_ids.insert("Venturi-Output".to_string(), 50);
         let overrides = BTreeMap::new();
         assert_eq!(
             node_id_to_channel(50, &snapshot, &overrides),
@@ -1645,7 +1861,9 @@ mod tests {
     #[test]
     fn node_id_to_channel_maps_input_source_to_mic() {
         let mut snapshot = Snapshot::default();
-        snapshot.input_ids.insert("main-source".to_string(), 60);
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 60);
         let overrides = BTreeMap::new();
         assert_eq!(
             node_id_to_channel(60, &snapshot, &overrides),
@@ -1681,6 +1899,30 @@ mod tests {
         let snapshot = Snapshot::default();
         let overrides = BTreeMap::new();
         assert_eq!(node_id_to_channel(999, &snapshot, &overrides), None);
+    }
+
+    #[test]
+    fn node_id_to_channel_ignores_non_main_output_sinks() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Output".to_string(), 50);
+        snapshot.output_ids.insert("alsa_output.real".to_string(), 88);
+        let overrides = BTreeMap::new();
+
+        assert_eq!(node_id_to_channel(88, &snapshot, &overrides), None);
+    }
+
+    #[test]
+    fn node_id_to_channel_ignores_non_virtual_mic_inputs() {
+        let mut snapshot = Snapshot::default();
+        snapshot
+            .input_ids
+            .insert("Venturi-VirtualMic".to_string(), 60);
+        snapshot
+            .input_ids
+            .insert("alsa_input.real_mic".to_string(), 61);
+        let overrides = BTreeMap::new();
+
+        assert_eq!(node_id_to_channel(61, &snapshot, &overrides), None);
     }
 
     #[test]
@@ -1899,17 +2141,25 @@ mod tests {
     fn echo_suppression_blocks_recent_volume_changes() {
         use std::time::{Duration, Instant};
 
-        let mut last_volume_sent: BTreeMap<Channel, Instant> = BTreeMap::new();
+        let mut last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
         let channel = Channel::Main;
 
         // Simulate: we just sent a volume command
-        last_volume_sent.insert(channel, Instant::now());
+        last_volume_sent.insert(
+            channel,
+            LastSentVolume {
+                sent_at: Instant::now(),
+                volume: 0.80,
+            },
+        );
 
         // Check suppression — should be suppressed (within 200ms)
-        let suppressed = last_volume_sent
-            .get(&channel)
-            .map(|sent_at| sent_at.elapsed() < Duration::from_millis(200))
-            .unwrap_or(false);
+        let suppressed = should_suppress_recent_echo(
+            last_volume_sent.get(&channel),
+            0.80,
+            Duration::from_millis(200),
+            0.01,
+        );
         assert!(
             suppressed,
             "volume change within 200ms should be suppressed"
@@ -1917,19 +2167,57 @@ mod tests {
     }
 
     #[test]
+    fn echo_suppression_allows_recent_server_corrected_volume() {
+        use std::time::{Duration, Instant};
+
+        let mut last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
+        let channel = Channel::Main;
+
+        // Simulate: we just sent 100%
+        last_volume_sent.insert(
+            channel,
+            LastSentVolume {
+                sent_at: Instant::now(),
+                volume: 1.0,
+            },
+        );
+
+        // PipeWire reports a rounded/corrected value shortly after.
+        let suppressed = should_suppress_recent_echo(
+            last_volume_sent.get(&channel),
+            0.98,
+            Duration::from_millis(200),
+            0.01,
+        );
+
+        assert!(
+            !suppressed,
+            "recent volume correction should NOT be suppressed"
+        );
+    }
+
+    #[test]
     fn echo_suppression_allows_old_volume_changes() {
         use std::time::{Duration, Instant};
 
-        let mut last_volume_sent: BTreeMap<Channel, Instant> = BTreeMap::new();
+        let mut last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
         let channel = Channel::Main;
 
         // Simulate: we sent a volume command 300ms ago
-        last_volume_sent.insert(channel, Instant::now() - Duration::from_millis(300));
+        last_volume_sent.insert(
+            channel,
+            LastSentVolume {
+                sent_at: Instant::now() - Duration::from_millis(300),
+                volume: 0.65,
+            },
+        );
 
-        let suppressed = last_volume_sent
-            .get(&channel)
-            .map(|sent_at| sent_at.elapsed() < Duration::from_millis(200))
-            .unwrap_or(false);
+        let suppressed = should_suppress_recent_echo(
+            last_volume_sent.get(&channel),
+            0.65,
+            Duration::from_millis(200),
+            0.01,
+        );
         assert!(
             !suppressed,
             "volume change after 200ms should NOT be suppressed"
@@ -1938,15 +2226,17 @@ mod tests {
 
     #[test]
     fn echo_suppression_allows_unseen_channels() {
-        use std::time::Instant;
+        use std::time::Duration;
 
-        let last_volume_sent: BTreeMap<Channel, Instant> = BTreeMap::new();
+        let last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
         let channel = Channel::Game;
 
-        let suppressed = last_volume_sent
-            .get(&channel)
-            .map(|sent_at| sent_at.elapsed() < std::time::Duration::from_millis(200))
-            .unwrap_or(false);
+        let suppressed = should_suppress_recent_echo(
+            last_volume_sent.get(&channel),
+            0.33,
+            Duration::from_millis(200),
+            0.01,
+        );
         assert!(
             !suppressed,
             "channel with no prior send should NOT be suppressed"

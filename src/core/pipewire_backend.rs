@@ -32,6 +32,42 @@ pub(crate) fn run_wpctl_checked(args: &[String]) -> Result<(), String> {
     run_command("wpctl", args)
 }
 
+fn parse_wpctl_volume_output(output: &str) -> Option<f32> {
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix("Volume:") else {
+            continue;
+        };
+
+        for token in rest.split_whitespace() {
+            if let Ok(value) = token.parse::<f32>() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn read_wpctl_volume(target: &str) -> Result<f32, String> {
+    let args = vec!["get-volume".to_string(), target.to_string()];
+    let output = Command::new("wpctl")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to run wpctl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "wpctl exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    parse_wpctl_volume_output(&stdout)
+        .ok_or_else(|| format!("unable to parse wpctl get-volume output: {stdout:?}"))
+}
+
 pub(crate) fn run_pw_metadata(args: &[String]) -> Result<(), String> {
     run_command("pw-metadata", args)
 }
@@ -511,11 +547,11 @@ fn find_virtual_mic_module_in_modules_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        MonitorLoopbackPlan, build_monitor_loopback_plan,
-        build_virtual_device_description_property,
+        build_monitor_loopback_plan, build_virtual_device_description_property,
         build_virtual_module_device_description_properties,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
-        find_virtual_mic_module_in_modules_raw, sink_description_for, source_description_for,
+        find_virtual_mic_module_in_modules_raw, parse_wpctl_volume_output, sink_description_for,
+        source_description_for, MonitorLoopbackPlan,
     };
 
     #[test]
@@ -684,5 +720,17 @@ mod tests {
         let (left, right) = compute_stereo_peak_from_s16le(raw.as_slice());
         assert!((left - 0.5).abs() < 0.02);
         assert!((right - 0.75).abs() < 0.02);
+    }
+
+    #[test]
+    fn parses_wpctl_volume_output_basic_value() {
+        let output = "Volume: 0.25\n";
+        assert_eq!(parse_wpctl_volume_output(output), Some(0.25));
+    }
+
+    #[test]
+    fn parses_wpctl_volume_output_with_muted_suffix() {
+        let output = "Volume: 0.88 [MUTED]\n";
+        assert_eq!(parse_wpctl_volume_output(output), Some(0.88));
     }
 }

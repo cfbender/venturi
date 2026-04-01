@@ -502,13 +502,7 @@ pub fn build_mixer_widget(
                         continue;
                     }
                     if let Some(strip_data) = state.strips.get(channel) {
-                        let model_volume = strip_data.volume_linear as f64;
-                        let current = handle.scale.value();
-                        if (current - model_volume).abs() > 0.005 {
-                            handle.suppress_signal.set(true);
-                            handle.scale.set_value(model_volume);
-                            handle.suppress_signal.set(false);
-                        }
+                        sync_slider_widget_from_model(handle, strip_data);
                     }
                 }
 
@@ -638,6 +632,25 @@ fn meter_should_be_visible(level: f32) -> bool {
     level > 0.01
 }
 
+fn sync_slider_widget_from_model(handle: &SliderHandle, strip_data: &ChannelStrip) {
+    let (next_slider_value, next_label) = compute_slider_sync_update(handle.scale.value(), strip_data);
+    if let Some(model_volume) = next_slider_value {
+        handle.suppress_signal.set(true);
+        handle.scale.set_value(model_volume);
+        handle.suppress_signal.set(false);
+    }
+
+    if handle.value_label.text().as_str() != next_label {
+        handle.value_label.set_text(&next_label);
+    }
+}
+
+fn compute_slider_sync_update(current_slider_value: f64, strip_data: &ChannelStrip) -> (Option<f64>, String) {
+    let model_volume = strip_data.volume_linear as f64;
+    let next_slider_value = ((current_slider_value - model_volume).abs() > 0.005).then_some(model_volume);
+    (next_slider_value, strip_data.volume_text())
+}
+
 fn should_apply_device_selection_change(
     is_programmatic_update: bool,
     current_selected: Option<&str>,
@@ -649,7 +662,8 @@ fn should_apply_device_selection_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceListModel, MixerTab, meter_display_level, meter_should_be_visible,
+        DeviceListModel, MixerTab, compute_slider_sync_update, meter_display_level,
+        meter_should_be_visible,
         should_apply_device_selection_change,
     };
     use crate::core::messages::{Channel, CoreEvent, DeviceEntry, DeviceKind};
@@ -741,5 +755,21 @@ mod tests {
 
         let strip = mixer.strips.get(&Channel::Main).unwrap();
         assert!((strip.volume_linear - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn compute_slider_sync_update_refreshes_label_even_without_value_change() {
+        let strip = ChannelStrip {
+            channel: Channel::Main,
+            icon: "🔊",
+            label: "Main",
+            volume_linear: 0.26,
+            muted: false,
+        };
+
+        let (next_slider, next_label) = compute_slider_sync_update(0.26, &strip);
+
+        assert_eq!(next_slider, None);
+        assert_eq!(next_label, "26%");
     }
 }
