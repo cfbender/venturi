@@ -177,5 +177,92 @@ pub fn collect_adapter_commands(
 }
 
 fn normalize_chord(raw: &str) -> String {
-    raw.trim().to_ascii_lowercase()
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut super_key = false;
+    let mut keys = Vec::new();
+
+    for token in raw.split('+') {
+        let normalized = token.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        match normalized.as_str() {
+            "ctrl" | "control" | "primary" => ctrl = true,
+            "alt" | "option" => alt = true,
+            "shift" => shift = true,
+            "super" | "meta" | "win" | "cmd" | "command" => super_key = true,
+            _ => keys.push(normalized),
+        }
+    }
+
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("ctrl".to_string());
+    }
+    if alt {
+        parts.push("alt".to_string());
+    }
+    if shift {
+        parts.push("shift".to_string());
+    }
+    if super_key {
+        parts.push("super".to_string());
+    }
+    parts.extend(keys);
+
+    parts.join("+")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::schema::Hotkeys;
+    use crate::core::messages::{Channel, CoreCommand};
+
+    use super::{HotkeyBindings, HotkeyEvent, HotkeyState, commands_for_hotkey_event};
+
+    #[test]
+    fn chord_matching_is_case_and_modifier_order_insensitive() {
+        let bindings = HotkeyBindings {
+            mute_main: "Ctrl+Shift+M".to_string(),
+            mute_mic: String::new(),
+            push_to_talk: String::new(),
+            toggle_window: String::new(),
+        };
+
+        let commands = commands_for_hotkey_event(
+            &HotkeyEvent::Pressed("shift+ctrl+m".to_string()),
+            &bindings,
+            HotkeyState {
+                main_muted: false,
+                mic_muted: false,
+            },
+        );
+
+        assert_eq!(commands, vec![CoreCommand::SetMute(Channel::Main, true)]);
+    }
+
+    #[test]
+    fn chord_matching_accepts_common_modifier_aliases() {
+        let config_hotkeys = Hotkeys {
+            mute_main: String::new(),
+            mute_mic: String::new(),
+            push_to_talk: String::new(),
+            toggle_window: "Control+Meta+V".to_string(),
+        };
+        let bindings = HotkeyBindings::from(&config_hotkeys);
+
+        let commands = commands_for_hotkey_event(
+            &HotkeyEvent::Pressed("ctrl+super+v".to_string()),
+            &bindings,
+            HotkeyState {
+                main_muted: false,
+                mic_muted: false,
+            },
+        );
+
+        assert_eq!(commands, vec![CoreCommand::ToggleWindow]);
+    }
 }

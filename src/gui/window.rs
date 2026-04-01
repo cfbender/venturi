@@ -12,7 +12,8 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::app::GuiLauncher;
 use crate::config::persistence::{Paths, load_config};
 use crate::config::schema::Palette;
-use crate::core::messages::{CoreCommand, CoreEvent};
+use crate::core::hotkeys::{HotkeyBindings, HotkeyEvent, HotkeyState, commands_for_hotkey_event};
+use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::gui::mixer_tab::{MixerTab, build_mixer_widget};
 use crate::gui::settings_tab::{SettingsTab, build_settings_widget};
 use crate::gui::soundboard_tab::{SoundboardTab, build_soundboard_widget};
@@ -80,6 +81,140 @@ fn ui_selected_device_from_config(raw: &str) -> Option<String> {
 
 fn should_metering_be_enabled(window_visible: bool, _window_active: bool) -> bool {
     window_visible
+}
+
+fn hotkey_bindings_from_settings(settings: &SettingsTab) -> HotkeyBindings {
+    HotkeyBindings::from(&settings.hotkeys())
+}
+
+fn hotkey_state_from_mixer(mixer: &MixerTab) -> HotkeyState {
+    let main_muted = mixer
+        .strips
+        .get(&Channel::Main)
+        .map(|strip| strip.muted)
+        .unwrap_or(false);
+    let mic_muted = mixer
+        .strips
+        .get(&Channel::Mic)
+        .map(|strip| strip.muted)
+        .unwrap_or(false);
+
+    HotkeyState {
+        main_muted,
+        mic_muted,
+    }
+}
+
+fn compose_hotkey_chord(
+    key_name: &str,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    super_key: bool,
+) -> Option<String> {
+    let normalized_key = key_name.trim().to_ascii_lowercase();
+    if normalized_key.is_empty() {
+        return None;
+    }
+
+    if matches!(
+        normalized_key.as_str(),
+        "shift_l"
+            | "shift_r"
+            | "control_l"
+            | "control_r"
+            | "ctrl_l"
+            | "ctrl_r"
+            | "alt_l"
+            | "alt_r"
+            | "meta_l"
+            | "meta_r"
+            | "super_l"
+            | "super_r"
+            | "win_l"
+            | "win_r"
+    ) {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("ctrl".to_string());
+    }
+    if alt {
+        parts.push("alt".to_string());
+    }
+    if shift {
+        parts.push("shift".to_string());
+    }
+    if super_key {
+        parts.push("super".to_string());
+    }
+    parts.push(normalized_key);
+
+    Some(parts.join("+"))
+}
+
+fn chord_from_key_event(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> Option<String> {
+    let key_name = key
+        .to_unicode()
+        .map(|ch| ch.to_ascii_lowercase().to_string())
+        .or_else(|| key.name().map(|name| name.to_string()))?;
+
+    compose_hotkey_chord(
+        &key_name,
+        modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK),
+        modifiers.contains(gtk::gdk::ModifierType::ALT_MASK),
+        modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK),
+        modifiers
+            .intersects(gtk::gdk::ModifierType::SUPER_MASK | gtk::gdk::ModifierType::META_MASK),
+    )
+}
+
+fn should_ignore_hotkeys_due_to_focus(window: &adw::ApplicationWindow) -> bool {
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {
+        return false;
+    };
+
+    focus.is::<gtk::Entry>() || focus.is::<gtk::SearchEntry>() || focus.is::<gtk::TextView>()
+}
+
+fn dispatch_window_hotkey_event(
+    event: HotkeyEvent,
+    settings_model: &Arc<Mutex<SettingsTab>>,
+    mixer_model: &Arc<Mutex<MixerTab>>,
+    command_tx: &Sender<CoreCommand>,
+) -> bool {
+    let bindings = match settings_model.lock() {
+        Ok(settings) => hotkey_bindings_from_settings(&settings),
+        Err(_) => return false,
+    };
+
+    let state = match mixer_model.lock() {
+        Ok(mixer) => hotkey_state_from_mixer(&mixer),
+        Err(_) => return false,
+    };
+
+    let commands = commands_for_hotkey_event(&event, &bindings, state);
+    if commands.is_empty() {
+        return false;
+    }
+
+    if let Ok(mut mixer) = mixer_model.lock() {
+        for command in &commands {
+            if let CoreCommand::SetMute(channel, muted) = command
+                && let Some(strip) = mixer.strips.get_mut(channel)
+            {
+                strip.muted = *muted;
+            }
+        }
+    }
+
+    for command in commands {
+        let _ = command_tx.send(command);
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -161,7 +296,7 @@ pub fn run_gtk_app(
             command_tx_outer.clone(),
             config_path.clone(),
         );
-        let settings = build_settings_widget(settings_model);
+        let settings = build_settings_widget(settings_model.clone());
 
         let mixer_page = stack.add_titled(&mixer, Some("mixer"), "Mixer");
         mixer_page.set_icon_name(Some("audio-speakers-symbolic"));
@@ -191,6 +326,57 @@ pub fn run_gtk_app(
             .default_height(vm.borrow().height as i32)
             .content(&content)
             .build();
+
+        {
+            let settings_model_for_press = settings_model.clone();
+            let mixer_model_for_press = mixer_model.clone();
+            let command_tx_for_press = command_tx_outer.clone();
+            let window_for_press = window.clone();
+
+            let settings_model_for_release = settings_model.clone();
+            let mixer_model_for_release = mixer_model.clone();
+            let command_tx_for_release = command_tx_outer.clone();
+            let window_for_release = window.clone();
+
+            let key_controller = gtk::EventControllerKey::new();
+            key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+                if should_ignore_hotkeys_due_to_focus(&window_for_press) {
+                    return gtk::glib::Propagation::Proceed;
+                }
+
+                let Some(chord) = chord_from_key_event(key, modifiers) else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+
+                if dispatch_window_hotkey_event(
+                    HotkeyEvent::Pressed(chord),
+                    &settings_model_for_press,
+                    &mixer_model_for_press,
+                    &command_tx_for_press,
+                ) {
+                    gtk::glib::Propagation::Stop
+                } else {
+                    gtk::glib::Propagation::Proceed
+                }
+            });
+            key_controller.connect_key_released(move |_, key, _, modifiers| {
+                if should_ignore_hotkeys_due_to_focus(&window_for_release) {
+                    return;
+                }
+
+                if let Some(chord) = chord_from_key_event(key, modifiers) {
+                    let _ = dispatch_window_hotkey_event(
+                        HotkeyEvent::Released(chord),
+                        &settings_model_for_release,
+                        &mixer_model_for_release,
+                        &command_tx_for_release,
+                    );
+                }
+            });
+
+            window.add_controller(key_controller);
+        }
 
         {
             let command_tx_for_hide = command_tx_outer.clone();
@@ -584,7 +770,10 @@ mod tests {
     use crate::gui::channel_strip::ChannelStrip;
     use crate::gui::mixer_tab::MixerTab;
 
-    use super::{parse_hex_color, should_metering_be_enabled, ui_selected_device_from_config};
+    use super::{
+        compose_hotkey_chord, parse_hex_color, should_metering_be_enabled,
+        ui_selected_device_from_config,
+    };
 
     #[test]
     fn parses_six_digit_hex_colors() {
@@ -665,5 +854,29 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let resolved = super::resolve_dev_data_dir(temp.path());
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn composes_hotkey_chord_in_canonical_modifier_order() {
+        assert_eq!(
+            compose_hotkey_chord("m", true, false, true, false),
+            Some("ctrl+shift+m".to_string())
+        );
+        assert_eq!(
+            compose_hotkey_chord("v", true, true, false, false),
+            Some("ctrl+alt+v".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_modifier_only_key_names_when_composing_hotkey_chord() {
+        assert_eq!(
+            compose_hotkey_chord("Control_L", true, false, false, false),
+            None
+        );
+        assert_eq!(
+            compose_hotkey_chord("Shift_R", false, false, true, false),
+            None
+        );
     }
 }

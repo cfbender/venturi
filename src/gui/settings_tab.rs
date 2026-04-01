@@ -20,10 +20,10 @@ impl SettingsTab {
         Self {
             noise_gate_enabled: true,
             noise_gate_threshold_db: -40.0,
-            mute_main_hotkey: "Ctrl+Shift+M".to_string(),
-            mute_mic_hotkey: "Ctrl+Shift+N".to_string(),
+            mute_main_hotkey: "Ctrl+Alt+M".to_string(),
+            mute_mic_hotkey: "Ctrl+Alt+N".to_string(),
             push_to_talk_hotkey: String::new(),
-            toggle_window_hotkey: "Ctrl+Shift+V".to_string(),
+            toggle_window_hotkey: "Ctrl+Alt+V".to_string(),
             config_path_label: config_path,
             about_label: runtime_versions,
         }

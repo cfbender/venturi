@@ -128,10 +128,10 @@ impl Default for Config {
                 overrides: BTreeMap::new(),
             },
             hotkeys: Hotkeys {
-                mute_main: "ctrl+shift+m".to_string(),
-                mute_mic: "ctrl+shift+n".to_string(),
+                mute_main: "ctrl+alt+m".to_string(),
+                mute_mic: "ctrl+alt+n".to_string(),
                 push_to_talk: String::new(),
-                toggle_window: "ctrl+shift+v".to_string(),
+                toggle_window: "ctrl+alt+v".to_string(),
             },
             soundboard: Soundboard { pads: Vec::new() },
             palette: None,
