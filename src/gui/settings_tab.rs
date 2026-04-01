@@ -60,19 +60,34 @@ pub fn persist_hotkeys_to_config(config_file: &Path, hotkeys: &Hotkeys) -> Resul
 pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>>) -> gtk::Box {
     use gtk::prelude::*;
 
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.set_margin_top(14);
+    root.set_margin_start(14);
+    root.set_margin_end(14);
+    root.set_margin_bottom(12);
+    root.add_css_class("settings-root");
 
     let noise_group = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    noise_group.add_css_class("settings-section");
     let noise_title = gtk::Label::new(Some("Mic Processing"));
     noise_title.add_css_class("title-4");
+    noise_title.set_xalign(0.0);
 
     let gate_toggle = gtk::Switch::new();
     let gate_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    gate_row.append(&gtk::Label::new(Some("Enable noise gate")));
+    gate_row.add_css_class("settings-row");
+    let gate_label = gtk::Label::new(Some("Enable noise gate"));
+    gate_label.set_hexpand(true);
+    gate_label.set_xalign(0.0);
+    gate_row.append(&gate_label);
     gate_row.append(&gate_toggle);
 
     let threshold = gtk::Scale::with_range(gtk::Orientation::Horizontal, -80.0, 0.0, 1.0);
     let threshold_label = gtk::Label::new(Some("Threshold (dB)"));
+    threshold_label.set_xalign(0.0);
+    threshold.add_css_class("settings-threshold");
 
     {
         let state = model.lock().expect("settings lock");
@@ -105,8 +120,10 @@ pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>
     noise_group.append(&threshold);
 
     let hotkeys_group = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    hotkeys_group.add_css_class("settings-section");
     let hotkeys_title = gtk::Label::new(Some("Hotkeys"));
     hotkeys_title.add_css_class("title-4");
+    hotkeys_title.set_xalign(0.0);
     hotkeys_group.append(&hotkeys_title);
 
     let mute_main_entry = gtk::Entry::new();
@@ -128,7 +145,12 @@ pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>
         ("Toggle Window", &toggle_window_entry),
     ] {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.append(&gtk::Label::new(Some(label)));
+        row.add_css_class("settings-row");
+        let row_label = gtk::Label::new(Some(label));
+        row_label.set_width_chars(14);
+        row_label.set_xalign(0.0);
+        row.append(&row_label);
+        entry.set_hexpand(true);
         row.append(entry);
         hotkeys_group.append(&row);
     }
@@ -187,18 +209,32 @@ pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>
     }
 
     let config_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    config_group.append(&gtk::Label::new(Some("Config")));
+    config_group.add_css_class("settings-section");
+    let config_title = gtk::Label::new(Some("Config"));
+    config_title.add_css_class("title-4");
+    config_title.set_xalign(0.0);
+    config_group.append(&config_title);
     if let Ok(state) = model.lock() {
-        config_group.append(&gtk::Label::new(Some(&format!(
-            "Path: {}",
-            state.config_path_label
-        ))));
+        let path_label = gtk::Label::new(Some(&format!("Path: {}", state.config_path_label)));
+        path_label.add_css_class("dim-label");
+        path_label.set_xalign(0.0);
+        path_label.set_wrap(true);
+        path_label.set_selectable(true);
+        config_group.append(&path_label);
     }
 
     let about_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    about_group.append(&gtk::Label::new(Some("About")));
+    about_group.add_css_class("settings-section");
+    let about_title = gtk::Label::new(Some("About"));
+    about_title.add_css_class("title-4");
+    about_title.set_xalign(0.0);
+    about_group.append(&about_title);
     if let Ok(state) = model.lock() {
-        about_group.append(&gtk::Label::new(Some(&state.about_label)));
+        let about_label = gtk::Label::new(Some(&state.about_label));
+        about_label.add_css_class("dim-label");
+        about_label.set_xalign(0.0);
+        about_label.set_wrap(true);
+        about_group.append(&about_label);
     }
 
     root.append(&noise_group);

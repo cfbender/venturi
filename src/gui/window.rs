@@ -509,6 +509,22 @@ fn install_mixer_css(palette: Option<&Palette>) {
     .soundboard-preview-button:disabled {{
         opacity: 0.45;
     }}
+
+    .settings-section {{
+        border-radius: 12px;
+        padding: 10px 12px;
+        background-color: alpha(@window_fg_color, 0.03);
+        border: 1px solid alpha(@window_fg_color, 0.08);
+    }}
+
+    .settings-row {{
+        min-height: 32px;
+        align-items: center;
+    }}
+
+    .settings-threshold {{
+        margin-bottom: 2px;
+    }}
     "#
     );
 
