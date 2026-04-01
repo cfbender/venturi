@@ -3,7 +3,7 @@ use venturi::app::{AppBootstrap, AppRunner, GuiLauncher};
 use venturi::gui::window::GtkGuiLauncher;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "venturi", about = "Linux audio mixer for PipeWire")]
+#[command(name = "venturi", version, about = "Linux audio mixer for PipeWire")]
 struct Cli {
     #[arg(long)]
     daemon: bool,
