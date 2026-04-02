@@ -56,17 +56,8 @@ pub struct SliderHandle {
     pub is_dragging: Rc<Cell<bool>>,
 }
 
-#[cfg(test)]
-impl SliderHandle {
-    /// Create a SliderHandle with dummy scale for testing flag behavior.
-    pub(crate) fn new_for_test() -> Self {
-        Self {
-            scale: gtk::Scale::default(),
-            value_label: gtk::Label::new(None),
-            suppress_signal: Rc::new(Cell::new(false)),
-            is_dragging: Rc::new(Cell::new(false)),
-        }
-    }
+fn default_slider_flags() -> (Rc<Cell<bool>>, Rc<Cell<bool>>) {
+    (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)))
 }
 
 pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) -> gtk::Box {
@@ -125,8 +116,7 @@ pub fn build_strip_widget_with_meter(
 
     let db_label = gtk::Label::new(Some(&state.borrow().volume_text()));
     let last_sent_at = Rc::new(RefCell::new(Instant::now() - Duration::from_secs(1)));
-    let suppress_signal = Rc::new(Cell::new(false));
-    let is_dragging = Rc::new(Cell::new(false));
+    let (suppress_signal, is_dragging) = default_slider_flags();
 
     let mute = gtk::ToggleButton::with_label("Mute");
     mute.set_active(state.borrow().muted);
@@ -258,10 +248,9 @@ mod tests {
 
     #[test]
     fn slider_handle_suppression_flags_default_to_false() {
-        let _ = gtk::init();
-        let handle = super::SliderHandle::new_for_test();
-        assert!(!handle.suppress_signal.get());
-        assert!(!handle.is_dragging.get());
+        let (suppress_signal, is_dragging) = super::default_slider_flags();
+        assert!(!suppress_signal.get());
+        assert!(!is_dragging.get());
     }
 
     #[test]
