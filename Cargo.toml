@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/domain", "crates/application", "crates/runtime"]
+members = [
+  "crates/domain",
+  "crates/application",
+  "crates/runtime",
+  "crates/adapters/pipewire",
+]
 
 [package]
 name = "venturi"

@@ -1,0 +1,8 @@
+[package]
+name = "venturi-pipewire-adapter"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "venturi_pipewire_adapter"
+path = "src/lib.rs"
