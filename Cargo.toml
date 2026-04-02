@@ -1,6 +1,16 @@
+[workspace]
+members = [
+  "crates/domain",
+  "crates/application",
+  "crates/runtime",
+  "crates/app-gtk",
+  "crates/adapters/pipewire",
+  "crates/adapters/platform",
+]
+
 [package]
 name = "venturi"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -15,12 +25,18 @@ serde_json = "1.0"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+venturi-application = { path = "crates/application" }
+venturi-app-gtk = { path = "crates/app-gtk" }
+venturi-domain = { path = "crates/domain" }
+venturi-platform-adapter = { path = "crates/adapters/platform" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = "3.13"
+venturi-application = { path = "crates/application" }
+venturi-runtime = { path = "crates/runtime" }
 
 [package.metadata.deb]
 depends = "$auto, libpipewire-0.3-0, libgtk-4-1, libadwaita-1-0"

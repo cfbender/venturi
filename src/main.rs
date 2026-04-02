@@ -1,6 +1,5 @@
 use clap::Parser;
-use venturi::app::{AppBootstrap, AppRunner, GuiLauncher};
-use venturi::gui::window::GtkGuiLauncher;
+use venturi::app::run_app;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "venturi", version, about = "Linux audio mixer for PipeWire")]
@@ -29,10 +28,5 @@ fn main() -> Result<(), String> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
-    let bootstrap = AppBootstrap::new();
-    let runner = AppRunner::new(GtkGuiLauncher);
-    runner.run(cli.daemon, bootstrap)
+    run_app(cli.daemon)
 }
-
-#[allow(dead_code)]
-fn _assert_gui_launcher_trait(_: &dyn GuiLauncher) {}

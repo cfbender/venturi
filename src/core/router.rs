@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::core::messages::Channel;
+use venturi_domain::Channel as DomainChannel;
 
 pub const FORCE_LINK_ROUTING_ENV: &str = "VENTURI_FORCE_LINK_ROUTING";
 
@@ -76,13 +77,17 @@ pub fn build_fallback_link_commands(stream_id: u32, channel: Channel) -> Vec<Vec
 }
 
 pub fn channel_node_name(channel: Channel) -> &'static str {
+    venturi_domain::channel_node_name(domain_channel(channel))
+}
+
+fn domain_channel(channel: Channel) -> DomainChannel {
     match channel {
-        Channel::Main => "Venturi-Output",
-        Channel::Game => "Venturi-Game",
-        Channel::Media => "Venturi-Media",
-        Channel::Chat => "Venturi-Chat",
-        Channel::Aux => "Venturi-Aux",
-        Channel::Mic => "Venturi-Mic",
+        Channel::Main => DomainChannel::Main,
+        Channel::Game => DomainChannel::Game,
+        Channel::Media => DomainChannel::Media,
+        Channel::Chat => DomainChannel::Chat,
+        Channel::Aux => DomainChannel::Aux,
+        Channel::Mic => DomainChannel::Mic,
     }
 }
 

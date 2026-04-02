@@ -1,6 +1,8 @@
 use crate::config::schema;
 use crate::core::messages::{Channel, CoreCommand};
 use std::collections::VecDeque;
+#[cfg(test)]
+use venturi_platform_adapter::HotkeyAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyBackend {
@@ -159,7 +161,7 @@ pub fn commands_for_hotkey_event(
     }
 
     if bindings.matches_press(event, &bindings.toggle_window) {
-        return vec![CoreCommand::ToggleWindow];
+        return vec![CoreCommand::typed_toggle_window()];
     }
 
     Vec::new()
@@ -174,6 +176,26 @@ pub fn collect_adapter_commands(
         .poll_event()
         .map(|event| commands_for_hotkey_event(&event, bindings, state))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn action_from_event(event: &HotkeyEvent) -> HotkeyAction {
+    match event {
+        HotkeyEvent::Pressed(chord) => HotkeyAction::Pressed {
+            chord: chord.clone(),
+        },
+        HotkeyEvent::Released(chord) => HotkeyAction::Released {
+            chord: chord.clone(),
+        },
+    }
+}
+
+#[cfg(test)]
+fn event_from_action(action: HotkeyAction) -> HotkeyEvent {
+    match action {
+        HotkeyAction::Pressed { chord } => HotkeyEvent::Pressed(chord),
+        HotkeyAction::Released { chord } => HotkeyEvent::Released(chord),
+    }
 }
 
 fn normalize_chord(raw: &str) -> String {
@@ -221,7 +243,10 @@ mod tests {
     use crate::config::schema::Hotkeys;
     use crate::core::messages::{Channel, CoreCommand};
 
-    use super::{HotkeyBindings, HotkeyEvent, HotkeyState, commands_for_hotkey_event};
+    use super::{
+        HotkeyBindings, HotkeyEvent, HotkeyState, action_from_event, commands_for_hotkey_event,
+        event_from_action,
+    };
 
     #[test]
     fn chord_matching_is_case_and_modifier_order_insensitive() {
@@ -264,5 +289,13 @@ mod tests {
         );
 
         assert_eq!(commands, vec![CoreCommand::ToggleWindow]);
+    }
+
+    #[test]
+    fn hotkey_adapter_action_roundtrip_is_typed() {
+        let event = HotkeyEvent::Pressed("ctrl+shift+v".to_string());
+        let action = action_from_event(&event);
+
+        assert_eq!(event_from_action(action), event);
     }
 }

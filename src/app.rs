@@ -113,6 +113,16 @@ impl<G: GuiLauncher> AppRunner<G> {
     }
 }
 
+pub fn run_app(daemon: bool) -> Result<(), String> {
+    run_app_with_launcher(daemon, crate::gui::window::GtkGuiLauncher)
+}
+
+pub fn run_app_with_launcher<G: GuiLauncher>(daemon: bool, gui_launcher: G) -> Result<(), String> {
+    let bootstrap = AppBootstrap::new();
+    let runner = AppRunner::new(gui_launcher);
+    runner.run(daemon, bootstrap)
+}
+
 fn wait_for_shutdown(event_rx: &Receiver<CoreEvent>) -> Result<(), String> {
     loop {
         match event_rx.recv() {
