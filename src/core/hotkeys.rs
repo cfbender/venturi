@@ -1,6 +1,7 @@
 use crate::config::schema;
 use crate::core::messages::{Channel, CoreCommand};
 use std::collections::VecDeque;
+use venturi_platform_adapter::HotkeyAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyBackend {
@@ -172,8 +173,30 @@ pub fn collect_adapter_commands(
 ) -> Vec<CoreCommand> {
     adapter
         .poll_event()
+        .and_then(|event| {
+            let action = action_from_event(&event);
+            event_from_action(&action)
+        })
         .map(|event| commands_for_hotkey_event(&event, bindings, state))
         .unwrap_or_default()
+}
+
+fn action_from_event(event: &HotkeyEvent) -> HotkeyAction {
+    let id = match event {
+        HotkeyEvent::Pressed(chord) => format!("pressed:{chord}"),
+        HotkeyEvent::Released(chord) => format!("released:{chord}"),
+    };
+
+    HotkeyAction { id }
+}
+
+fn event_from_action(action: &HotkeyAction) -> Option<HotkeyEvent> {
+    let (kind, chord) = action.id.split_once(':')?;
+    match kind {
+        "pressed" => Some(HotkeyEvent::Pressed(chord.to_string())),
+        "released" => Some(HotkeyEvent::Released(chord.to_string())),
+        _ => None,
+    }
 }
 
 fn normalize_chord(raw: &str) -> String {
@@ -221,7 +244,7 @@ mod tests {
     use crate::config::schema::Hotkeys;
     use crate::core::messages::{Channel, CoreCommand};
 
-    use super::{HotkeyBindings, HotkeyEvent, HotkeyState, commands_for_hotkey_event};
+    use super::{commands_for_hotkey_event, HotkeyBindings, HotkeyEvent, HotkeyState};
 
     #[test]
     fn chord_matching_is_case_and_modifier_order_insensitive() {

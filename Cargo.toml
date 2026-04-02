@@ -4,6 +4,7 @@ members = [
   "crates/application",
   "crates/runtime",
   "crates/adapters/pipewire",
+  "crates/adapters/platform",
 ]
 
 [package]
@@ -24,6 +25,7 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 venturi-domain = { path = "crates/domain" }
+venturi-platform-adapter = { path = "crates/adapters/platform" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }

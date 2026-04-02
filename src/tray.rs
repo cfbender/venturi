@@ -1,4 +1,5 @@
 use crossbeam_channel::Sender;
+use venturi_platform_adapter::{TrayAction, TrayController};
 
 use crate::core::messages::CoreCommand;
 
@@ -11,6 +12,38 @@ const TRAY_ICON_RELATIVE_PATH: &str = "hicolor/scalable/apps/org.venturi.Venturi
 pub enum TrayMenuAction {
     ShowHide,
     Quit,
+}
+
+impl TrayMenuAction {
+    fn to_action(self) -> TrayAction {
+        match self {
+            TrayMenuAction::ShowHide => TrayAction::ShowHide,
+            TrayMenuAction::Quit => TrayAction::Quit,
+        }
+    }
+}
+
+fn command_from_adapter_name(command: &str) -> Result<CoreCommand, String> {
+    match command {
+        "toggle_window" => Ok(CoreCommand::ToggleWindow),
+        "shutdown" => Ok(CoreCommand::Shutdown),
+        unknown => Err(format!("unsupported tray command: {unknown}")),
+    }
+}
+
+fn dispatch_tray_action(
+    command_tx: &Sender<CoreCommand>,
+    action: TrayMenuAction,
+) -> Result<(), String> {
+    let mut command_name: Option<&'static str> = None;
+    let mut controller = TrayController::new(|command| {
+        command_name = Some(command);
+    });
+    controller.dispatch(action.to_action());
+
+    let command_name = command_name.ok_or_else(|| "tray action produced no command".to_string())?;
+    let command = command_from_adapter_name(command_name)?;
+    command_tx.send(command).map_err(|err| err.to_string())
 }
 
 #[derive(Clone)]
@@ -27,11 +60,7 @@ impl TrayHandle {
     }
 
     pub fn activate(&self, action: TrayMenuAction) -> Result<(), String> {
-        let command = match action {
-            TrayMenuAction::ShowHide => CoreCommand::ToggleWindow,
-            TrayMenuAction::Quit => CoreCommand::Shutdown,
-        };
-        self.command_tx.send(command).map_err(|err| err.to_string())
+        dispatch_tray_action(&self.command_tx, action)
     }
 }
 
@@ -231,7 +260,7 @@ impl ksni::Tray for VenturiTray {
             ksni::menu::StandardItem {
                 label: "Show/Hide".to_string(),
                 activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.command_tx.send(CoreCommand::ToggleWindow);
+                    let _ = dispatch_tray_action(&tray.command_tx, TrayMenuAction::ShowHide);
                 }),
                 ..Default::default()
             }
@@ -239,7 +268,7 @@ impl ksni::Tray for VenturiTray {
             ksni::menu::StandardItem {
                 label: "Quit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.command_tx.send(CoreCommand::Shutdown);
+                    let _ = dispatch_tray_action(&tray.command_tx, TrayMenuAction::Quit);
                 }),
                 ..Default::default()
             }
@@ -255,7 +284,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use tempfile::tempdir;
 
-    use super::{TRAY_ICON_NAME, VenturiTray, resolve_installed_tray_icon};
+    use super::{resolve_installed_tray_icon, VenturiTray, TRAY_ICON_NAME};
 
     #[test]
     fn tray_reports_venturi_icon_name() {
