@@ -34,6 +34,8 @@ ksni = { version = "0.3", features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = "3.13"
+venturi-application = { path = "crates/application" }
+venturi-runtime = { path = "crates/runtime" }
 
 [package.metadata.deb]
 depends = "$auto, libpipewire-0.3-0, libgtk-4-1, libadwaita-1-0"
