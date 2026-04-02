@@ -160,6 +160,14 @@ impl MixerTab {
                 }
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
+            CoreEvent::DeviceSelectionChanged {
+                selected_output,
+                selected_input,
+            } => {
+                self.devices.selected_output = selected_output.clone();
+                self.devices.selected_input = selected_input.clone();
+                self.ui_dirty.store(true, Ordering::Relaxed);
+            }
             CoreEvent::Error(msg) => {
                 self.banner = Some(msg.clone());
                 self.ui_dirty.store(true, Ordering::Relaxed);
@@ -848,6 +856,25 @@ mod tests {
             Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo"),
             "alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1",
         ));
+    }
+
+    #[test]
+    fn applies_device_selection_changed_event() {
+        let mut mixer = MixerTab::default();
+
+        mixer.apply_event(&CoreEvent::DeviceSelectionChanged {
+            selected_output: Some("alsa_output.usb-Headset.analog-stereo".to_string()),
+            selected_input: Some("alsa_input.usb-Headset.mono-fallback".to_string()),
+        });
+
+        assert_eq!(
+            mixer.devices.selected_output.as_deref(),
+            Some("alsa_output.usb-Headset.analog-stereo")
+        );
+        assert_eq!(
+            mixer.devices.selected_input.as_deref(),
+            Some("alsa_input.usb-Headset.mono-fallback")
+        );
     }
 
     #[test]

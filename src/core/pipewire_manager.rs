@@ -11,7 +11,7 @@ use crate::config::persistence::{DebouncedSaver, Paths, ensure_dirs, load_config
 use crate::core::hotkeys::{
     HotkeyAdapter, HotkeyBindings, HotkeyState, build_adapter, collect_adapter_commands,
 };
-use crate::core::messages::{Channel, CoreCommand, CoreEvent};
+use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, DeviceKind};
 use crate::core::pipewire_backend::{
     PwPlayProcess, PwTargetSampler, current_default_sink_name, current_default_source_name,
     ensure_virtual_devices, reconcile_monitor_loopback_modules, rewire_virtual_mic_source,
@@ -43,6 +43,7 @@ const ECHO_SUPPRESSION_WINDOW: Duration = Duration::from_millis(200);
 const ECHO_SUPPRESSION_VOLUME_EPSILON: f32 = 0.01;
 const INTENT_REAPPLY_VOLUME_EPSILON: f32 = 0.01;
 const RESTART_DELAY: Duration = Duration::from_secs(2);
+const DEVICE_SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
@@ -143,6 +144,30 @@ fn should_skip_output_device_reconcile(
     force: bool,
 ) -> bool {
     !force && current_selection == Some(requested_device)
+}
+
+fn selected_device_available(
+    devices: &[DeviceEntry],
+    kind: DeviceKind,
+    selected: Option<&str>,
+) -> bool {
+    let Some(selected) = selected else {
+        return false;
+    };
+
+    selected.eq_ignore_ascii_case(fallback_to_default_device())
+        || devices
+            .iter()
+            .any(|device| device.kind == kind && device.id == selected)
+}
+
+#[cfg(test)]
+fn keep_pipewire_backend_symbols_for_tests() {
+    let _ = current_default_sink_name as fn() -> Result<Option<String>, String>;
+    let _ = reconcile_monitor_loopback_modules
+        as fn(&str, Option<&str>) -> Result<Option<String>, String>;
+    let _ = unload_pactl_module as fn(&str) -> Result<(), String>;
+    let _ = VENTURI_MAIN_MONITOR;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -776,6 +801,9 @@ struct CoreRuntimeState {
     consecutive_failures: u32,
     first_failure_at: Instant,
     restart_pending_until: Option<Instant>,
+    last_device_selection_poll_at: Instant,
+    output_restore_pending: bool,
+    input_restore_pending: bool,
 }
 
 impl CoreRuntimeState {
@@ -858,6 +886,9 @@ impl CoreRuntimeState {
             consecutive_failures: 0,
             first_failure_at: Instant::now(),
             restart_pending_until: None,
+            last_device_selection_poll_at: Instant::now() - DEVICE_SELECTION_POLL_INTERVAL,
+            output_restore_pending: false,
+            input_restore_pending: false,
         };
 
         state.overrides = deserialize_overrides(&state.runtime_config.categorizer.overrides);
@@ -950,9 +981,11 @@ impl CoreRuntimeState {
             }
             CoreCommand::SetOutputDevice(device) => {
                 self.handle_set_output_device(&device)?;
+                self.emit_device_selection_changed(event_tx);
             }
             CoreCommand::SetInputDevice(device) => {
                 self.handle_set_input_device(&device)?;
+                self.emit_device_selection_changed(event_tx);
             }
             CoreCommand::ToggleWindow => {
                 event_tx
@@ -1241,6 +1274,157 @@ impl CoreRuntimeState {
         channels
     }
 
+    fn emit_device_selection_changed(&self, event_tx: &Sender<CoreEvent>) {
+        let _ = event_tx.send(CoreEvent::DeviceSelectionChanged {
+            selected_output: self.selected_output.clone(),
+            selected_input: self.selected_input.clone(),
+        });
+    }
+
+    fn poll_selected_device_restore(&mut self, event_tx: &Sender<CoreEvent>, force_poll: bool) {
+        if !force_poll && self.last_device_selection_poll_at.elapsed() < DEVICE_SELECTION_POLL_INTERVAL {
+            return;
+        }
+        self.last_device_selection_poll_at = Instant::now();
+
+        if !selected_device_available(
+            &self.last_snapshot.devices,
+            DeviceKind::Output,
+            self.selected_output.as_deref(),
+        ) {
+            self.output_restore_pending = self.selected_output.is_some();
+        }
+
+        if !selected_device_available(
+            &self.last_snapshot.devices,
+            DeviceKind::Input,
+            self.selected_input.as_deref(),
+        ) {
+            self.input_restore_pending = self.selected_input.is_some();
+        }
+
+        let mut selection_changed = false;
+
+        if self.output_restore_pending
+            && let Some(selected_output) = self.selected_output.clone()
+            && selected_device_available(
+                &self.last_snapshot.devices,
+                DeviceKind::Output,
+                Some(selected_output.as_str()),
+            )
+        {
+            match self.handle_set_output_device_internal(&selected_output, true) {
+                Ok(()) => {
+                    self.output_restore_pending = false;
+                    selection_changed = true;
+                }
+                Err(err) => {
+                    let _ = event_tx.send(CoreEvent::Error(format!(
+                        "failed to restore output routing to {selected_output}: {err}"
+                    )));
+                }
+            }
+        }
+
+        if self.input_restore_pending
+            && let Some(selected_input) = self.selected_input.clone()
+            && selected_device_available(
+                &self.last_snapshot.devices,
+                DeviceKind::Input,
+                Some(selected_input.as_str()),
+            )
+        {
+            match self.handle_set_input_device_internal(&selected_input, true) {
+                Ok(()) => {
+                    self.input_restore_pending = false;
+                    selection_changed = true;
+                }
+                Err(err) => {
+                    let _ = event_tx.send(CoreEvent::Error(format!(
+                        "failed to restore input routing to {selected_input}: {err}"
+                    )));
+                }
+            }
+        }
+
+        if selection_changed {
+            self.emit_device_selection_changed(event_tx);
+        }
+    }
+
+    fn reconcile_output_route(&mut self, device: &str) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            keep_pipewire_backend_symbols_for_tests();
+            let _ = device;
+            self.output_loopback_module = Some("test-output-loopback-module".to_string());
+            return Ok(());
+        }
+
+        #[cfg(not(test))]
+        {
+            let default_sink = if device.eq_ignore_ascii_case(fallback_to_default_device()) {
+                current_default_sink_name()?
+            } else {
+                None
+            };
+            let desired_output_owned =
+                resolve_output_loopback_target(device, default_sink.as_deref());
+            let desired_output = desired_output_owned.as_deref();
+            self.output_loopback_module = reconcile_monitor_loopback_modules(
+                VENTURI_MAIN_MONITOR,
+                desired_output,
+            )
+            .map_err(|err| {
+                if let Some(target) = desired_output {
+                    format!("failed to route Venturi main mix to {target}: {err}")
+                } else {
+                    format!("failed to clear Venturi main mix loopbacks: {err}")
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    fn reconcile_input_route(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            keep_pipewire_backend_symbols_for_tests();
+            self.virtual_mic_module = Some("test-virtual-mic-module".to_string());
+            return Ok(());
+        }
+
+        #[cfg(not(test))]
+        {
+            match resolve_selected_input_name(self.selected_input.as_deref()) {
+                Ok(Some(source_name)) => {
+                    if let Some(prev_module) = self.virtual_mic_module.take()
+                        && let Err(err) = unload_pactl_module(&prev_module)
+                    {
+                        return Err(format!(
+                            "failed to unload virtual mic module {prev_module}: {err}"
+                        ));
+                    }
+                    match rewire_virtual_mic_source(&source_name, VIRTUAL_SOURCES[0]) {
+                        Ok(module_id) => {
+                            self.virtual_mic_module = Some(module_id);
+                        }
+                        Err(err) => {
+                            return Err(format!(
+                                "failed to route virtual mic from {source_name}: {err}"
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(format!("failed to resolve selected input source: {err}"));
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn handle_set_output_device(&mut self, device: &str) -> Result<(), String> {
         self.handle_set_output_device_internal(device, false)
     }
@@ -1250,70 +1434,42 @@ impl CoreRuntimeState {
         device: &str,
         force: bool,
     ) -> Result<(), String> {
+        let selection_changed = self.selected_output.as_deref() != Some(device);
         if should_skip_output_device_reconcile(self.selected_output.as_deref(), device, force) {
             return Ok(());
         }
 
-        let default_sink = if device.eq_ignore_ascii_case(fallback_to_default_device()) {
-            current_default_sink_name()?
-        } else {
-            None
-        };
-        let desired_output_owned = resolve_output_loopback_target(device, default_sink.as_deref());
-        let desired_output = desired_output_owned.as_deref();
-        self.output_loopback_module =
-            reconcile_monitor_loopback_modules(VENTURI_MAIN_MONITOR, desired_output).map_err(
-                |err| {
-                    if let Some(target) = desired_output {
-                        format!("failed to route Venturi main mix to {target}: {err}")
-                    } else {
-                        format!("failed to clear Venturi main mix loopbacks: {err}")
-                    }
-                },
-            )?;
+        self.reconcile_output_route(device)?;
 
         self.selected_output = Some(device.to_string());
-        self.runtime_config.audio.output_device = config_device_value(device);
-        save_config(&self.paths, &self.runtime_config)
-            .map_err(|err| format!("failed to persist output device selection: {err}"))?;
+        self.output_restore_pending = false;
+        if selection_changed {
+            self.runtime_config.audio.output_device = config_device_value(device);
+            save_config(&self.paths, &self.runtime_config)
+                .map_err(|err| format!("failed to persist output device selection: {err}"))?;
+        }
         Ok(())
     }
 
     fn handle_set_input_device(&mut self, device: &str) -> Result<(), String> {
-        if self.selected_input.as_deref() == Some(device) {
+        self.handle_set_input_device_internal(device, false)
+    }
+
+    fn handle_set_input_device_internal(&mut self, device: &str, force: bool) -> Result<(), String> {
+        let selection_changed = self.selected_input.as_deref() != Some(device);
+        if !force && !selection_changed {
             return Ok(());
         }
 
         self.selected_input = Some(device.to_string());
-        match resolve_selected_input_name(self.selected_input.as_deref()) {
-            Ok(Some(source_name)) => {
-                if let Some(prev_module) = self.virtual_mic_module.take()
-                    && let Err(err) = unload_pactl_module(&prev_module)
-                {
-                    return Err(format!(
-                        "failed to unload virtual mic module {prev_module}: {err}"
-                    ));
-                }
-                match rewire_virtual_mic_source(&source_name, VIRTUAL_SOURCES[0]) {
-                    Ok(module_id) => {
-                        self.virtual_mic_module = Some(module_id);
-                    }
-                    Err(err) => {
-                        return Err(format!(
-                            "failed to route virtual mic from {source_name}: {err}"
-                        ));
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Err(format!("failed to resolve selected input source: {err}"));
-            }
-        }
+        self.reconcile_input_route()?;
 
-        self.runtime_config.audio.input_device = config_device_value(device);
-        save_config(&self.paths, &self.runtime_config)
-            .map_err(|err| format!("failed to persist input device selection: {err}"))?;
+        self.input_restore_pending = false;
+        if selection_changed {
+            self.runtime_config.audio.input_device = config_device_value(device);
+            save_config(&self.paths, &self.runtime_config)
+                .map_err(|err| format!("failed to persist input device selection: {err}"))?;
+        }
         Ok(())
     }
 
@@ -1337,6 +1493,7 @@ impl CoreRuntimeState {
                 self.last_snapshot.devices.clone(),
             ));
         }
+        self.emit_device_selection_changed(event_tx);
         for (id, stream) in &self.last_snapshot.streams {
             let category = classify_with_priority(
                 &self.overrides,
@@ -1400,12 +1557,14 @@ impl CoreRuntimeState {
                     &self.channel_volume_intents,
                 );
                 self.apply_channel_volume_intents_for_active_categories(event_tx);
+                self.poll_selected_device_restore(event_tx, true);
                 // Update shared snapshot for meter worker
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
                 emit_snapshot_channel_volumes(&self.last_snapshot, &self.overrides, event_tx);
             }
             PwMonitorEvent::ObjectsChanged(objects) => {
                 self.merge_changed_objects(&objects, event_tx);
+                self.poll_selected_device_restore(event_tx, true);
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
             }
             PwMonitorEvent::ProcessDied(reason) => {
@@ -1438,6 +1597,8 @@ impl CoreRuntimeState {
             return; // Stop retrying
         }
 
+        self.output_restore_pending = true;
+        self.input_restore_pending = true;
         // Schedule non-blocking restart
         self.restart_pending_until = Some(Instant::now() + RESTART_DELAY);
     }
@@ -1934,8 +2095,9 @@ impl PipeWireManager {
                     }
                 }
 
-                // Hotkey tick, state flush — run on every loop iteration
+                // Hotkey tick, device restore poll, state flush — run on every loop iteration
                 state.handle_hotkey_tick(&event_tx);
+                state.poll_selected_device_restore(&event_tx, false);
                 state.flush_persisted_state_if_due(&event_tx);
                 state.cleanup_soundboard_players();
             }
@@ -1965,22 +2127,73 @@ impl PipeWireManager {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::time::Duration;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
+    use crate::config::persistence::{DebouncedSaver, Paths, load_config};
     use crate::config::schema::State;
+    use crate::core::hotkeys::{HotkeyBindings, HotkeyState, build_adapter};
     use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, DeviceKind};
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
+    use crate::core::pw_monitor::PwMonitorEvent;
+    use crate::core::router::RoutingMode;
 
     use super::{
-        LastSentVolume, SoundboardPlaybackMode, apply_snapshot_volume_hint,
-        apply_structural_monitor_delta, apply_volume_intents_to_snapshot,
-        build_channel_level_targets, build_stream_name_level_targets, coalesce_commands,
-        collect_drifted_intent_channels, compute_channel_level_updates_with,
-        compute_level_sample_count, node_id_to_channel, parse_channel_volume_intents,
-        persisted_channel_mute, persisted_channel_volume, resolve_output_loopback_target,
+        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, LastSentVolume,
+        SoundboardPlaybackMode, apply_snapshot_volume_hint, apply_structural_monitor_delta,
+        apply_volume_intents_to_snapshot, build_channel_level_targets,
+        build_stream_name_level_targets, coalesce_commands, collect_drifted_intent_channels,
+        compute_channel_level_updates_with, compute_level_sample_count, node_id_to_channel,
+        parse_channel_volume_intents, persisted_channel_mute, persisted_channel_volume,
+        resolve_output_loopback_target, selected_device_available,
         should_emit_observed_channel_volume, should_skip_output_device_reconcile,
         should_suppress_recent_echo, snapshot_channel_volumes, soundboard_playback_targets,
     };
+
+    fn build_test_runtime_state(
+        selected_output: Option<&str>,
+        selected_input: Option<&str>,
+    ) -> CoreRuntimeState {
+        let paths = Paths::resolve();
+        let runtime_config = load_config(&paths);
+        let hotkey_bindings = HotkeyBindings::from(&runtime_config.hotkeys);
+
+        CoreRuntimeState {
+            routing_mode: RoutingMode::MetadataFirst,
+            paths,
+            runtime_config,
+            hotkey_bindings,
+            hotkey_state: HotkeyState {
+                main_muted: false,
+                mic_muted: false,
+            },
+            hotkey_adapter: build_adapter(Some("x11"), false),
+            last_snapshot: Snapshot::default(),
+            overrides: BTreeMap::new(),
+            selected_output: selected_output.map(str::to_string),
+            selected_input: selected_input.map(str::to_string),
+            output_loopback_module: None,
+            virtual_mic_module: None,
+            last_sink_volume_by_target: BTreeMap::new(),
+            last_source_volume_by_target: BTreeMap::new(),
+            last_sink_mute_by_target: BTreeMap::new(),
+            last_source_mute_by_target: BTreeMap::new(),
+            runtime_state: State::default(),
+            state_saver: DebouncedSaver::new(),
+            channel_volume_intents: BTreeMap::new(),
+            soundboard_players: BTreeMap::new(),
+            meter_enabled: Arc::new(AtomicBool::new(true)),
+            last_volume_sent: BTreeMap::new(),
+            shared_snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            consecutive_failures: 0,
+            first_failure_at: Instant::now(),
+            restart_pending_until: None,
+            last_device_selection_poll_at: Instant::now() - DEVICE_SELECTION_POLL_INTERVAL,
+            output_restore_pending: false,
+            input_restore_pending: false,
+        }
+    }
 
     #[test]
     fn full_soundboard_playback_targets_virtual_mic_and_main_output() {
@@ -2371,6 +2584,92 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
             "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo",
             false,
         ));
+    }
+
+    #[test]
+    fn selected_device_available_matches_default_and_kind() {
+        let devices = vec![
+            DeviceEntry {
+                kind: DeviceKind::Output,
+                id: "alsa_output.usb-Headset.analog-stereo".to_string(),
+                label: "Headset Output".to_string(),
+            },
+            DeviceEntry {
+                kind: DeviceKind::Input,
+                id: "alsa_input.usb-Headset.mono-fallback".to_string(),
+                label: "Headset Input".to_string(),
+            },
+        ];
+
+        assert!(selected_device_available(
+            &devices,
+            DeviceKind::Output,
+            Some("Default"),
+        ));
+        assert!(selected_device_available(
+            &devices,
+            DeviceKind::Output,
+            Some("alsa_output.usb-Headset.analog-stereo"),
+        ));
+        assert!(!selected_device_available(
+            &devices,
+            DeviceKind::Output,
+            Some("alsa_input.usb-Headset.mono-fallback"),
+        ));
+        assert!(!selected_device_available(
+            &devices,
+            DeviceKind::Input,
+            Some("alsa_input.usb-Unknown.mono-fallback"),
+        ));
+        assert!(!selected_device_available(&devices, DeviceKind::Input, None));
+    }
+
+    #[test]
+    fn emits_device_selection_changed_when_selected_devices_reappear() {
+        let selected_output = "alsa_output.usb-Headset.analog-stereo";
+        let selected_input = "alsa_input.usb-Headset.mono-fallback";
+        let mut state =
+            build_test_runtime_state(Some(selected_output), Some(selected_input));
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        state.handle_monitor_event(PwMonitorEvent::InitialSnapshot(Snapshot::default()), &event_tx);
+        assert!(state.output_restore_pending);
+        assert!(state.input_restore_pending);
+
+        let mut restored_snapshot = Snapshot::default();
+        restored_snapshot.devices = vec![
+            DeviceEntry {
+                kind: DeviceKind::Output,
+                id: selected_output.to_string(),
+                label: "Headset Output".to_string(),
+            },
+            DeviceEntry {
+                kind: DeviceKind::Input,
+                id: selected_input.to_string(),
+                label: "Headset Input".to_string(),
+            },
+        ];
+
+        state.handle_monitor_event(
+            PwMonitorEvent::InitialSnapshot(restored_snapshot),
+            &event_tx,
+        );
+
+        assert!(!state.output_restore_pending);
+        assert!(!state.input_restore_pending);
+
+        let selection_event = event_rx.try_iter().find_map(|event| match event {
+            CoreEvent::DeviceSelectionChanged {
+                selected_output,
+                selected_input,
+            } => Some((selected_output, selected_input)),
+            _ => None,
+        });
+
+        assert_eq!(
+            selection_event,
+            Some((Some(selected_output.to_string()), Some(selected_input.to_string())))
+        );
     }
 
     #[test]

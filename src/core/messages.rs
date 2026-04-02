@@ -53,6 +53,10 @@ pub enum CoreEvent {
     LevelsUpdate(Vec<(Channel, (f32, f32))>),
     VolumeChanged(Channel, f32),
     DevicesChanged(Vec<DeviceEntry>),
+    DeviceSelectionChanged {
+        selected_output: Option<String>,
+        selected_input: Option<String>,
+    },
     Error(String),
 }
 
