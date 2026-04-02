@@ -38,9 +38,7 @@ impl RuntimeSupervisor {
 
     pub async fn start(&self) -> Result<(), RuntimeSupervisorError> {
         self.readiness.mark_ready();
-        self.events_tx
-            .send(RuntimeEvent::Ready)
-            .map_err(|_| RuntimeSupervisorError::ReadyEventSendFailed)?;
+        let _ = self.events_tx.send(RuntimeEvent::Ready);
         Ok(())
     }
 }

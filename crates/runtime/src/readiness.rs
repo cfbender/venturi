@@ -34,15 +34,12 @@ impl ReadinessBarrier {
     }
 
     pub async fn wait_ready(&self) {
-        if self.inner.ready.load(Ordering::SeqCst) {
-            return;
-        }
-
         loop {
-            self.inner.notify.notified().await;
+            let notified = self.inner.notify.notified();
             if self.inner.ready.load(Ordering::SeqCst) {
                 return;
             }
+            notified.await;
         }
     }
 }
