@@ -11,6 +11,7 @@ use crate::core::meter::decay_peak;
 use crate::gui::app_chip::{AppChip, ChipStatus, DndPayload, build_chip_widget};
 use crate::gui::channel_strip::{ChannelStrip, SliderHandle, build_strip_widget_with_meter};
 use gtk::prelude::*;
+use venturi_application::AppEvent;
 use venturi_domain::StableDeviceId;
 
 pub const NO_DEVICES_FOUND: &str = "No devices found";
@@ -183,6 +184,17 @@ impl MixerTab {
                 if let Some(strip) = self.strips.get_mut(channel) {
                     strip.volume_linear = *volume;
                 }
+                self.ui_dirty.store(true, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn apply_runtime_event(&mut self, event: &AppEvent) {
+        match event {
+            AppEvent::MeterUpdated(snapshot) => {
+                let channel: Channel = snapshot.channel.into();
+                self.levels.insert(channel, (snapshot.level, snapshot.peak));
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
             _ => {}

@@ -33,6 +33,7 @@ pub enum PadAction {
 #[derive(Debug, Clone, Default)]
 pub struct SoundboardTab {
     pub pads: Vec<SoundboardPad>,
+    transport_playing: bool,
 }
 
 fn normalize_optional_text(raw: &str) -> Option<String> {
@@ -68,6 +69,7 @@ impl SoundboardTab {
                     file: Some(pad.file.clone()),
                 })
                 .collect(),
+            transport_playing: false,
         };
         tab.ensure_empty_slots(SOUND_PAD_COUNT);
         tab
@@ -127,6 +129,14 @@ impl SoundboardTab {
             })
             .collect()
     }
+
+    pub fn on_soundboard_state(&mut self, playing: bool) {
+        self.set_transport_state(playing);
+    }
+
+    fn set_transport_state(&mut self, playing: bool) {
+        self.transport_playing = playing;
+    }
 }
 
 pub fn persist_soundboard_to_config(
@@ -148,6 +158,7 @@ pub fn persist_soundboard_to_config(
     let mut config = load_config(&paths);
     let tab = SoundboardTab {
         pads: pads.to_vec(),
+        transport_playing: false,
     };
     config.soundboard.pads = tab.configured_pads();
     save_config(&paths, &config)
@@ -572,6 +583,7 @@ mod tests {
                     file: None,
                 },
             ],
+            transport_playing: false,
         };
         tab.ensure_empty_slots(SOUND_PAD_COUNT);
 
