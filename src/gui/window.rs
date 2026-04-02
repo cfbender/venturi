@@ -8,6 +8,7 @@ use std::{
 
 use adw::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
+use venturi_app_gtk::RuntimeUiEvent;
 
 use crate::app::GuiLauncher;
 use crate::config::persistence::{Paths, load_config};
@@ -215,6 +216,15 @@ fn dispatch_window_hotkey_event(
     }
 
     true
+}
+
+fn runtime_ui_event_from_core_event(event: &CoreEvent) -> Option<RuntimeUiEvent> {
+    match event {
+        CoreEvent::Ready => Some(RuntimeUiEvent::Ready),
+        CoreEvent::ToggleWindowRequested => Some(RuntimeUiEvent::ToggleWindowRequested),
+        CoreEvent::ShutdownRequested => Some(RuntimeUiEvent::ShutdownRequested),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -425,22 +435,28 @@ pub fn run_gtk_app(
         let last_metering_enabled_for_events = last_metering_enabled.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
             while let Ok(event) = event_rx.try_recv() {
-                if matches!(event, CoreEvent::ShutdownRequested) {
-                    app_for_events.quit();
-                    continue;
-                }
-
-                if matches!(event, CoreEvent::ToggleWindowRequested) {
-                    if window_for_events.is_visible() {
-                        let _ = command_tx_for_events.send(CoreCommand::SetMeteringEnabled(false));
-                        last_metering_enabled_for_events.set(Some(false));
-                        window_for_events.hide();
-                    } else {
-                        window_for_events.present();
-                        let _ = command_tx_for_events.send(CoreCommand::SetMeteringEnabled(true));
-                        last_metering_enabled_for_events.set(Some(true));
+                if let Some(runtime_event) = runtime_ui_event_from_core_event(&event) {
+                    match runtime_event {
+                        RuntimeUiEvent::ShutdownRequested => {
+                            app_for_events.quit();
+                            continue;
+                        }
+                        RuntimeUiEvent::ToggleWindowRequested => {
+                            if window_for_events.is_visible() {
+                                let _ = command_tx_for_events
+                                    .send(CoreCommand::SetMeteringEnabled(false));
+                                last_metering_enabled_for_events.set(Some(false));
+                                window_for_events.hide();
+                            } else {
+                                window_for_events.present();
+                                let _ = command_tx_for_events
+                                    .send(CoreCommand::SetMeteringEnabled(true));
+                                last_metering_enabled_for_events.set(Some(true));
+                            }
+                            continue;
+                        }
+                        RuntimeUiEvent::Ready => {}
                     }
-                    continue;
                 }
 
                 vm.borrow_mut().apply_core_event(&event);
