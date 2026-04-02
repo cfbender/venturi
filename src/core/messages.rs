@@ -42,6 +42,7 @@ pub enum CoreEvent {
     Ready,
     Pong,
     ToggleWindowRequested,
+    ShutdownRequested,
     StreamAppeared {
         id: u32,
         app_key: String,

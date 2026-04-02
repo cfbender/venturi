@@ -962,7 +962,10 @@ impl CoreRuntimeState {
             CoreCommand::SetMeteringEnabled(enabled) => {
                 self.meter_enabled.store(enabled, Ordering::Relaxed);
             }
-            CoreCommand::Shutdown => return Ok(CommandLoopControl::Shutdown),
+            CoreCommand::Shutdown => {
+                let _ = event_tx.send(CoreEvent::ShutdownRequested);
+                return Ok(CommandLoopControl::Shutdown);
+            }
             CoreCommand::PlaySound { pad_id, file } => {
                 self.handle_play_sound(pad_id, &file, SoundboardPlaybackMode::Full, event_tx);
             }
@@ -2905,12 +2908,5 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
         let should_give_up =
             consecutive_failures >= 3 && first_failure_at.elapsed() < failure_window;
         assert!(should_give_up, "3 failures in 30s should give up");
-    }
-
-    #[test]
-    fn restart_logic_resets_after_success() {
-        let mut consecutive_failures: u32 = 2;
-        consecutive_failures = 0;
-        assert_eq!(consecutive_failures, 0);
     }
 }

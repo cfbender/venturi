@@ -2,6 +2,11 @@ use crossbeam_channel::Sender;
 
 use crate::core::messages::CoreCommand;
 
+#[cfg(target_os = "linux")]
+const TRAY_ICON_NAME: &str = "org.venturi.Venturi";
+#[cfg(target_os = "linux")]
+const TRAY_ICON_RELATIVE_PATH: &str = "hicolor/scalable/apps/org.venturi.Venturi.svg";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayMenuAction {
     ShowHide,
@@ -74,6 +79,75 @@ struct VenturiTray {
 }
 
 #[cfg(target_os = "linux")]
+fn icon_theme_roots() -> Vec<String> {
+    let xdg_data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.local/share")
+    });
+
+    vec![
+        format!("{xdg_data_home}/icons"),
+        "/usr/share/icons".to_string(),
+        "/usr/local/share/icons".to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn installed_icon_theme_root() -> Option<String> {
+    for root in icon_theme_roots() {
+        let icon_path = std::path::PathBuf::from(&root).join(TRAY_ICON_RELATIVE_PATH);
+        if icon_path.exists() {
+            return Some(root);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn tray_icon_file_path() -> Option<std::path::PathBuf> {
+    if let Some(theme_root) = installed_icon_theme_root() {
+        return Some(std::path::PathBuf::from(theme_root).join(TRAY_ICON_RELATIVE_PATH));
+    }
+
+    let dev_icon = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("data")
+        .join(format!("{TRAY_ICON_NAME}.svg"));
+    if dev_icon.exists() {
+        Some(dev_icon)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn load_tray_icon_pixmap() -> Option<ksni::Icon> {
+    use gtk::prelude::{TextureExt, TextureExtManual};
+
+    let icon_file = tray_icon_file_path()?;
+    let texture = gtk::gdk::Texture::from_file(&gtk::gio::File::for_path(icon_file)).ok()?;
+    let width = texture.width();
+    let height = texture.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let stride = (width as usize).saturating_mul(4);
+    let mut data = vec![0u8; stride.saturating_mul(height as usize)];
+    texture.download(&mut data, stride);
+
+    // ksni expects ARGB32 data in network byte order.
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.rotate_right(1);
+    }
+
+    Some(ksni::Icon {
+        width,
+        height,
+        data,
+    })
+}
+
+#[cfg(target_os = "linux")]
 impl ksni::Tray for VenturiTray {
     const MENU_ON_ACTIVATE: bool = true;
 
@@ -86,33 +160,18 @@ impl ksni::Tray for VenturiTray {
     }
 
     fn icon_theme_path(&self) -> String {
-        // Search standard XDG icon directories for the installed icon.
-        // The icon lives under hicolor/scalable/apps/org.venturi.Venturi.svg.
-        let icon_file = "hicolor/scalable/apps/org.venturi.Venturi.svg";
-
-        let xdg_data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            format!("{home}/.local/share")
-        });
-
-        let candidates = [
-            format!("{xdg_data_home}/icons"),
-            "/usr/share/icons".to_string(),
-            "/usr/local/share/icons".to_string(),
-        ];
-
-        for dir in &candidates {
-            let path = format!("{dir}/{icon_file}");
-            if std::path::Path::new(&path).exists() {
-                return dir.clone();
-            }
-        }
-
-        String::new()
+        installed_icon_theme_root().unwrap_or_default()
     }
 
     fn icon_name(&self) -> String {
-        "org.venturi.Venturi".to_string()
+        TRAY_ICON_NAME.to_string()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        static ICON_PIXMAP: std::sync::LazyLock<Option<ksni::Icon>> =
+            std::sync::LazyLock::new(load_tray_icon_pixmap);
+
+        ICON_PIXMAP.clone().into_iter().collect()
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -157,6 +216,25 @@ mod tests {
         assert_eq!(
             <VenturiTray as ksni::Tray>::icon_name(&tray),
             "org.venturi.Venturi"
+        );
+    }
+
+    #[test]
+    fn tray_exposes_icon_pixmap_data() {
+        let (tx, _rx) = unbounded();
+        let tray = VenturiTray { command_tx: tx };
+
+        let pixmaps = <VenturiTray as ksni::Tray>::icon_pixmap(&tray);
+        assert!(
+            !pixmaps.is_empty(),
+            "expected tray icon pixmap to be populated"
+        );
+
+        let icon = &pixmaps[0];
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(
+            icon.data.len(),
+            (icon.width as usize) * (icon.height as usize) * 4
         );
     }
 }

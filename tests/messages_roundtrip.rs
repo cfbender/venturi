@@ -5,6 +5,7 @@ use venturi::core::messages::{Channel, CoreCommand, CoreEvent};
 fn command_and_event_are_debuggable_and_sendable() {
     let cmd = CoreCommand::SetVolume(Channel::Game, 0.8);
     let evt = CoreEvent::StreamAppeared {
+        app_key: "org.venturi.venturi".to_string(),
         id: 10,
         name: "Discord".to_string(),
         category: Channel::Chat,

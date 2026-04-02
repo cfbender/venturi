@@ -418,12 +418,18 @@ pub fn run_gtk_app(
         let vm = vm.clone();
         let mixer_model_for_events = mixer_model.clone();
         let event_rx = event_rx_outer.clone();
+        let app_for_events = app.clone();
         let window_for_events = window.clone();
         let command_tx_for_events = command_tx_outer.clone();
         let last_metering_enabled = Rc::new(Cell::new(None::<bool>));
         let last_metering_enabled_for_events = last_metering_enabled.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
             while let Ok(event) = event_rx.try_recv() {
+                if matches!(event, CoreEvent::ShutdownRequested) {
+                    app_for_events.quit();
+                    continue;
+                }
+
                 if matches!(event, CoreEvent::ToggleWindowRequested) {
                     if window_for_events.is_visible() {
                         let _ = command_tx_for_events.send(CoreCommand::SetMeteringEnabled(false));
