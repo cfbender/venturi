@@ -1,6 +1,4 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use venturi_app_gtk::{GtkLauncher, WindowBridge};
-use venturi_runtime::RuntimeSupervisor;
 
 use crate::config::persistence::{load_config, Paths};
 use crate::core::messages::{CoreCommand, CoreEvent};
@@ -120,26 +118,9 @@ pub fn run_app(daemon: bool) -> Result<(), String> {
 }
 
 pub fn run_app_with_launcher<G: GuiLauncher>(daemon: bool, gui_launcher: G) -> Result<(), String> {
-    let _runtime_ui_launcher = bootstrap_runtime_ui_bridge()?;
     let bootstrap = AppBootstrap::new();
     let runner = AppRunner::new(gui_launcher);
     runner.run(daemon, bootstrap)
-}
-
-fn bootstrap_runtime_ui_bridge() -> Result<GtkLauncher, String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("failed to initialize runtime bootstrap: {err}"))?;
-
-    let supervisor = RuntimeSupervisor::new_for_test();
-    runtime
-        .block_on(supervisor.start())
-        .map_err(|err| format!("failed to start runtime supervisor: {err}"))?;
-
-    let launcher = GtkLauncher::new(WindowBridge::new_for_test(Box::new(|_| {})));
-    launcher.notify_ready();
-    Ok(launcher)
 }
 
 fn wait_for_shutdown(event_rx: &Receiver<CoreEvent>) -> Result<(), String> {
