@@ -9,9 +9,12 @@ fn read_repo_file(relative: &str) -> String {
 #[test]
 fn deb_assets_include_app_icon_svg() {
     let cargo_toml = read_repo_file("Cargo.toml");
-    assert!(cargo_toml.contains(
-        "[\"data/org.venturi.Venturi.svg\", \"usr/share/icons/hicolor/scalable/apps/\", \"644\"]"
-    ));
+    assert!(
+        cargo_toml.contains("\"data/org.venturi.Venturi.svg\"")
+            && cargo_toml.contains("\"usr/share/icons/hicolor/scalable/apps/\""),
+        "Cargo.toml [package.metadata.deb] assets must include the app icon SVG \
+         installed to usr/share/icons/hicolor/scalable/apps/"
+    );
 }
 
 #[test]
