@@ -70,6 +70,7 @@ fn stream_events_update_viewmodel_once() {
     pump_event(
         &mut window,
         CoreEvent::StreamAppeared {
+            app_key: "org.venturi.venturi".to_string(),
             id: 5,
             name: "Discord".to_string(),
             category: Channel::Chat,

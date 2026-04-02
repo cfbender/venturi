@@ -19,6 +19,7 @@ AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 DESKTOP_FILE="venturi.desktop"
 AUTOSTART_FILE="venturi-autostart.desktop"
 ICON_FILE="org.venturi.Venturi.svg"
+SYMBOLIC_ICON_FILE="org.venturi.Venturi-symbolic.svg"
 
 # Resolve the absolute path to the venturi binary.
 # Checks (in order): mise, cargo bin, PATH, local release build.
@@ -59,6 +60,7 @@ remove() {
     echo "Removing Venturi desktop integration..."
     rm -f "$APP_DIR/$DESKTOP_FILE"
     rm -f "$ICON_DIR/$ICON_FILE"
+    rm -f "$ICON_DIR/$SYMBOLIC_ICON_FILE"
     rm -f "$AUTOSTART_DIR/$AUTOSTART_FILE"
     update-desktop-database "$APP_DIR" 2>/dev/null || true
     gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
@@ -96,6 +98,8 @@ EOF
     # Application icon
     cp "$PROJECT_DIR/data/$ICON_FILE" "$ICON_DIR/$ICON_FILE"
     echo "  Installed $ICON_DIR/$ICON_FILE"
+    cp "$PROJECT_DIR/data/$SYMBOLIC_ICON_FILE" "$ICON_DIR/$SYMBOLIC_ICON_FILE"
+    echo "  Installed $ICON_DIR/$SYMBOLIC_ICON_FILE"
 
     # Autostart entry (launches in daemon mode so it runs in the tray)
     cat > "$AUTOSTART_DIR/$AUTOSTART_FILE" <<EOF

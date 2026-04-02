@@ -45,4 +45,9 @@ assets = [
     "usr/share/icons/hicolor/scalable/apps/",
     "644",
   ],
+  [
+    "data/org.venturi.Venturi-symbolic.svg",
+    "usr/share/icons/hicolor/scalable/apps/",
+    "644",
+  ],
 ]
