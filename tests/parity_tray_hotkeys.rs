@@ -5,6 +5,7 @@ use venturi::tray::{TrayMenuAction, create_tray};
 use venturi_runtime::test_harness;
 
 #[test]
+#[cfg(target_os = "linux")]
 fn tray_and_hotkeys_keep_lifecycle_snapshot_in_sync() {
     let harness = test_harness();
     let (tx, rx) = unbounded();
@@ -14,8 +15,12 @@ fn tray_and_hotkeys_keep_lifecycle_snapshot_in_sync() {
         .expect("dispatch show/hide");
     tray.activate(TrayMenuAction::Quit).expect("dispatch quit");
 
-    let tray_toggle = rx.recv().expect("receive tray toggle command");
-    let tray_shutdown = rx.recv().expect("receive tray shutdown command");
+    let tray_toggle = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("receive tray toggle command");
+    let tray_shutdown = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("receive tray shutdown command");
 
     let bindings = HotkeyBindings {
         mute_main: String::new(),

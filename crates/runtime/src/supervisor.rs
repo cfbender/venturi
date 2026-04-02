@@ -10,12 +10,6 @@ pub enum RuntimeEvent {
     ShutdownRequested,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeSupervisorError {
-    #[error("runtime supervisor failed to emit ready event")]
-    ReadyEventSendFailed,
-}
-
 #[derive(Clone, Debug)]
 pub struct RuntimeSupervisor {
     readiness: ReadinessBarrier,
@@ -45,10 +39,9 @@ impl RuntimeSupervisor {
         self.events_tx.subscribe()
     }
 
-    pub async fn start(&self) -> Result<(), RuntimeSupervisorError> {
+    pub fn start(&self) {
         self.readiness.mark_ready();
         let _ = self.events_tx.send(RuntimeEvent::Ready);
-        Ok(())
     }
 
     pub fn composition(&self) -> Option<&RuntimeComposition> {

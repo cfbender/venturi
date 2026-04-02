@@ -128,15 +128,6 @@ fn config_device_value(device: &str) -> String {
     }
 }
 
-fn typed_channel(channel: Channel) -> Channel {
-    let typed: venturi_domain::Channel = channel.into();
-    typed.into()
-}
-
-fn typed_device_id(device: &str) -> venturi_domain::StableDeviceId {
-    venturi_domain::StableDeviceId(device.to_string())
-}
-
 fn resolve_output_loopback_target(device: &str, default_sink: Option<&str>) -> Option<String> {
     if !device.eq_ignore_ascii_case(fallback_to_default_device()) {
         return Some(device.to_string());
@@ -950,7 +941,6 @@ impl CoreRuntimeState {
                 self.resend_initial_state(event_tx);
             }
             CoreCommand::SetVolume(channel, volume) => {
-                let channel = typed_channel(channel);
                 self.update_channel_volume_intent(channel, volume, event_tx);
                 let applied_volume = apply_channel_volume(
                     channel,
@@ -990,13 +980,11 @@ impl CoreRuntimeState {
                 self.handle_move_stream(stream_id, channel)?;
             }
             CoreCommand::SetOutputDevice(device) => {
-                let typed = typed_device_id(&device);
-                self.handle_set_output_device(&typed.0)?;
+                self.handle_set_output_device(&device)?;
                 self.emit_device_selection_changed(event_tx);
             }
             CoreCommand::SetInputDevice(device) => {
-                let typed = typed_device_id(&device);
-                self.handle_set_input_device(&typed.0)?;
+                self.handle_set_input_device(&device)?;
                 self.emit_device_selection_changed(event_tx);
             }
             CoreCommand::ToggleWindow => {

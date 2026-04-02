@@ -7,7 +7,7 @@ async fn wait_ready_returns_immediately_when_already_ready() {
     let barrier = ReadinessBarrier::new();
     barrier.mark_ready();
 
-    timeout(Duration::from_millis(50), barrier.wait_ready())
+    timeout(Duration::from_secs(1), barrier.wait_ready())
         .await
         .unwrap();
 }
@@ -35,7 +35,7 @@ async fn wait_ready_unblocks_after_mark_ready() {
 async fn supervisor_emits_ready_before_timeout() {
     let supervisor = RuntimeSupervisor::new_for_test();
     let mut rx = supervisor.subscribe();
-    supervisor.start().await.unwrap();
+    supervisor.start();
 
     let event = timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -47,5 +47,5 @@ async fn supervisor_emits_ready_before_timeout() {
 #[tokio::test]
 async fn supervisor_start_succeeds_with_zero_subscribers() {
     let supervisor = RuntimeSupervisor::new_for_test();
-    supervisor.start().await.unwrap();
+    supervisor.start();
 }

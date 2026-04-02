@@ -1,6 +1,6 @@
-use venturi_domain::Channel;
+use venturi_domain::{Channel, channel_node_name};
 
 #[test]
 fn workspace_exposes_domain_channel() {
-    assert!(matches!(Channel::Main, Channel::Main));
+    assert_eq!(channel_node_name(Channel::Main), "Venturi-Output");
 }

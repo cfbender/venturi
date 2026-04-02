@@ -1,6 +1,7 @@
 use crate::config::schema;
 use crate::core::messages::{Channel, CoreCommand};
 use std::collections::VecDeque;
+#[cfg(test)]
 use venturi_platform_adapter::HotkeyAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,11 +174,11 @@ pub fn collect_adapter_commands(
 ) -> Vec<CoreCommand> {
     adapter
         .poll_event()
-        .map(|event| event_from_action(action_from_event(&event)))
         .map(|event| commands_for_hotkey_event(&event, bindings, state))
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn action_from_event(event: &HotkeyEvent) -> HotkeyAction {
     match event {
         HotkeyEvent::Pressed(chord) => HotkeyAction::Pressed {
@@ -189,6 +190,7 @@ fn action_from_event(event: &HotkeyEvent) -> HotkeyAction {
     }
 }
 
+#[cfg(test)]
 fn event_from_action(action: HotkeyAction) -> HotkeyEvent {
     match action {
         HotkeyAction::Pressed { chord } => HotkeyEvent::Pressed(chord),
