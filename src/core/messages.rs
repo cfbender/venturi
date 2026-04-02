@@ -64,6 +64,14 @@ pub enum CoreCommand {
 }
 
 impl CoreCommand {
+    pub fn typed_toggle_window() -> Self {
+        Self::ToggleWindow
+    }
+
+    pub fn typed_shutdown() -> Self {
+        Self::Shutdown
+    }
+
     pub fn typed_set_volume(channel: venturi_domain::Channel, value: f32) -> Self {
         Self::SetVolume(channel.into(), value)
     }

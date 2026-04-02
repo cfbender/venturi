@@ -1,4 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HotkeyAction {
-    pub id: String,
+pub enum HotkeyAction {
+    Pressed { chord: String },
+    Released { chord: String },
 }

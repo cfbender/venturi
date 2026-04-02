@@ -4,16 +4,22 @@ pub enum TrayAction {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayCommand {
+    ToggleWindow,
+    Shutdown,
+}
+
 pub struct TrayController<F>
 where
-    F: FnMut(&'static str),
+    F: FnMut(TrayCommand),
 {
     dispatch: F,
 }
 
 impl<F> TrayController<F>
 where
-    F: FnMut(&'static str),
+    F: FnMut(TrayCommand),
 {
     pub fn new(dispatch: F) -> Self {
         Self { dispatch }
@@ -21,8 +27,8 @@ where
 
     pub fn dispatch(&mut self, action: TrayAction) {
         let command = match action {
-            TrayAction::ShowHide => "toggle_window",
-            TrayAction::Quit => "shutdown",
+            TrayAction::ShowHide => TrayCommand::ToggleWindow,
+            TrayAction::Quit => TrayCommand::Shutdown,
         };
         (self.dispatch)(command);
     }

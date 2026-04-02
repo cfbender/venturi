@@ -92,6 +92,28 @@ Core and meter worker share `Arc<Mutex<Snapshot>>` only for read-copy metering u
 
 This is the only intentional shared state between runtime threads.
 
+## Staged Typed Service Seams
+
+Tray and hotkey lifecycle paths now cross adapter boundaries through typed enums instead of string command IDs.
+
+- `venturi-platform-adapter` tray actions map to typed tray commands (`ToggleWindow`, `Shutdown`).
+- Core tray callsites convert typed tray commands directly into `CoreCommand` values.
+- Hotkey adapter actions are typed press/release variants, so event conversion no longer depends on string parsing fallbacks.
+
+This keeps boundary migration incremental while preserving existing runtime behavior.
+
+## Lifecycle Parity Tests
+
+`venturi-runtime::composition::TestSnapshot` includes lifecycle request flags for toggle-window and shutdown paths, with read access in `SnapshotView`.
+
+Integration coverage now verifies parity across tray + hotkey lifecycle dispatch:
+
+- tray `Show/Hide` and `Quit` actions emit expected `CoreCommand`s
+- hotkey toggle emits `CoreCommand::ToggleWindow`
+- applying these commands into runtime composition lifecycle methods sets parity snapshot flags
+
+Primary verification entry point: `cargo test --test parity_tray_hotkeys`.
+
 ## Routing & Channel Control Boundaries
 
 ### `Main`

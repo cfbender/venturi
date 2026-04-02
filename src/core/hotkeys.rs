@@ -160,7 +160,7 @@ pub fn commands_for_hotkey_event(
     }
 
     if bindings.matches_press(event, &bindings.toggle_window) {
-        return vec![CoreCommand::ToggleWindow];
+        return vec![CoreCommand::typed_toggle_window()];
     }
 
     Vec::new()
@@ -173,29 +173,26 @@ pub fn collect_adapter_commands(
 ) -> Vec<CoreCommand> {
     adapter
         .poll_event()
-        .and_then(|event| {
-            let action = action_from_event(&event);
-            event_from_action(&action)
-        })
+        .map(|event| event_from_action(action_from_event(&event)))
         .map(|event| commands_for_hotkey_event(&event, bindings, state))
         .unwrap_or_default()
 }
 
 fn action_from_event(event: &HotkeyEvent) -> HotkeyAction {
-    let id = match event {
-        HotkeyEvent::Pressed(chord) => format!("pressed:{chord}"),
-        HotkeyEvent::Released(chord) => format!("released:{chord}"),
-    };
-
-    HotkeyAction { id }
+    match event {
+        HotkeyEvent::Pressed(chord) => HotkeyAction::Pressed {
+            chord: chord.clone(),
+        },
+        HotkeyEvent::Released(chord) => HotkeyAction::Released {
+            chord: chord.clone(),
+        },
+    }
 }
 
-fn event_from_action(action: &HotkeyAction) -> Option<HotkeyEvent> {
-    let (kind, chord) = action.id.split_once(':')?;
-    match kind {
-        "pressed" => Some(HotkeyEvent::Pressed(chord.to_string())),
-        "released" => Some(HotkeyEvent::Released(chord.to_string())),
-        _ => None,
+fn event_from_action(action: HotkeyAction) -> HotkeyEvent {
+    match action {
+        HotkeyAction::Pressed { chord } => HotkeyEvent::Pressed(chord),
+        HotkeyAction::Released { chord } => HotkeyEvent::Released(chord),
     }
 }
 
@@ -244,7 +241,10 @@ mod tests {
     use crate::config::schema::Hotkeys;
     use crate::core::messages::{Channel, CoreCommand};
 
-    use super::{commands_for_hotkey_event, HotkeyBindings, HotkeyEvent, HotkeyState};
+    use super::{
+        action_from_event, commands_for_hotkey_event, event_from_action, HotkeyBindings,
+        HotkeyEvent, HotkeyState,
+    };
 
     #[test]
     fn chord_matching_is_case_and_modifier_order_insensitive() {
@@ -287,5 +287,13 @@ mod tests {
         );
 
         assert_eq!(commands, vec![CoreCommand::ToggleWindow]);
+    }
+
+    #[test]
+    fn hotkey_adapter_action_roundtrip_is_typed() {
+        let event = HotkeyEvent::Pressed("ctrl+shift+v".to_string());
+        let action = action_from_event(&event);
+
+        assert_eq!(event_from_action(action), event);
     }
 }

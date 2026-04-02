@@ -11,6 +11,8 @@ pub struct TestSnapshot {
     selected_input: Option<StableDeviceId>,
     meter_levels: BTreeMap<u8, (f32, f32)>,
     playing_pads: BTreeMap<u32, String>,
+    toggle_window_requested: bool,
+    shutdown_requested: bool,
 }
 
 impl TestSnapshot {
@@ -52,6 +54,14 @@ impl SnapshotView {
 
     pub fn playing_file(&self, pad_id: u32) -> Option<&str> {
         self.inner.playing_pads.get(&pad_id).map(String::as_str)
+    }
+
+    pub fn toggle_window_requested(&self) -> bool {
+        self.inner.toggle_window_requested
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.inner.shutdown_requested
     }
 }
 
@@ -112,6 +122,22 @@ impl RuntimeComposition {
     pub fn stop(&self, pad_id: u32) {
         let mut snapshot = self.snapshot.lock().expect("composition stop lock");
         snapshot.playing_pads.remove(&pad_id);
+    }
+
+    pub fn request_toggle_window(&self) {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .expect("composition request toggle window lock");
+        snapshot.toggle_window_requested = true;
+    }
+
+    pub fn request_shutdown(&self) {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .expect("composition request shutdown lock");
+        snapshot.shutdown_requested = true;
     }
 }
 

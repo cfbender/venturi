@@ -97,11 +97,24 @@ RUST_LOG=venturi=debug venturi
 
 ## Development
 
+Venturi is a Cargo workspace. The root `venturi` crate owns app integration tests, while focused runtime and adapter crates live under `crates/`.
+
 ```bash
 cargo check          # Type-check without building
 cargo test           # Run the test suite
 cargo run            # Build and launch
 cargo run -- --daemon
+```
+
+For lifecycle parity and typed adapter seams, run:
+
+```bash
+cargo test --test parity_tray_hotkeys
+cargo test --test tray_integration
+cargo test --test hotkey_resolution
+cargo test -p venturi-platform-adapter
+cargo test -p venturi-runtime
+cargo test --test startup_modes
 ```
 
 ## Architecture

@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use venturi_platform_adapter::{TrayAction, TrayController};
+use venturi_platform_adapter::{TrayAction, TrayCommand, TrayController};
 
 use crate::core::messages::CoreCommand;
 
@@ -23,11 +23,10 @@ impl TrayMenuAction {
     }
 }
 
-fn command_from_adapter_name(command: &str) -> Result<CoreCommand, String> {
+fn command_from_adapter(command: TrayCommand) -> CoreCommand {
     match command {
-        "toggle_window" => Ok(CoreCommand::ToggleWindow),
-        "shutdown" => Ok(CoreCommand::Shutdown),
-        unknown => Err(format!("unsupported tray command: {unknown}")),
+        TrayCommand::ToggleWindow => CoreCommand::typed_toggle_window(),
+        TrayCommand::Shutdown => CoreCommand::typed_shutdown(),
     }
 }
 
@@ -35,15 +34,17 @@ fn dispatch_tray_action(
     command_tx: &Sender<CoreCommand>,
     action: TrayMenuAction,
 ) -> Result<(), String> {
-    let mut command_name: Option<&'static str> = None;
+    let mut dispatched_command: Option<TrayCommand> = None;
     let mut controller = TrayController::new(|command| {
-        command_name = Some(command);
+        dispatched_command = Some(command);
     });
     controller.dispatch(action.to_action());
 
-    let command_name = command_name.ok_or_else(|| "tray action produced no command".to_string())?;
-    let command = command_from_adapter_name(command_name)?;
-    command_tx.send(command).map_err(|err| err.to_string())
+    let command =
+        dispatched_command.ok_or_else(|| "tray action produced no command".to_string())?;
+    command_tx
+        .send(command_from_adapter(command))
+        .map_err(|err| err.to_string())
 }
 
 #[derive(Clone)]
