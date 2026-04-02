@@ -1,6 +1,6 @@
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::watch;
@@ -133,7 +133,10 @@ async fn all_service_traits_support_trait_object_dispatch() {
     let services = InMemoryServices::new();
 
     let routing: &(dyn RoutingService + Send + Sync) = &services;
-    routing.set_volume(Channel::Main, 0.75).await.expect("route");
+    routing
+        .set_volume(Channel::Main, 0.75)
+        .await
+        .expect("route");
 
     let devices: &(dyn DeviceService + Send + Sync) = &services;
     let listed = devices.list_devices().await.expect("list devices");

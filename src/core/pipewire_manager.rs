@@ -1294,7 +1294,9 @@ impl CoreRuntimeState {
     }
 
     fn poll_selected_device_restore(&mut self, event_tx: &Sender<CoreEvent>, force_poll: bool) {
-        if !force_poll && self.last_device_selection_poll_at.elapsed() < DEVICE_SELECTION_POLL_INTERVAL {
+        if !force_poll
+            && self.last_device_selection_poll_at.elapsed() < DEVICE_SELECTION_POLL_INTERVAL
+        {
             return;
         }
         self.last_device_selection_poll_at = Instant::now();
@@ -1370,7 +1372,7 @@ impl CoreRuntimeState {
             keep_pipewire_backend_symbols_for_tests();
             let _ = device;
             self.output_loopback_module = Some("test-output-loopback-module".to_string());
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(test))]
@@ -1383,17 +1385,16 @@ impl CoreRuntimeState {
             let desired_output_owned =
                 resolve_output_loopback_target(device, default_sink.as_deref());
             let desired_output = desired_output_owned.as_deref();
-            self.output_loopback_module = reconcile_monitor_loopback_modules(
-                VENTURI_MAIN_MONITOR,
-                desired_output,
-            )
-            .map_err(|err| {
-                if let Some(target) = desired_output {
-                    format!("failed to route Venturi main mix to {target}: {err}")
-                } else {
-                    format!("failed to clear Venturi main mix loopbacks: {err}")
-                }
-            })?;
+            self.output_loopback_module =
+                reconcile_monitor_loopback_modules(VENTURI_MAIN_MONITOR, desired_output).map_err(
+                    |err| {
+                        if let Some(target) = desired_output {
+                            format!("failed to route Venturi main mix to {target}: {err}")
+                        } else {
+                            format!("failed to clear Venturi main mix loopbacks: {err}")
+                        }
+                    },
+                )?;
             Ok(())
         }
     }
@@ -1403,7 +1404,7 @@ impl CoreRuntimeState {
         {
             keep_pipewire_backend_symbols_for_tests();
             self.virtual_mic_module = Some("test-virtual-mic-module".to_string());
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(test))]
@@ -1467,7 +1468,11 @@ impl CoreRuntimeState {
         self.handle_set_input_device_internal(device, false)
     }
 
-    fn handle_set_input_device_internal(&mut self, device: &str, force: bool) -> Result<(), String> {
+    fn handle_set_input_device_internal(
+        &mut self,
+        device: &str,
+        force: bool,
+    ) -> Result<(), String> {
         let selection_changed = self.selected_input.as_deref() != Some(device);
         if !force && !selection_changed {
             return Ok(());
@@ -2152,8 +2157,8 @@ mod tests {
     use crate::core::router::RoutingMode;
 
     use super::{
-        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, LastSentVolume,
-        SoundboardPlaybackMode, apply_snapshot_volume_hint, apply_structural_monitor_delta,
+        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, LastSentVolume, SoundboardPlaybackMode,
+        apply_snapshot_volume_hint, apply_structural_monitor_delta,
         apply_volume_intents_to_snapshot, build_channel_level_targets,
         build_stream_name_level_targets, coalesce_commands, collect_drifted_intent_channels,
         compute_channel_level_updates_with, compute_level_sample_count, node_id_to_channel,
@@ -2633,34 +2638,42 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
             DeviceKind::Input,
             Some("alsa_input.usb-Unknown.mono-fallback"),
         ));
-        assert!(!selected_device_available(&devices, DeviceKind::Input, None));
+        assert!(!selected_device_available(
+            &devices,
+            DeviceKind::Input,
+            None
+        ));
     }
 
     #[test]
     fn emits_device_selection_changed_when_selected_devices_reappear() {
         let selected_output = "alsa_output.usb-Headset.analog-stereo";
         let selected_input = "alsa_input.usb-Headset.mono-fallback";
-        let mut state =
-            build_test_runtime_state(Some(selected_output), Some(selected_input));
+        let mut state = build_test_runtime_state(Some(selected_output), Some(selected_input));
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
-        state.handle_monitor_event(PwMonitorEvent::InitialSnapshot(Snapshot::default()), &event_tx);
+        state.handle_monitor_event(
+            PwMonitorEvent::InitialSnapshot(Snapshot::default()),
+            &event_tx,
+        );
         assert!(state.output_restore_pending);
         assert!(state.input_restore_pending);
 
-        let mut restored_snapshot = Snapshot::default();
-        restored_snapshot.devices = vec![
-            DeviceEntry {
-                kind: DeviceKind::Output,
-                id: selected_output.to_string(),
-                label: "Headset Output".to_string(),
-            },
-            DeviceEntry {
-                kind: DeviceKind::Input,
-                id: selected_input.to_string(),
-                label: "Headset Input".to_string(),
-            },
-        ];
+        let restored_snapshot = Snapshot {
+            devices: vec![
+                DeviceEntry {
+                    kind: DeviceKind::Output,
+                    id: selected_output.to_string(),
+                    label: "Headset Output".to_string(),
+                },
+                DeviceEntry {
+                    kind: DeviceKind::Input,
+                    id: selected_input.to_string(),
+                    label: "Headset Input".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
 
         state.handle_monitor_event(
             PwMonitorEvent::InitialSnapshot(restored_snapshot),
@@ -2680,7 +2693,10 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
 
         assert_eq!(
             selection_event,
-            Some((Some(selected_output.to_string()), Some(selected_input.to_string())))
+            Some((
+                Some(selected_output.to_string()),
+                Some(selected_input.to_string())
+            ))
         );
     }
 

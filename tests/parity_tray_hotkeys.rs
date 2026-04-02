@@ -1,7 +1,7 @@
 use crossbeam_channel::unbounded;
-use venturi::core::hotkeys::{commands_for_hotkey_event, HotkeyBindings, HotkeyEvent, HotkeyState};
+use venturi::core::hotkeys::{HotkeyBindings, HotkeyEvent, HotkeyState, commands_for_hotkey_event};
 use venturi::core::messages::CoreCommand;
-use venturi::tray::{create_tray, TrayMenuAction};
+use venturi::tray::{TrayMenuAction, create_tray};
 use venturi_runtime::test_harness;
 
 #[test]

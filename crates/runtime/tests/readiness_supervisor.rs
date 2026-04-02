@@ -25,7 +25,10 @@ async fn wait_ready_unblocks_after_mark_ready() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     barrier.mark_ready();
 
-    timeout(Duration::from_secs(1), waiter).await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

@@ -191,13 +191,10 @@ impl MixerTab {
     }
 
     pub fn apply_runtime_event(&mut self, event: &AppEvent) {
-        match event {
-            AppEvent::MeterUpdated(snapshot) => {
-                let channel: Channel = snapshot.channel.into();
-                self.levels.insert(channel, (snapshot.level, snapshot.peak));
-                self.ui_dirty.store(true, Ordering::Relaxed);
-            }
-            _ => {}
+        if let AppEvent::MeterUpdated(snapshot) = event {
+            let channel: Channel = snapshot.channel.into();
+            self.levels.insert(channel, (snapshot.level, snapshot.peak));
+            self.ui_dirty.store(true, Ordering::Relaxed);
         }
     }
 

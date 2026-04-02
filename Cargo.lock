@@ -506,6 +506,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-sink"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893"
+
+[[package]]
 name = "futures-task"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1693,6 +1699,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "toml"
 version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1907,6 +1926,54 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "venturi-app-gtk",
+ "venturi-application",
+ "venturi-domain",
+ "venturi-platform-adapter",
+ "venturi-runtime",
+]
+
+[[package]]
+name = "venturi-app-gtk"
+version = "0.1.0"
+dependencies = [
+ "venturi-runtime",
+]
+
+[[package]]
+name = "venturi-application"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "venturi-domain",
+]
+
+[[package]]
+name = "venturi-domain"
+version = "0.1.0"
+
+[[package]]
+name = "venturi-pipewire-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "venturi-application",
+]
+
+[[package]]
+name = "venturi-platform-adapter"
+version = "0.1.0"
+
+[[package]]
+name = "venturi-runtime"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "venturi-application",
 ]
 
 [[package]]

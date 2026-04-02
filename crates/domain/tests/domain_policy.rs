@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use venturi_domain::{
-    channel_node_name, collision_safe_name, decay_peak, Channel, DeviceKind, RoutePlan,
-    StableDeviceId,
+    Channel, DeviceKind, RoutePlan, StableDeviceId, channel_node_name, collision_safe_name,
+    decay_peak,
 };
 
 #[test]

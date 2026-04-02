@@ -242,8 +242,8 @@ mod tests {
     use crate::core::messages::{Channel, CoreCommand};
 
     use super::{
-        action_from_event, commands_for_hotkey_event, event_from_action, HotkeyBindings,
-        HotkeyEvent, HotkeyState,
+        HotkeyBindings, HotkeyEvent, HotkeyState, action_from_event, commands_for_hotkey_event,
+        event_from_action,
     };
 
     #[test]
