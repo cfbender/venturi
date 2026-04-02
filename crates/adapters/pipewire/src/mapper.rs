@@ -10,22 +10,23 @@ pub struct NodeFingerprint {
 pub struct StableIdMapper {
     next_id: u64,
     stable_by_fingerprint: HashMap<NodeFingerprint, String>,
-    stable_by_pw_id: HashMap<u32, String>,
 }
 
 impl StableIdMapper {
-    pub fn upsert(&mut self, pw_id: u32, fingerprint: NodeFingerprint) -> String {
-        let stable_id = self
-            .stable_by_fingerprint
+    /// Inserts or updates a PipeWire node fingerprint and returns its stable ID.
+    ///
+    /// Stable IDs are keyed by fingerprint identity (`app_name` + `object_path`).
+    /// A fingerprint always maps to the same stable ID, even if its PipeWire
+    /// runtime ID changes. Reusing a runtime ID for a different fingerprint
+    /// produces that fingerprint's stable ID.
+    pub fn upsert(&mut self, _pw_id: u32, fingerprint: NodeFingerprint) -> String {
+        self.stable_by_fingerprint
             .entry(fingerprint)
             .or_insert_with(|| {
                 let id = format!("node-{}", self.next_id);
                 self.next_id += 1;
                 id
             })
-            .clone();
-
-        self.stable_by_pw_id.insert(pw_id, stable_id.clone());
-        stable_id
+            .clone()
     }
 }
