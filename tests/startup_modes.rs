@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use venturi::app::{AppBootstrap, AppRunner, GuiLauncher, should_create_tray};
@@ -30,9 +31,19 @@ fn daemon_mode_does_not_launch_gui() {
 
     let runner = AppRunner::new(gui);
     let bootstrap = AppBootstrap::new();
-    runner.run(true, bootstrap).expect("daemon run");
+    let command_tx = bootstrap.command_tx.clone();
+
+    let handle = std::thread::spawn(move || runner.run(true, bootstrap));
+
+    std::thread::sleep(Duration::from_millis(150));
 
     assert_eq!(launches.load(Ordering::Relaxed), 0);
+
+    command_tx
+        .send(CoreCommand::Shutdown)
+        .expect("send shutdown command");
+    let result = handle.join().expect("daemon thread should not panic");
+    result.expect("daemon run");
 }
 
 #[test]
@@ -56,14 +67,45 @@ fn daemon_mode_reaches_ready_and_roundtrip() {
     let runner = AppRunner::new(gui);
 
     let bootstrap = AppBootstrap::new();
-    runner
-        .run(true, bootstrap)
-        .expect("daemon mode should get ready and ping/pong");
+    let command_tx = bootstrap.command_tx.clone();
+
+    let handle = std::thread::spawn(move || runner.run(true, bootstrap));
+
+    std::thread::sleep(Duration::from_millis(150));
+    command_tx
+        .send(CoreCommand::Shutdown)
+        .expect("send shutdown command");
+
+    let result = handle.join().expect("daemon thread should not panic");
+    result.expect("daemon mode should get ready and ping/pong");
+}
+
+#[test]
+fn daemon_mode_stays_alive_until_shutdown_command() {
+    let launches = Arc::new(AtomicUsize::new(0));
+    let gui = CountingGui { launches };
+    let runner = AppRunner::new(gui);
+
+    let bootstrap = AppBootstrap::new();
+    let command_tx = bootstrap.command_tx.clone();
+
+    let handle = std::thread::spawn(move || runner.run(true, bootstrap));
+
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !handle.is_finished(),
+        "daemon mode should remain running until explicitly shut down"
+    );
+
+    command_tx
+        .send(CoreCommand::Shutdown)
+        .expect("send shutdown command");
+    let result = handle.join().expect("daemon thread should not panic");
+    result.expect("daemon mode should exit cleanly after shutdown command");
 }
 
 #[test]
 fn tray_creation_gate_respects_daemon_and_config_flag() {
-    assert!(!should_create_tray(true, true));
-    assert!(!should_create_tray(false, false));
-    assert!(should_create_tray(false, true));
+    assert!(!should_create_tray(false));
+    assert!(should_create_tray(true));
 }

@@ -88,24 +88,42 @@ impl<G: GuiLauncher> AppRunner<G> {
             "core did not answer ping",
         )?;
 
-        if !daemon {
-            let paths = Paths::resolve();
-            let config = load_config(&paths);
-            let _tray = if should_create_tray(daemon, config.general.show_tray_icon) {
-                create_tray(bootstrap.command_tx.clone())
-            } else {
-                None
-            };
+        let paths = Paths::resolve();
+        let config = load_config(&paths);
+        let _tray = if should_create_tray(config.general.show_tray_icon) {
+            create_tray(bootstrap.command_tx.clone())
+        } else {
+            None
+        };
+
+        if daemon {
+            wait_for_shutdown(&bootstrap.event_rx)?;
+        } else {
             self.gui_launcher
                 .launch(bootstrap.command_tx.clone(), bootstrap.event_rx.clone())?;
+
+            bootstrap
+                .command_tx
+                .send(CoreCommand::Shutdown)
+                .map_err(|e| e.to_string())?;
         }
 
-        bootstrap
-            .command_tx
-            .send(CoreCommand::Shutdown)
-            .map_err(|e| e.to_string())?;
         let _ = manager.join();
         Ok(())
+    }
+}
+
+fn wait_for_shutdown(event_rx: &Receiver<CoreEvent>) -> Result<(), String> {
+    loop {
+        match event_rx.recv() {
+            Ok(CoreEvent::ShutdownRequested) => return Ok(()),
+            Ok(_) => continue,
+            Err(err) => {
+                return Err(format!(
+                    "core event channel closed before shutdown request: {err}"
+                ));
+            }
+        }
     }
 }
 
@@ -133,6 +151,6 @@ pub fn pump_event(window: &mut MainWindow, event: CoreEvent) {
     window.apply_core_event(&event);
 }
 
-pub fn should_create_tray(daemon: bool, show_tray_icon: bool) -> bool {
-    !daemon && show_tray_icon
+pub fn should_create_tray(show_tray_icon: bool) -> bool {
+    show_tray_icon
 }

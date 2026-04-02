@@ -255,7 +255,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use tempfile::tempdir;
 
-    use super::{resolve_installed_tray_icon, VenturiTray, TRAY_ICON_NAME};
+    use super::{TRAY_ICON_NAME, VenturiTray, resolve_installed_tray_icon};
 
     #[test]
     fn tray_reports_venturi_icon_name() {
