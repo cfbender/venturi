@@ -1,6 +1,9 @@
-use crate::{AppError, Channel};
+use async_trait::async_trait;
 
-pub trait SessionService {
-    fn active_channel(&self) -> Result<Channel, AppError>;
-    fn set_active_channel(&self, channel: Channel) -> Result<(), AppError>;
+use crate::AppError;
+
+#[async_trait]
+pub trait SessionService: Send + Sync {
+    async fn save(&self) -> Result<(), AppError>;
+    async fn restore(&self) -> Result<(), AppError>;
 }
