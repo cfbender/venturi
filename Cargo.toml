@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/domain", "crates/application"]
+members = ["crates/domain", "crates/application", "crates/runtime"]
 
 [package]
 name = "venturi"
