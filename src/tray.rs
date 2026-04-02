@@ -6,11 +6,6 @@ use crate::core::messages::CoreCommand;
 const TRAY_ICON_NAME: &str = "org.venturi.Venturi";
 #[cfg(target_os = "linux")]
 const TRAY_ICON_RELATIVE_PATH: &str = "hicolor/scalable/apps/org.venturi.Venturi.svg";
-#[cfg(target_os = "linux")]
-const TRAY_SYMBOLIC_ICON_NAME: &str = "org.venturi.Venturi-symbolic";
-#[cfg(target_os = "linux")]
-const TRAY_SYMBOLIC_ICON_RELATIVE_PATH: &str =
-    "hicolor/scalable/apps/org.venturi.Venturi-symbolic.svg";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayMenuAction {
@@ -92,10 +87,7 @@ struct TrayIconSelection {
 }
 
 #[cfg(target_os = "linux")]
-const TRAY_ICON_CANDIDATES: [(&str, &str); 2] = [
-    (TRAY_SYMBOLIC_ICON_NAME, TRAY_SYMBOLIC_ICON_RELATIVE_PATH),
-    (TRAY_ICON_NAME, TRAY_ICON_RELATIVE_PATH),
-];
+const TRAY_ICON_CANDIDATES: [(&str, &str); 1] = [(TRAY_ICON_NAME, TRAY_ICON_RELATIVE_PATH)];
 
 #[cfg(target_os = "linux")]
 fn icon_theme_roots() -> Vec<String> {
@@ -263,9 +255,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use tempfile::tempdir;
 
-    use super::{
-        TRAY_ICON_NAME, TRAY_SYMBOLIC_ICON_NAME, VenturiTray, resolve_installed_tray_icon,
-    };
+    use super::{resolve_installed_tray_icon, VenturiTray, TRAY_ICON_NAME};
 
     #[test]
     fn tray_reports_venturi_icon_name() {
@@ -273,10 +263,7 @@ mod tests {
         let tray = VenturiTray { command_tx: tx };
 
         let icon_name = <VenturiTray as ksni::Tray>::icon_name(&tray);
-        assert!(
-            icon_name == TRAY_ICON_NAME || icon_name == TRAY_SYMBOLIC_ICON_NAME,
-            "unexpected tray icon name: {icon_name}"
-        );
+        assert_eq!(icon_name, TRAY_ICON_NAME);
     }
 
     #[test]
@@ -299,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_symbolic_icon_when_available() {
+    fn prefers_regular_icon_when_symbolic_also_available() {
         let temp = tempdir().expect("tempdir");
         let apps_dir = temp.path().join("hicolor/scalable/apps");
         fs::create_dir_all(&apps_dir).expect("create apps dir");
@@ -307,12 +294,12 @@ mod tests {
         let base_icon_path = apps_dir.join(format!("{TRAY_ICON_NAME}.svg"));
         fs::write(&base_icon_path, "<svg/>").expect("write base icon");
 
-        let symbolic_icon_path = apps_dir.join(format!("{TRAY_SYMBOLIC_ICON_NAME}.svg"));
+        let symbolic_icon_path = apps_dir.join("org.venturi.Venturi-symbolic.svg");
         fs::write(&symbolic_icon_path, "<svg/>").expect("write symbolic icon");
 
         let selection = resolve_installed_tray_icon([temp.path().display().to_string()])
             .expect("icon selection should resolve");
 
-        assert_eq!(selection.icon_name, TRAY_SYMBOLIC_ICON_NAME);
+        assert_eq!(selection.icon_name, TRAY_ICON_NAME);
     }
 }

@@ -55,7 +55,6 @@ jobs:
           cp data/venturi.desktop dist/
           cp data/org.venturi.Venturi.metainfo.xml dist/
           cp data/org.venturi.Venturi.svg dist/
-          cp data/org.venturi.Venturi-symbolic.svg dist/
           tar -czf venturi-${{ matrix.target }}.tar.gz -C dist .
 
       - name: Upload binary

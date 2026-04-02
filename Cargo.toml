@@ -1,6 +1,6 @@
 [package]
 name = "venturi"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
@@ -42,11 +42,6 @@ assets = [
   ],
   [
     "data/org.venturi.Venturi.svg",
-    "usr/share/icons/hicolor/scalable/apps/",
-    "644",
-  ],
-  [
-    "data/org.venturi.Venturi-symbolic.svg",
     "usr/share/icons/hicolor/scalable/apps/",
     "644",
   ],
