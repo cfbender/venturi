@@ -613,7 +613,12 @@ pub fn build_mixer_widget(
                 ] {
                     let (left, right) =
                         levels_snapshot.get(&channel).copied().unwrap_or((0.0, 0.0));
-                    let current = meter_display_level(left.max(right));
+                    let max_fraction = state
+                        .strips
+                        .get(&channel)
+                        .map(|strip| strip.volume_linear)
+                        .unwrap_or(1.0);
+                    let current = meter_display_fraction(left.max(right), max_fraction);
                     let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
                     let next = decay_peak(previous, current, elapsed_ms);
                     if let Some(widget) = meter_widgets.get(&channel) {
@@ -755,6 +760,10 @@ fn meter_display_level(linear_peak: f32) -> f32 {
     linear_peak.clamp(0.0, 1.0).sqrt()
 }
 
+fn meter_display_fraction(linear_peak: f32, max_fraction: f32) -> f32 {
+    meter_display_level(linear_peak).min(max_fraction.clamp(0.0, 1.0))
+}
+
 fn meter_should_be_visible(level: f32) -> bool {
     level > 0.01
 }
@@ -794,8 +803,8 @@ fn should_apply_device_selection_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceListModel, MixerTab, compute_slider_sync_update, meter_display_level,
-        meter_should_be_visible, should_apply_device_selection_change,
+        DeviceListModel, MixerTab, compute_slider_sync_update, meter_display_fraction,
+        meter_display_level, meter_should_be_visible, should_apply_device_selection_change,
     };
     use crate::core::messages::{Channel, CoreEvent, DeviceEntry, DeviceKind};
     use crate::gui::channel_strip::ChannelStrip;
@@ -840,6 +849,13 @@ mod tests {
         assert!((meter_display_level(0.01) - 0.1).abs() < 0.0001);
         assert!((meter_display_level(0.25) - 0.5).abs() < 0.0001);
         assert_eq!(meter_display_level(1.5), 1.0);
+    }
+
+    #[test]
+    fn meter_display_fraction_is_capped_by_channel_volume_fraction() {
+        assert_eq!(meter_display_fraction(1.0, 0.52), 0.52);
+        assert_eq!(meter_display_fraction(0.25, 1.0), 0.5);
+        assert_eq!(meter_display_fraction(0.25, 0.4), 0.4);
     }
 
     #[test]

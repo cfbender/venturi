@@ -184,8 +184,9 @@ pub fn build_strip_widget_with_meter(
     let slider_overlay = gtk::Overlay::new();
     slider_overlay.set_hexpand(true);
     slider_overlay.set_vexpand(true);
-    slider_overlay.set_child(Some(&slider));
-    slider_overlay.add_overlay(&meter);
+    slider_overlay.set_child(Some(&meter));
+    slider_overlay.add_overlay(&slider);
+    slider_overlay.set_measure_overlay(&slider, true);
 
     root.append(&header);
     root.append(&slider_overlay);

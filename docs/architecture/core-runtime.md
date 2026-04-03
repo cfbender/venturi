@@ -128,7 +128,8 @@ Primary verification entry point: `cargo test --test parity_tray_hotkeys`.
 
 ### App channels (`Game`, `Media`, `Chat`, `Aux`)
 
-- Control target: per-stream node IDs (`stream.id`)
+- Control target: Venturi channel mix sinks (`Venturi-Game`, `Venturi-Media`, `Venturi-Chat`, `Venturi-Aux`)
+- Category slider semantics: controls each channel bus contribution into `Venturi-Output` (app-local source volume remains app/OS controlled)
 - Classification source: `classify_with_priority(overrides, binary, app_name, media_role)`
 
 ## Failure Handling

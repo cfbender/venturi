@@ -23,8 +23,8 @@ use crate::core::pipewire_channel_control::{
 use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump};
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{
-    FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands, build_metadata_target_args,
-    routing_mode_from_flag,
+    FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands,
+    build_metadata_legacy_target_args, build_metadata_target_args, routing_mode_from_flag,
 };
 
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -42,6 +42,7 @@ const MAX_STREAM_PROBES_PER_CHANNEL: usize = 1;
 const ECHO_SUPPRESSION_WINDOW: Duration = Duration::from_millis(200);
 const ECHO_SUPPRESSION_VOLUME_EPSILON: f32 = 0.01;
 const INTENT_REAPPLY_VOLUME_EPSILON: f32 = 0.01;
+const EXTERNAL_INTENT_ADOPTION_WINDOW: Duration = Duration::from_millis(750);
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const DEVICE_SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -50,19 +51,18 @@ const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
 const METER_WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const METER_OVERRIDE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const METER_SAMPLE_INTERVAL: Duration = Duration::from_millis(66);
-const VIRTUAL_SINKS: [&str; 1] = ["Venturi-Output"];
-const VIRTUAL_SOURCES: [&str; 1] = ["Venturi-VirtualMic"];
-const VENTURI_VIRTUAL_MIC_INPUT_TARGET: &str = "input.Venturi-VirtualMic";
-const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
-const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
-const LEGACY_VENTURI_SINKS: [&str; 6] = [
+const VIRTUAL_SINKS: [&str; 5] = [
+    "Venturi-Output",
     "Venturi-Game",
     "Venturi-Media",
     "Venturi-Chat",
     "Venturi-Aux",
-    "Venturi-Mic",
-    "Venturi-Sound",
 ];
+const VIRTUAL_SOURCES: [&str; 1] = ["Venturi-VirtualMic"];
+const VENTURI_VIRTUAL_MIC_INPUT_TARGET: &str = "input.Venturi-VirtualMic";
+const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
+const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
+const LEGACY_VENTURI_SINKS: [&str; 2] = ["Venturi-Mic", "Venturi-Sound"];
 const PW_SETTINGS_METADATA_NAME: &str = "settings";
 const VENTURI_CHANNEL_GAME_VOLUME_KEY: &str = "venturi.channel.game.volume";
 const VENTURI_CHANNEL_MEDIA_VOLUME_KEY: &str = "venturi.channel.media.volume";
@@ -201,6 +201,19 @@ fn should_suppress_channel_volume_echo(
         ECHO_SUPPRESSION_WINDOW,
         ECHO_SUPPRESSION_VOLUME_EPSILON,
     )
+}
+
+fn volume_drift_exceeds_intent_epsilon(observed_volume: f32, intent_volume: f32) -> bool {
+    (observed_volume - intent_volume).abs() >= INTENT_REAPPLY_VOLUME_EPSILON
+}
+
+fn should_adopt_external_channel_drift(
+    last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
+    channel: Channel,
+) -> bool {
+    last_volume_sent
+        .get(&channel)
+        .is_none_or(|last_sent| last_sent.sent_at.elapsed() >= EXTERNAL_INTENT_ADOPTION_WINDOW)
 }
 
 fn persisted_channel_volume(state: &crate::config::schema::State, channel: Channel) -> f32 {
@@ -344,7 +357,7 @@ fn persist_channel_volume_intent(channel: Channel, volume: f32) -> Result<(), St
 fn node_id_to_channel(
     id: u32,
     snapshot: &Snapshot,
-    overrides: &BTreeMap<String, Channel>,
+    _overrides: &BTreeMap<String, Channel>,
 ) -> Option<Channel> {
     // Only map Venturi main sink ID to Main.
     if snapshot.output_ids.get(VENTURI_MAIN_OUTPUT).copied() == Some(id) {
@@ -354,15 +367,13 @@ fn node_id_to_channel(
     if snapshot.input_ids.get(VIRTUAL_SOURCES[0]).copied() == Some(id) {
         return Some(Channel::Mic);
     }
-    // Check streams → classify via categorizer
-    if let Some(stream) = snapshot.streams.get(&id) {
-        return Some(classify_with_priority(
-            overrides,
-            Some(&stream.app_key),
-            Some(&stream.display_name),
-            stream.media_role.as_deref(),
-        ));
+
+    for channel in [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux] {
+        if category_mix_output_id(snapshot, channel) == Some(id) {
+            return Some(channel);
+        }
     }
+
     None
 }
 
@@ -564,7 +575,7 @@ fn snapshot_channel_volumes(
 
 fn channel_volume_from_snapshot(
     snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
+    _overrides: &BTreeMap<String, crate::core::messages::Channel>,
     channel: Channel,
 ) -> Option<f32> {
     match channel {
@@ -577,35 +588,30 @@ fn channel_volume_from_snapshot(
             .get(VIRTUAL_SOURCES[0])
             .and_then(|mic_id| snapshot.volumes.get(mic_id).copied()),
         Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            let mut max_volume: Option<f32> = None;
-
-            for (stream_id, stream) in &snapshot.streams {
-                let Some(volume) = snapshot.volumes.get(stream_id).copied() else {
-                    continue;
-                };
-
-                let classified = classify_with_priority(
-                    overrides,
-                    Some(&stream.app_key),
-                    Some(&stream.display_name),
-                    stream.media_role.as_deref(),
-                );
-
-                if classified != channel {
-                    continue;
-                }
-
-                max_volume = Some(max_volume.map_or(volume, |prev| prev.max(volume)));
-            }
-
-            max_volume
+            category_mix_output_id(snapshot, channel)
+                .and_then(|mix_id| snapshot.volumes.get(&mix_id).copied())
         }
     }
 }
 
+fn category_mix_output_node_name(channel: Channel) -> Option<&'static str> {
+    match channel {
+        Channel::Game => Some("Venturi-Game"),
+        Channel::Media => Some("Venturi-Media"),
+        Channel::Chat => Some("Venturi-Chat"),
+        Channel::Aux => Some("Venturi-Aux"),
+        Channel::Main | Channel::Mic => None,
+    }
+}
+
+fn category_mix_output_id(snapshot: &Snapshot, channel: Channel) -> Option<u32> {
+    let node_name = category_mix_output_node_name(channel)?;
+    snapshot.output_ids.get(node_name).copied()
+}
+
 fn apply_snapshot_volume_hint(
     snapshot: &mut Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
+    _overrides: &BTreeMap<String, crate::core::messages::Channel>,
     channel: Channel,
     volume: f32,
 ) {
@@ -621,16 +627,8 @@ fn apply_snapshot_volume_hint(
             }
         }
         Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            for (stream_id, stream) in &snapshot.streams {
-                let classified = classify_with_priority(
-                    overrides,
-                    Some(&stream.app_key),
-                    Some(&stream.display_name),
-                    stream.media_role.as_deref(),
-                );
-                if classified == channel {
-                    snapshot.volumes.insert(*stream_id, volume);
-                }
+            if let Some(mix_id) = category_mix_output_id(snapshot, channel) {
+                snapshot.volumes.insert(mix_id, volume);
             }
         }
     }
@@ -644,6 +642,91 @@ fn apply_volume_intents_to_snapshot(
     for (&channel, &volume) in intents {
         apply_snapshot_volume_hint(snapshot, overrides, channel, volume);
     }
+}
+
+fn collect_new_stream_route_targets(
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, Channel>,
+    stream_ids_before: &BTreeSet<u32>,
+) -> Vec<(u32, Channel)> {
+    snapshot
+        .streams
+        .iter()
+        .filter(|(stream_id, _)| !stream_ids_before.contains(stream_id))
+        .map(|(stream_id, stream)| {
+            let channel = classify_with_priority(
+                overrides,
+                Some(&stream.app_key),
+                Some(&stream.display_name),
+                stream.media_role.as_deref(),
+            );
+            (*stream_id, channel)
+        })
+        .collect()
+}
+
+fn collect_category_stream_route_targets(
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, Channel>,
+) -> Vec<(u32, Channel)> {
+    snapshot
+        .streams
+        .iter()
+        .filter_map(|(stream_id, stream)| {
+            let channel = classify_with_priority(
+                overrides,
+                Some(&stream.app_key),
+                Some(&stream.display_name),
+                stream.media_role.as_deref(),
+            );
+
+            if matches!(
+                channel,
+                Channel::Game | Channel::Media | Channel::Chat | Channel::Aux
+            ) {
+                Some((*stream_id, channel))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn category_mix_sink_ids_changed(
+    output_ids_before: &BTreeMap<String, u32>,
+    snapshot: &Snapshot,
+) -> bool {
+    [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux]
+        .iter()
+        .any(|channel| {
+            let Some(node_name) = category_mix_output_node_name(*channel) else {
+                return false;
+            };
+            output_ids_before.get(node_name) != snapshot.output_ids.get(node_name)
+        })
+}
+
+fn collect_stream_route_targets_for_reconcile(
+    snapshot: &Snapshot,
+    overrides: &BTreeMap<String, Channel>,
+    stream_ids_before: &BTreeSet<u32>,
+    output_ids_before: &BTreeMap<String, u32>,
+) -> Vec<(u32, Channel)> {
+    let mut targets_by_stream = BTreeMap::new();
+
+    for (stream_id, channel) in
+        collect_new_stream_route_targets(snapshot, overrides, stream_ids_before)
+    {
+        targets_by_stream.insert(stream_id, channel);
+    }
+
+    if category_mix_sink_ids_changed(output_ids_before, snapshot) {
+        for (stream_id, channel) in collect_category_stream_route_targets(snapshot, overrides) {
+            targets_by_stream.insert(stream_id, channel);
+        }
+    }
+
+    targets_by_stream.into_iter().collect()
 }
 
 fn collect_drifted_intent_channels(
@@ -660,7 +743,7 @@ fn collect_drifted_intent_channels(
             continue;
         };
 
-        let drifted = (observed_volume - intent_volume).abs() >= INTENT_REAPPLY_VOLUME_EPSILON;
+        let drifted = volume_drift_exceeds_intent_epsilon(observed_volume, intent_volume);
         let suppressed =
             should_suppress_channel_volume_echo(last_volume_sent, channel, observed_volume);
 
@@ -693,7 +776,7 @@ fn should_emit_observed_channel_volume(
         return true;
     };
 
-    (current_channel_volume - intent_volume).abs() < INTENT_REAPPLY_VOLUME_EPSILON
+    !volume_drift_exceeds_intent_epsilon(current_channel_volume, intent_volume)
 }
 
 fn emit_snapshot_channel_volumes(
@@ -1069,10 +1152,28 @@ impl CoreRuntimeState {
                 .map_err(|err| format!("failed to persist categorizer override: {err}"))?;
         }
 
+        self.route_stream_to_channel(stream_id, channel)
+    }
+
+    fn route_stream_to_channel(
+        &mut self,
+        stream_id: u32,
+        channel: crate::core::messages::Channel,
+    ) -> Result<(), String> {
         let route_result = match self.routing_mode {
             RoutingMode::MetadataFirst => {
-                let args = build_metadata_target_args(stream_id, channel);
-                run_pw_metadata(&args)
+                let target_args = build_metadata_target_args(stream_id, channel);
+                let legacy_target_args = build_metadata_legacy_target_args(stream_id, channel);
+
+                let target_result = run_pw_metadata(&target_args);
+                let legacy_result = run_pw_metadata(&legacy_target_args);
+
+                match (target_result, legacy_result) {
+                    (Ok(()), _) | (_, Ok(())) => Ok(()),
+                    (Err(target_err), Err(legacy_err)) => Err(format!(
+                        "failed to set stream route metadata (target.object: {target_err}; target.node: {legacy_err})"
+                    )),
+                }
             }
             RoutingMode::FallbackLinks => {
                 let mut result = Ok(());
@@ -1096,6 +1197,26 @@ impl CoreRuntimeState {
         }
 
         Ok(())
+    }
+
+    fn route_stream_targets_for_reconcile(
+        &mut self,
+        stream_ids_before: &BTreeSet<u32>,
+        output_ids_before: &BTreeMap<String, u32>,
+        event_tx: &Sender<CoreEvent>,
+    ) {
+        for (stream_id, channel) in collect_stream_route_targets_for_reconcile(
+            &self.last_snapshot,
+            &self.overrides,
+            stream_ids_before,
+            output_ids_before,
+        ) {
+            if let Err(err) = self.route_stream_to_channel(stream_id, channel) {
+                let _ = event_tx.send(CoreEvent::Error(format!(
+                    "failed to auto-route stream {stream_id} to {channel:?}: {err}"
+                )));
+            }
+        }
     }
 
     fn apply_persisted_channel_mix(&mut self, channel: Channel) {
@@ -1199,6 +1320,27 @@ impl CoreRuntimeState {
                 channel
             )));
         }
+    }
+
+    fn adopt_external_channel_volume_intent_if_drifted(
+        &mut self,
+        channel: Channel,
+        observed_volume: f32,
+        event_tx: &Sender<CoreEvent>,
+    ) {
+        let Some(intent_volume) = self.channel_volume_intents.get(&channel).copied() else {
+            return;
+        };
+
+        if !volume_drift_exceeds_intent_epsilon(observed_volume, intent_volume) {
+            return;
+        }
+
+        if !should_adopt_external_channel_drift(&self.last_volume_sent, channel) {
+            return;
+        }
+
+        self.update_channel_volume_intent(channel, observed_volume, event_tx);
     }
 
     fn apply_channel_volume_intents_for_channels(
@@ -1523,6 +1665,9 @@ impl CoreRuntimeState {
     ) {
         match event {
             PwMonitorEvent::InitialSnapshot(snapshot) => {
+                let stream_ids_before: BTreeSet<u32> =
+                    self.last_snapshot.streams.keys().copied().collect();
+                let output_ids_before = self.last_snapshot.output_ids.clone();
                 // Diff devices
                 if snapshot.devices != self.last_snapshot.devices {
                     let _ = event_tx.send(CoreEvent::DevicesChanged(snapshot.devices.clone()));
@@ -1556,6 +1701,11 @@ impl CoreRuntimeState {
                 self.restart_pending_until = None;
 
                 self.last_snapshot = snapshot;
+                self.route_stream_targets_for_reconcile(
+                    &stream_ids_before,
+                    &output_ids_before,
+                    event_tx,
+                );
                 apply_volume_intents_to_snapshot(
                     &mut self.last_snapshot,
                     &self.overrides,
@@ -1616,6 +1766,7 @@ impl CoreRuntimeState {
         let mut removed_ids = Vec::new();
         let mut structural_ids = Vec::new();
         let stream_ids_before: BTreeSet<u32> = self.last_snapshot.streams.keys().copied().collect();
+        let output_ids_before = self.last_snapshot.output_ids.clone();
 
         for obj in objects {
             let Some(id) = obj.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else {
@@ -1660,6 +1811,12 @@ impl CoreRuntimeState {
                         )
                         .unwrap_or(new_vol);
 
+                        self.adopt_external_channel_volume_intent_if_drifted(
+                            channel,
+                            channel_volume,
+                            event_tx,
+                        );
+
                         if should_emit_observed_channel_volume(
                             channel,
                             channel_volume,
@@ -1694,6 +1851,8 @@ impl CoreRuntimeState {
         } else {
             prune_removed_node_ids(&mut self.last_snapshot, &removed_ids, event_tx);
         }
+
+        self.route_stream_targets_for_reconcile(&stream_ids_before, &output_ids_before, event_tx);
 
         let mut channels = self.collect_new_stream_intent_channels(&stream_ids_before);
         channels.extend(collect_drifted_intent_channels(
@@ -2145,13 +2304,15 @@ mod tests {
     use crate::core::router::RoutingMode;
 
     use super::{
-        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, LastSentVolume, SoundboardPlaybackMode,
-        apply_snapshot_volume_hint, apply_structural_monitor_delta,
-        apply_volume_intents_to_snapshot, build_channel_level_targets,
-        build_stream_name_level_targets, coalesce_commands, collect_drifted_intent_channels,
-        compute_channel_level_updates_with, compute_level_sample_count, node_id_to_channel,
-        parse_channel_volume_intents, persisted_channel_mute, persisted_channel_volume,
-        resolve_output_loopback_target, selected_device_available,
+        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, EXTERNAL_INTENT_ADOPTION_WINDOW,
+        LastSentVolume, SoundboardPlaybackMode, apply_snapshot_volume_hint,
+        apply_structural_monitor_delta, apply_volume_intents_to_snapshot,
+        build_channel_level_targets, build_stream_name_level_targets, coalesce_commands,
+        collect_drifted_intent_channels, collect_new_stream_route_targets,
+        collect_stream_route_targets_for_reconcile, compute_channel_level_updates_with,
+        compute_level_sample_count, node_id_to_channel, parse_channel_volume_intents,
+        persisted_channel_mute, persisted_channel_volume, resolve_output_loopback_target,
+        selected_device_available, should_adopt_external_channel_drift,
         should_emit_observed_channel_volume, should_skip_output_device_reconcile,
         should_suppress_recent_echo, snapshot_channel_volumes, soundboard_playback_targets,
     };
@@ -2278,10 +2439,12 @@ mod tests {
         snapshot
             .output_ids
             .insert("Venturi-Output".to_string(), 128);
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 555);
         snapshot
             .input_ids
             .insert("Venturi-VirtualMic".to_string(), 281);
         snapshot.volumes.insert(128, 0.41);
+        snapshot.volumes.insert(555, 0.27);
         snapshot.volumes.insert(281, 0.73);
         snapshot.streams.insert(
             901,
@@ -2295,7 +2458,7 @@ mod tests {
                 media_role: Some("music".to_string()),
             },
         );
-        snapshot.volumes.insert(901, 0.27);
+        snapshot.volumes.insert(901, 0.99);
 
         let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
 
@@ -2305,8 +2468,9 @@ mod tests {
     }
 
     #[test]
-    fn derives_channel_volume_from_max_stream_volume_for_same_category() {
+    fn derives_category_channel_volume_from_mix_sink_not_stream_volume() {
         let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 777);
         snapshot.streams.insert(
             100,
             StreamInfo {
@@ -2331,18 +2495,19 @@ mod tests {
                 media_role: Some("movie".to_string()),
             },
         );
-        // Higher stream id has lower volume to catch "last stream wins" bugs.
+        snapshot.volumes.insert(777, 0.33);
         snapshot.volumes.insert(100, 0.40);
         snapshot.volumes.insert(200, 0.04);
 
         let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
 
-        assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.40));
+        assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.33));
     }
 
     #[test]
     fn startup_snapshot_uses_metadata_intent_for_category_volume() {
         let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 333);
         snapshot.streams.insert(
             100,
             StreamInfo {
@@ -2356,6 +2521,7 @@ mod tests {
             },
         );
         snapshot.volumes.insert(100, 0.03);
+        snapshot.volumes.insert(333, 0.14);
 
         let mut intents = BTreeMap::new();
         intents.insert(Channel::Media, 0.50);
@@ -2364,6 +2530,8 @@ mod tests {
 
         let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
         assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.50));
+        assert_eq!(snapshot.volumes.get(&100).copied(), Some(0.03));
+        assert_eq!(snapshot.volumes.get(&333).copied(), Some(0.50));
     }
 
     #[test]
@@ -2385,19 +2553,8 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     #[test]
     fn detects_drifted_category_intent_channels_from_snapshot_volume() {
         let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(
-            100,
-            StreamInfo {
-                id: 100,
-                meter_target: 9100,
-                node_name: Some("media-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-        snapshot.volumes.insert(100, 0.27);
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
+        snapshot.volumes.insert(444, 0.27);
 
         let mut intents = BTreeMap::new();
         intents.insert(Channel::Media, 0.60);
@@ -2415,19 +2572,8 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     #[test]
     fn suppresses_drifted_intent_reapply_for_recent_matching_echo() {
         let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(
-            100,
-            StreamInfo {
-                id: 100,
-                meter_target: 9100,
-                node_name: Some("media-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-        snapshot.volumes.insert(100, 0.60);
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
+        snapshot.volumes.insert(444, 0.60);
 
         let mut intents = BTreeMap::new();
         intents.insert(Channel::Media, 0.60);
@@ -2450,19 +2596,8 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     #[test]
     fn suppresses_observed_volume_emit_while_channel_is_drifted_from_intent() {
         let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(
-            100,
-            StreamInfo {
-                id: 100,
-                meter_target: 9100,
-                node_name: Some("media-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-        snapshot.volumes.insert(100, 0.19);
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
+        snapshot.volumes.insert(444, 0.19);
 
         let mut intents = BTreeMap::new();
         intents.insert(Channel::Media, 0.57);
@@ -2480,21 +2615,90 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
-    fn emits_observed_volume_when_intent_matches_channel_volume() {
-        let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(
-            100,
-            StreamInfo {
-                id: 100,
-                meter_target: 9100,
-                node_name: Some("media-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
+    fn external_drift_is_adopted_after_grace_window() {
+        let mut last_sent = BTreeMap::new();
+        last_sent.insert(
+            Channel::Media,
+            LastSentVolume {
+                sent_at: Instant::now()
+                    - EXTERNAL_INTENT_ADOPTION_WINDOW
+                    - Duration::from_millis(1),
+                volume: 0.42,
             },
         );
-        snapshot.volumes.insert(100, 0.57);
+
+        assert!(should_adopt_external_channel_drift(
+            &last_sent,
+            Channel::Media,
+        ));
+    }
+
+    #[test]
+    fn external_drift_is_not_adopted_during_grace_window() {
+        let mut last_sent = BTreeMap::new();
+        last_sent.insert(
+            Channel::Media,
+            LastSentVolume {
+                sent_at: Instant::now(),
+                volume: 0.42,
+            },
+        );
+
+        assert!(!should_adopt_external_channel_drift(
+            &last_sent,
+            Channel::Media,
+        ));
+    }
+
+    #[test]
+    fn runtime_state_adopts_external_drifted_intent_after_grace_window() {
+        let mut state = build_test_runtime_state(None, None);
+        state.channel_volume_intents.insert(Channel::Media, 0.80);
+        state.last_volume_sent.insert(
+            Channel::Media,
+            LastSentVolume {
+                sent_at: Instant::now()
+                    - EXTERNAL_INTENT_ADOPTION_WINDOW
+                    - Duration::from_millis(1),
+                volume: 0.80,
+            },
+        );
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+
+        state.adopt_external_channel_volume_intent_if_drifted(Channel::Media, 0.25, &event_tx);
+
+        assert_eq!(
+            state.channel_volume_intents.get(&Channel::Media),
+            Some(&0.25)
+        );
+    }
+
+    #[test]
+    fn runtime_state_does_not_adopt_external_drifted_intent_too_soon() {
+        let mut state = build_test_runtime_state(None, None);
+        state.channel_volume_intents.insert(Channel::Media, 0.80);
+        state.last_volume_sent.insert(
+            Channel::Media,
+            LastSentVolume {
+                sent_at: Instant::now(),
+                volume: 0.80,
+            },
+        );
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+
+        state.adopt_external_channel_volume_intent_if_drifted(Channel::Media, 0.25, &event_tx);
+
+        assert_eq!(
+            state.channel_volume_intents.get(&Channel::Media),
+            Some(&0.80)
+        );
+    }
+
+    #[test]
+    fn emits_observed_volume_when_intent_matches_channel_volume() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
+        snapshot.volumes.insert(444, 0.57);
 
         let mut intents = BTreeMap::new();
         intents.insert(Channel::Media, 0.57);
@@ -2512,11 +2716,14 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
-    fn apply_snapshot_volume_hint_updates_targets_for_main_mic_and_classified_streams() {
+    fn apply_snapshot_volume_hint_updates_main_mic_and_category_mix_sinks() {
         let mut snapshot = Snapshot::default();
         snapshot
             .output_ids
             .insert("Venturi-Output".to_string(), 128);
+        snapshot
+            .output_ids
+            .insert("Venturi-Media".to_string(), 9010);
         snapshot
             .input_ids
             .insert("Venturi-VirtualMic".to_string(), 281);
@@ -2551,7 +2758,8 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
 
         assert_eq!(snapshot.volumes.get(&128).copied(), Some(0.31));
         assert_eq!(snapshot.volumes.get(&281).copied(), Some(0.62));
-        assert_eq!(snapshot.volumes.get(&901).copied(), Some(0.47));
+        assert_eq!(snapshot.volumes.get(&9010).copied(), Some(0.47));
+        assert_eq!(snapshot.volumes.get(&901).copied(), None);
         assert_eq!(snapshot.volumes.get(&902).copied(), None);
     }
 
@@ -2771,6 +2979,74 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
+    fn collects_route_targets_for_new_streams_from_classification() {
+        let mut snapshot = Snapshot::default();
+        snapshot.streams.insert(
+            100,
+            StreamInfo {
+                id: 100,
+                meter_target: 9100,
+                node_name: Some("firefox-node".to_string()),
+                is_corked: false,
+                app_key: "firefox".to_string(),
+                display_name: "Firefox".to_string(),
+                media_role: Some("Movie".to_string()),
+            },
+        );
+        snapshot.streams.insert(
+            101,
+            StreamInfo {
+                id: 101,
+                meter_target: 9101,
+                node_name: Some("discord-node".to_string()),
+                is_corked: false,
+                app_key: "discord".to_string(),
+                display_name: "Discord".to_string(),
+                media_role: Some("Communication".to_string()),
+            },
+        );
+
+        let stream_ids_before = BTreeSet::from([100_u32]);
+
+        let routes =
+            collect_new_stream_route_targets(&snapshot, &BTreeMap::new(), &stream_ids_before);
+
+        assert_eq!(routes, vec![(101_u32, Channel::Chat)]);
+    }
+
+    #[test]
+    fn collects_route_targets_for_existing_streams_when_category_mix_sink_ids_change() {
+        let mut snapshot = Snapshot::default();
+        snapshot.streams.insert(
+            100,
+            StreamInfo {
+                id: 100,
+                meter_target: 9100,
+                node_name: Some("firefox-node".to_string()),
+                is_corked: false,
+                app_key: "firefox".to_string(),
+                display_name: "Firefox".to_string(),
+                media_role: Some("Movie".to_string()),
+            },
+        );
+        snapshot
+            .output_ids
+            .insert("Venturi-Media".to_string(), 4000);
+
+        let stream_ids_before = BTreeSet::from([100_u32]);
+        let output_ids_before = BTreeMap::new();
+
+        let routes = collect_stream_route_targets_for_reconcile(
+            &snapshot,
+            &BTreeMap::new(),
+            &stream_ids_before,
+            &output_ids_before,
+        );
+
+        assert_eq!(routes, vec![(100_u32, Channel::Media)]);
+    }
+
+    #[test]
     fn computes_meter_sample_count_for_sampling_interval() {
         assert_eq!(
             compute_level_sample_count(48_000, Duration::from_millis(66)),
@@ -2817,7 +3093,18 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
-    fn node_id_to_channel_maps_stream_via_categorizer() {
+    fn node_id_to_channel_maps_category_mix_sink() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 100);
+        let overrides = BTreeMap::new();
+        assert_eq!(
+            node_id_to_channel(100, &snapshot, &overrides),
+            Some(Channel::Media)
+        );
+    }
+
+    #[test]
+    fn node_id_to_channel_ignores_stream_ids_for_category_separation() {
         let mut snapshot = Snapshot::default();
         snapshot.streams.insert(
             100,
@@ -2832,11 +3119,8 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
             },
         );
         let overrides = BTreeMap::new();
-        // Firefox classifies as Media
-        assert_eq!(
-            node_id_to_channel(100, &snapshot, &overrides),
-            Some(Channel::Media)
-        );
+
+        assert_eq!(node_id_to_channel(100, &snapshot, &overrides), None);
     }
 
     #[test]
@@ -2870,6 +3154,27 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
         let overrides = BTreeMap::new();
 
         assert_eq!(node_id_to_channel(61, &snapshot, &overrides), None);
+    }
+
+    #[test]
+    fn category_mix_sinks_are_managed_and_not_legacy_cleanup_targets() {
+        let category_mix_sinks = [
+            "Venturi-Game",
+            "Venturi-Media",
+            "Venturi-Chat",
+            "Venturi-Aux",
+        ];
+
+        for sink in category_mix_sinks {
+            assert!(
+                super::VIRTUAL_SINKS.contains(&sink),
+                "{sink} must be provisioned as an active virtual sink"
+            );
+            assert!(
+                !super::LEGACY_VENTURI_SINKS.contains(&sink),
+                "{sink} must not be unloaded as a legacy sink"
+            );
+        }
     }
 
     #[test]

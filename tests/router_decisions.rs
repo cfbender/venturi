@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use venturi::core::messages::Channel;
 use venturi::core::router::{
-    RoutingMode, build_device_route_plan, build_fallback_link_commands, build_metadata_target_args,
-    channel_node_name, choose_routing_mode, force_link_routing_enabled, resolve_input_target,
-    resolve_output_target, routing_mode_from_flag,
+    RoutingMode, build_device_route_plan, build_fallback_link_commands,
+    build_metadata_legacy_target_args, build_metadata_target_args, channel_node_name,
+    choose_routing_mode, force_link_routing_enabled, resolve_input_target, resolve_output_target,
+    routing_mode_from_flag,
 };
 
 #[test]
@@ -81,8 +82,18 @@ fn builds_metadata_target_args_for_stream_move() {
     assert_eq!(
         build_metadata_target_args(77, Channel::Chat),
         vec![
-            "-n".to_string(),
-            "settings".to_string(),
+            "77".to_string(),
+            "target.object".to_string(),
+            "Venturi-Chat".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn builds_metadata_legacy_target_args_for_stream_move() {
+    assert_eq!(
+        build_metadata_legacy_target_args(77, Channel::Chat),
+        vec![
             "77".to_string(),
             "target.node".to_string(),
             "Venturi-Chat".to_string(),
