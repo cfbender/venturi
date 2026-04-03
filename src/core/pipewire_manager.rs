@@ -24,7 +24,8 @@ use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump};
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{
     FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands,
-    build_metadata_legacy_target_args, build_metadata_target_args, routing_mode_from_flag,
+    build_metadata_legacy_target_args, build_metadata_target_args, channel_node_name,
+    routing_mode_from_flag,
 };
 
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -360,7 +361,10 @@ fn persist_channel_volume_intent(channel: Channel, volume: f32) -> Result<(), St
     run_pw_metadata(&args)
 }
 
-/// Map a PipeWire node ID to a Venturi Channel using snapshot state and categorizer.
+/// Map only Venturi-owned channel node IDs to a Channel.
+///
+/// This intentionally ignores app stream IDs to preserve strict separation between
+/// app-local stream gain and Venturi channel bus gain.
 fn node_id_to_channel(
     id: u32,
     snapshot: &Snapshot,
@@ -603,10 +607,9 @@ fn channel_volume_from_snapshot(
 
 fn category_mix_output_node_name(channel: Channel) -> Option<&'static str> {
     match channel {
-        Channel::Game => Some("Venturi-Game"),
-        Channel::Media => Some("Venturi-Media"),
-        Channel::Chat => Some("Venturi-Chat"),
-        Channel::Aux => Some("Venturi-Aux"),
+        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
+            Some(channel_node_name(channel))
+        }
         Channel::Main | Channel::Mic => None,
     }
 }

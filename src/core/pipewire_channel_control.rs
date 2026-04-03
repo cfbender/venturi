@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::categorizer::rules::classify_with_priority;
 use crate::core::messages::Channel;
 use crate::core::pipewire_backend::{read_wpctl_volume, run_wpctl, run_wpctl_checked};
 use crate::core::pipewire_discovery::Snapshot;
-use crate::core::router::{resolve_input_target, resolve_output_target};
+use crate::core::router::{channel_node_name, resolve_input_target, resolve_output_target};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChannelControlTargets<'a> {
@@ -14,10 +13,9 @@ pub(crate) struct ChannelControlTargets<'a> {
 
 fn category_mix_output_node_name(channel: Channel) -> Option<&'static str> {
     match channel {
-        Channel::Game => Some("Venturi-Game"),
-        Channel::Media => Some("Venturi-Media"),
-        Channel::Chat => Some("Venturi-Chat"),
-        Channel::Aux => Some("Venturi-Aux"),
+        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
+            Some(channel_node_name(channel))
+        }
         Channel::Main | Channel::Mic => None,
     }
 }
@@ -158,7 +156,7 @@ pub(crate) fn apply_channel_mute(
     channel: Channel,
     muted: bool,
     snapshot: &Snapshot,
-    overrides: &BTreeMap<String, Channel>,
+    _overrides: &BTreeMap<String, Channel>,
     targets: ChannelControlTargets<'_>,
     last_sink_mute_by_target: &mut BTreeMap<String, bool>,
     last_source_mute_by_target: &mut BTreeMap<String, bool>,
@@ -184,21 +182,13 @@ pub(crate) fn apply_channel_mute(
             }
         }
         Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            for stream in snapshot.streams.values() {
-                let stream_channel = classify_with_priority(
-                    overrides,
-                    Some(&stream.app_key),
-                    Some(&stream.display_name),
-                    stream.media_role.as_deref(),
-                );
-                if stream_channel == channel {
-                    let args = vec![
-                        "set-mute".to_string(),
-                        stream.id.to_string(),
-                        value.to_string(),
-                    ];
-                    let _ = run_wpctl_checked(&args);
-                }
+            let Some(target) = category_mix_output_target(channel, snapshot) else {
+                return;
+            };
+            if last_sink_mute_by_target.get(&target) != Some(&muted) {
+                let args = vec!["set-mute".to_string(), target.clone(), value.to_string()];
+                run_wpctl(&args);
+                last_sink_mute_by_target.insert(target, muted);
             }
         }
     }
@@ -206,6 +196,8 @@ pub(crate) fn apply_channel_mute(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::core::messages::Channel;
     use crate::core::pipewire_discovery::Snapshot;
 
@@ -249,5 +241,29 @@ mod tests {
         let target = super::category_mix_output_target(Channel::Chat, &snapshot);
 
         assert_eq!(target, None);
+    }
+
+    #[test]
+    fn category_mute_updates_mix_sink_target_cache() {
+        let mut snapshot = Snapshot::default();
+        snapshot.output_ids.insert("Venturi-Media".to_string(), 412);
+
+        let mut sink_mute_by_target = BTreeMap::new();
+        let mut source_mute_by_target = BTreeMap::new();
+
+        super::apply_channel_mute(
+            Channel::Media,
+            true,
+            &snapshot,
+            &BTreeMap::new(),
+            super::ChannelControlTargets {
+                virtual_input_source_name: "Venturi-VirtualMic",
+                main_output_sink_name: "Venturi-Output",
+            },
+            &mut sink_mute_by_target,
+            &mut source_mute_by_target,
+        );
+
+        assert_eq!(sink_mute_by_target.get("412"), Some(&true));
     }
 }
