@@ -9,7 +9,9 @@ use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::messages::{DeviceEntry, DeviceKind};
 use crate::core::meter::decay_peak;
 use crate::gui::app_chip::{AppChip, ChipStatus, DndPayload, build_chip_widget};
-use crate::gui::channel_strip::{ChannelStrip, SliderHandle, build_strip_widget_with_meter};
+use crate::gui::channel_strip::{
+    ChannelStrip, SliderHandle, build_strip_widget_with_meter, linear_to_slider_fraction,
+};
 use gtk::prelude::*;
 use venturi_application::AppEvent;
 use venturi_domain::StableDeviceId;
@@ -613,7 +615,12 @@ pub fn build_mixer_widget(
                 ] {
                     let (left, right) =
                         levels_snapshot.get(&channel).copied().unwrap_or((0.0, 0.0));
-                    let current = meter_display_level(left.max(right));
+                    let max_fraction = state
+                        .strips
+                        .get(&channel)
+                        .map(|strip| linear_to_slider_fraction(strip.volume_linear))
+                        .unwrap_or(1.0);
+                    let current = meter_display_fraction(left.max(right), max_fraction);
                     let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
                     let next = decay_peak(previous, current, elapsed_ms);
                     if let Some(widget) = meter_widgets.get(&channel) {
@@ -755,6 +762,10 @@ fn meter_display_level(linear_peak: f32) -> f32 {
     linear_peak.clamp(0.0, 1.0).sqrt()
 }
 
+fn meter_display_fraction(linear_peak: f32, max_fraction: f32) -> f32 {
+    meter_display_level(linear_peak).min(max_fraction.clamp(0.0, 1.0))
+}
+
 fn meter_should_be_visible(level: f32) -> bool {
     level > 0.01
 }
@@ -777,7 +788,7 @@ fn compute_slider_sync_update(
     current_slider_value: f64,
     strip_data: &ChannelStrip,
 ) -> (Option<f64>, String) {
-    let model_volume = strip_data.volume_linear as f64;
+    let model_volume = linear_to_slider_fraction(strip_data.volume_linear) as f64;
     let next_slider_value =
         ((current_slider_value - model_volume).abs() > 0.005).then_some(model_volume);
     (next_slider_value, strip_data.volume_text())
@@ -794,8 +805,8 @@ fn should_apply_device_selection_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceListModel, MixerTab, compute_slider_sync_update, meter_display_level,
-        meter_should_be_visible, should_apply_device_selection_change,
+        DeviceListModel, MixerTab, compute_slider_sync_update, meter_display_fraction,
+        meter_display_level, meter_should_be_visible, should_apply_device_selection_change,
     };
     use crate::core::messages::{Channel, CoreEvent, DeviceEntry, DeviceKind};
     use crate::gui::channel_strip::ChannelStrip;
@@ -840,6 +851,13 @@ mod tests {
         assert!((meter_display_level(0.01) - 0.1).abs() < 0.0001);
         assert!((meter_display_level(0.25) - 0.5).abs() < 0.0001);
         assert_eq!(meter_display_level(1.5), 1.0);
+    }
+
+    #[test]
+    fn meter_display_fraction_is_capped_by_channel_volume_fraction() {
+        assert_eq!(meter_display_fraction(1.0, 0.52), 0.52);
+        assert_eq!(meter_display_fraction(0.25, 1.0), 0.5);
+        assert_eq!(meter_display_fraction(0.25, 0.4), 0.4);
     }
 
     #[test]
@@ -917,10 +935,27 @@ mod tests {
             muted: false,
         };
 
-        let (next_slider, next_label) = compute_slider_sync_update(0.26, &strip);
+        let current_slider = super::linear_to_slider_fraction(0.26) as f64;
+        let (next_slider, next_label) = compute_slider_sync_update(current_slider, &strip);
 
         assert_eq!(next_slider, None);
-        assert_eq!(next_label, "26%");
+        assert_eq!(next_label, "64%");
+    }
+
+    #[test]
+    fn compute_slider_sync_update_uses_os_style_slider_scale() {
+        let strip = ChannelStrip {
+            channel: Channel::Media,
+            icon: "🎵",
+            label: "Media",
+            volume_linear: 0.421_875,
+            muted: false,
+        };
+
+        let (next_slider, next_label) = compute_slider_sync_update(0.75, &strip);
+
+        assert_eq!(next_slider, None);
+        assert_eq!(next_label, "75%");
     }
 
     #[test]

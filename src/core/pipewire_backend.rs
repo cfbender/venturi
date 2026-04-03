@@ -371,7 +371,25 @@ pub(crate) fn ensure_virtual_devices(
         run_pactl(&args)?;
     }
 
+    for monitor_source in category_mix_monitor_sources(virtual_sinks) {
+        reconcile_monitor_loopback_modules(&monitor_source, Some(VENTURI_MAIN_OUTPUT)).map_err(
+            |err| {
+                format!(
+                    "failed to route category mix monitor {monitor_source} into {VENTURI_MAIN_OUTPUT}: {err}"
+                )
+            },
+        )?;
+    }
+
     Ok(())
+}
+
+fn category_mix_monitor_sources(virtual_sinks: &[&str]) -> Vec<String> {
+    virtual_sinks
+        .iter()
+        .filter(|sink_name| !sink_name.eq_ignore_ascii_case(VENTURI_MAIN_OUTPUT))
+        .map(|sink_name| format!("{sink_name}.monitor"))
+        .collect()
 }
 
 fn parse_pactl_short_names(raw: &str) -> BTreeSet<String> {
@@ -608,7 +626,7 @@ mod tests {
     use super::{
         MonitorLoopbackPlan, build_monitor_loopback_plan, build_pw_play_args,
         build_virtual_device_description_property,
-        build_virtual_module_device_description_properties,
+        build_virtual_module_device_description_properties, category_mix_monitor_sources,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
         find_virtual_mic_module_in_modules_raw, parse_wpctl_volume_output, sink_description_for,
         source_description_for,
@@ -803,6 +821,21 @@ mod tests {
                 "--target".to_string(),
                 "input.Venturi-VirtualMic".to_string(),
                 "/tmp/airhorn.wav".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_category_mix_monitor_sources_from_virtual_sinks() {
+        let virtual_sinks = ["Venturi-Output", "Venturi-Game", "Venturi-Media"];
+
+        let monitor_sources = category_mix_monitor_sources(virtual_sinks.as_slice());
+
+        assert_eq!(
+            monitor_sources,
+            vec![
+                "Venturi-Game.monitor".to_string(),
+                "Venturi-Media.monitor".to_string()
             ]
         );
     }

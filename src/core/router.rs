@@ -52,8 +52,15 @@ pub fn build_metadata_route_plan(stream_id: u32, channel: Channel) -> MetadataRo
 pub fn build_metadata_target_args(stream_id: u32, channel: Channel) -> Vec<String> {
     let plan = build_metadata_route_plan(stream_id, channel);
     vec![
-        "-n".to_string(),
-        "settings".to_string(),
+        plan.stream_id.to_string(),
+        "target.object".to_string(),
+        plan.target_node,
+    ]
+}
+
+pub fn build_metadata_legacy_target_args(stream_id: u32, channel: Channel) -> Vec<String> {
+    let plan = build_metadata_route_plan(stream_id, channel);
+    vec![
         plan.stream_id.to_string(),
         "target.node".to_string(),
         plan.target_node,
