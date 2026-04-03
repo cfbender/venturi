@@ -20,6 +20,14 @@ pub struct ChannelStrip {
     pub muted: bool,
 }
 
+pub(crate) fn linear_to_slider_fraction(volume_linear: f32) -> f32 {
+    volume_linear.clamp(0.0, 1.0).cbrt()
+}
+
+fn slider_fraction_to_linear(slider_fraction: f64) -> f32 {
+    (slider_fraction.clamp(0.0, 1.0) as f32).powi(3)
+}
+
 impl ChannelStrip {
     pub fn new(channel: Channel, icon: &'static str, label: &'static str) -> Self {
         Self {
@@ -33,7 +41,10 @@ impl ChannelStrip {
 
     pub fn volume_text(&self) -> String {
         let value = apply_mute(self.volume_linear, self.muted);
-        format!("{:.0}%", (value * 100.0).clamp(0.0, 100.0))
+        format!(
+            "{:.0}%",
+            (linear_to_slider_fraction(value) * 100.0).clamp(0.0, 100.0)
+        )
     }
 
     pub fn set_volume_command(&mut self, volume_linear: f32) -> CoreCommand {
@@ -99,7 +110,7 @@ pub fn build_strip_widget_with_meter(
     meter.add_css_class(meter_css_class_for(channel));
 
     let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
-    slider.set_value(state.borrow().volume_linear as f64);
+    slider.set_value(linear_to_slider_fraction(state.borrow().volume_linear) as f64);
     slider.set_inverted(true);
     slider.set_vexpand(true);
     slider.set_margin_top(TRACK_TOP_INSET_PX);
@@ -133,7 +144,7 @@ pub fn build_strip_widget_with_meter(
             }
             let mut state = state.borrow_mut();
             let now = Instant::now();
-            let cmd = state.set_volume_command(scale.value() as f32);
+            let cmd = state.set_volume_command(slider_fraction_to_linear(scale.value()));
             db_label.set_text(&state.volume_text());
 
             if should_emit_volume_update(*last_sent_at.borrow(), now, false) {
@@ -208,8 +219,7 @@ fn should_emit_volume_update(_last_sent_at: Instant, _now: Instant, _is_release:
 }
 
 fn release_volume_command(state: &mut ChannelStrip, slider_value: f64) -> CoreCommand {
-    let clamped = slider_value.clamp(0.0, 1.0) as f32;
-    state.set_volume_command(clamped)
+    state.set_volume_command(slider_fraction_to_linear(slider_value))
 }
 
 fn meter_css_class_for(channel: Channel) -> &'static str {
@@ -263,5 +273,13 @@ mod tests {
 
         assert!(matches!(cmd, CoreCommand::SetVolume(Channel::Main, v) if (v - 1.0).abs() < 0.001));
         assert!((strip.volume_linear - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn volume_text_matches_os_style_percentage_scale() {
+        let mut strip = super::ChannelStrip::new(Channel::Media, "🎮", "Media");
+        strip.volume_linear = 0.421_875;
+
+        assert_eq!(strip.volume_text(), "75%");
     }
 }

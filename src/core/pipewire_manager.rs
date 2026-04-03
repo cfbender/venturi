@@ -210,10 +210,17 @@ fn volume_drift_exceeds_intent_epsilon(observed_volume: f32, intent_volume: f32)
 fn should_adopt_external_channel_drift(
     last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
     channel: Channel,
+    observed_volume: f32,
 ) -> bool {
-    last_volume_sent
-        .get(&channel)
-        .is_none_or(|last_sent| last_sent.sent_at.elapsed() >= EXTERNAL_INTENT_ADOPTION_WINDOW)
+    let Some(last_sent) = last_volume_sent.get(&channel) else {
+        return true;
+    };
+
+    if (last_sent.volume - observed_volume).abs() > ECHO_SUPPRESSION_VOLUME_EPSILON {
+        return true;
+    }
+
+    last_sent.sent_at.elapsed() >= EXTERNAL_INTENT_ADOPTION_WINDOW
 }
 
 fn persisted_channel_volume(state: &crate::config::schema::State, channel: Channel) -> f32 {
@@ -1336,7 +1343,7 @@ impl CoreRuntimeState {
             return;
         }
 
-        if !should_adopt_external_channel_drift(&self.last_volume_sent, channel) {
+        if !should_adopt_external_channel_drift(&self.last_volume_sent, channel, observed_volume) {
             return;
         }
 
@@ -2630,6 +2637,7 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
         assert!(should_adopt_external_channel_drift(
             &last_sent,
             Channel::Media,
+            0.42,
         ));
     }
 
@@ -2647,6 +2655,25 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
         assert!(!should_adopt_external_channel_drift(
             &last_sent,
             Channel::Media,
+            0.42,
+        ));
+    }
+
+    #[test]
+    fn external_drift_is_adopted_immediately_when_volume_diverges() {
+        let mut last_sent = BTreeMap::new();
+        last_sent.insert(
+            Channel::Media,
+            LastSentVolume {
+                sent_at: Instant::now(),
+                volume: 0.80,
+            },
+        );
+
+        assert!(should_adopt_external_channel_drift(
+            &last_sent,
+            Channel::Media,
+            0.25,
         ));
     }
 
@@ -2674,7 +2701,28 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
-    fn runtime_state_does_not_adopt_external_drifted_intent_too_soon() {
+    fn runtime_state_does_not_adopt_recent_matching_echo_too_soon() {
+        let mut state = build_test_runtime_state(None, None);
+        state.channel_volume_intents.insert(Channel::Media, 0.80);
+        state.last_volume_sent.insert(
+            Channel::Media,
+            LastSentVolume {
+                sent_at: Instant::now(),
+                volume: 0.80,
+            },
+        );
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+
+        state.adopt_external_channel_volume_intent_if_drifted(Channel::Media, 0.79, &event_tx);
+
+        assert_eq!(
+            state.channel_volume_intents.get(&Channel::Media),
+            Some(&0.80)
+        );
+    }
+
+    #[test]
+    fn runtime_state_adopts_external_drifted_intent_immediately_when_volume_differs() {
         let mut state = build_test_runtime_state(None, None);
         state.channel_volume_intents.insert(Channel::Media, 0.80);
         state.last_volume_sent.insert(
@@ -2690,7 +2738,7 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
 
         assert_eq!(
             state.channel_volume_intents.get(&Channel::Media),
-            Some(&0.80)
+            Some(&0.25)
         );
     }
 
