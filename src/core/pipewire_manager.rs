@@ -45,7 +45,14 @@ const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
 const METER_WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const METER_SAMPLE_INTERVAL: Duration = Duration::from_millis(66);
 
-const BUS_METER_TARGETS: [(Channel, &str); 6] = [
+/// Channels whose bus-level meters the meter worker should maintain.
+///
+/// Each entry maps a mixer [`Channel`] to the PipeWire node name used to look
+/// up the numeric `object.serial` in the [`Snapshot`].  The serial is then
+/// passed to `pw-record --target <serial>` because `pw-record` cannot resolve
+/// sink names — it only matches source names, so using a sink name causes it
+/// to silently fall back to the default source (the physical mic).
+const BUS_METER_CHANNELS: [(Channel, &str); 6] = [
     (Channel::Main, "Venturi-Output"),
     (Channel::Game, "Venturi-Game"),
     (Channel::Media, "Venturi-Media"),
@@ -1366,6 +1373,7 @@ fn spawn_meter_worker(
     event_tx: Sender<CoreEvent>,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
+    shared_snapshot: Arc<Mutex<Snapshot>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let level_sample_count = compute_level_sample_count(48_000, METER_SAMPLE_INTERVAL);
@@ -1384,10 +1392,30 @@ fn spawn_meter_worker(
             }
             last_meter_sample = Instant::now();
 
-            for (channel, target_name) in &BUS_METER_TARGETS {
+            // Look up numeric object serials from the current snapshot.  `pw-record --target`
+            // only resolves sinks correctly by serial — string node names silently fall back
+            // to the default source.
+            let (output_targets, input_targets) = {
+                if let Ok(snap) = shared_snapshot.try_lock() {
+                    (
+                        snap.output_meter_targets.clone(),
+                        snap.input_meter_targets.clone(),
+                    )
+                } else {
+                    (BTreeMap::new(), BTreeMap::new())
+                }
+            };
+
+            for (channel, node_name) in &BUS_METER_CHANNELS {
                 if !samplers.contains_key(channel) {
-                    if let Ok(sampler) = PwTargetSampler::spawn(target_name) {
-                        samplers.insert(*channel, sampler);
+                    let serial = output_targets
+                        .get(*node_name)
+                        .or_else(|| input_targets.get(*node_name));
+                    if let Some(&target_serial) = serial {
+                        let target_str = target_serial.to_string();
+                        if let Ok(sampler) = PwTargetSampler::spawn(&target_str) {
+                            samplers.insert(*channel, sampler);
+                        }
                     }
                 }
             }
@@ -1395,7 +1423,7 @@ fn spawn_meter_worker(
             let mut updates = Vec::new();
             let mut failed = Vec::new();
 
-            for (channel, _) in &BUS_METER_TARGETS {
+            for (channel, _) in &BUS_METER_CHANNELS {
                 let levels = if let Some(sampler) = samplers.get_mut(channel) {
                     match sampler.sample_levels(level_sample_count) {
                         Ok(levels) => levels,
@@ -1431,6 +1459,7 @@ impl PipeWireManager {
             event_tx.clone(),
             meter_running.clone(),
             meter_enabled.clone(),
+            shared_snapshot.clone(),
         );
         let meter_running_for_core = meter_running.clone();
         let meter_enabled_for_core = meter_enabled.clone();
