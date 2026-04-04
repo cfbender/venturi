@@ -461,7 +461,7 @@ pub fn build_soundboard_widget(
                 if let Some(file) =
                     normalize_optional_text(current_pad.file.as_deref().unwrap_or_default())
                 {
-                    let _ = tx_for_click.send(CoreCommand::typed_play_sound(current_pad.id, file));
+                    let _ = tx_for_click.send(CoreCommand::PlaySound { pad_id: current_pad.id, file });
                 } else {
                     open_pad_editor_dialog(
                         &button_for_click,
@@ -489,7 +489,7 @@ pub fn build_soundboard_widget(
                     normalize_optional_text(current_pad.file.as_deref().unwrap_or_default())
                 {
                     let _ =
-                        tx_for_preview.send(CoreCommand::typed_preview_sound(current_pad.id, file));
+                        tx_for_preview.send(CoreCommand::PreviewSound { pad_id: current_pad.id, file });
                 } else {
                     open_pad_editor_dialog(
                         &button_for_preview,

@@ -21,11 +21,11 @@ pub struct ChannelStrip {
 }
 
 pub(crate) fn linear_to_slider_fraction(volume_linear: f32) -> f32 {
-    volume_linear.clamp(0.0, 1.0).cbrt()
+    volume_linear.clamp(0.0, 1.0)
 }
 
 fn slider_fraction_to_linear(slider_fraction: f64) -> f32 {
-    (slider_fraction.clamp(0.0, 1.0) as f32).powi(3)
+    slider_fraction.clamp(0.0, 1.0) as f32
 }
 
 impl ChannelStrip {
@@ -41,10 +41,7 @@ impl ChannelStrip {
 
     pub fn volume_text(&self) -> String {
         let value = apply_mute(self.volume_linear, self.muted);
-        format!(
-            "{:.0}%",
-            (linear_to_slider_fraction(value) * 100.0).clamp(0.0, 100.0)
-        )
+        format!("{:.0}%", (value * 100.0).clamp(0.0, 100.0))
     }
 
     pub fn set_volume_command(&mut self, volume_linear: f32) -> CoreCommand {
@@ -269,17 +266,19 @@ mod tests {
         let mut strip = super::ChannelStrip::new(Channel::Main, "🔊", "Main");
         strip.volume_linear = 0.98;
 
-        let cmd = super::release_volume_command(&mut strip, 1.0);
+        let cmd = super::release_volume_command(&mut strip, 0.42);
 
-        assert!(matches!(cmd, CoreCommand::SetVolume(Channel::Main, v) if (v - 1.0).abs() < 0.001));
-        assert!((strip.volume_linear - 1.0).abs() < 0.001);
+        assert!(
+            matches!(cmd, CoreCommand::SetVolume(Channel::Main, v) if (v - 0.42).abs() < 0.001)
+        );
+        assert!((strip.volume_linear - 0.42).abs() < 0.001);
     }
 
     #[test]
-    fn volume_text_matches_os_style_percentage_scale() {
+    fn volume_text_matches_linear_percentage_scale() {
         let mut strip = super::ChannelStrip::new(Channel::Media, "🎮", "Media");
         strip.volume_linear = 0.421_875;
 
-        assert_eq!(strip.volume_text(), "75%");
+        assert_eq!(strip.volume_text(), "42%");
     }
 }

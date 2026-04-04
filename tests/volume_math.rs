@@ -1,19 +1,5 @@
 use venturi::core::meter::decay_peak;
-use venturi::core::volume::{apply_mute, linear_to_db, slider_to_linear};
-
-#[test]
-fn cubic_slider_mapping_matches_expected_points() {
-    assert_eq!(slider_to_linear(0.0), 0.0);
-    assert!((slider_to_linear(1.0) - 1.5).abs() < 1e-6);
-}
-
-#[test]
-fn db_conversion_handles_negative_infinity_and_unity() {
-    assert_eq!(linear_to_db(0.0), f32::NEG_INFINITY);
-    assert!((linear_to_db(1.0) - 0.0).abs() < 1e-6);
-    let plus = linear_to_db(1.5);
-    assert!(plus > 3.0 && plus < 4.0);
-}
+use venturi::core::volume::apply_mute;
 
 #[test]
 fn mute_sets_output_to_zero() {

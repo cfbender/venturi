@@ -72,28 +72,6 @@ pub(crate) fn run_pw_metadata(args: &[String]) -> Result<(), String> {
     run_command("pw-metadata", args)
 }
 
-pub(crate) fn run_pw_metadata_capture(args: &[String]) -> Result<String, String> {
-    let output = Command::new("pw-metadata")
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run pw-metadata: {e}"))?;
-
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|e| e.to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "pw-metadata exited with {}: {}",
-            output.status,
-            stderr.trim()
-        ))
-    }
-}
-
-pub(crate) fn run_pw_link(args: &[String]) -> Result<(), String> {
-    run_command("pw-link", args)
-}
-
 pub(crate) fn run_pactl(args: &[String]) -> Result<String, String> {
     let output = Command::new("pactl")
         .args(args)
@@ -336,17 +314,25 @@ pub(crate) fn ensure_virtual_devices(
 
     for sink in virtual_sinks {
         if existing_sinks.contains(*sink) {
+            // Recreate Venturi-Sound as mono if it already exists as stereo.
+            if sink.eq_ignore_ascii_case(VENTURI_SOUND_SINK) {
+                recreate_sound_sink_as_mono_if_needed(sink)?;
+            }
             continue;
         }
-        let args = vec![
+        let mut args = vec![
             "load-module".to_string(),
             "module-null-sink".to_string(),
             format!("sink_name={sink}"),
-            format!(
-                "sink_properties={}",
-                build_virtual_module_device_description_properties(sink_description_for(sink))
-            ),
         ];
+        if sink.eq_ignore_ascii_case(VENTURI_SOUND_SINK) {
+            args.push("channels=1".to_string());
+            args.push("channel_map=mono".to_string());
+        }
+        args.push(format!(
+            "sink_properties={}",
+            build_virtual_module_device_description_properties(sink_description_for(sink))
+        ));
         run_pactl(&args)?;
     }
 
@@ -381,13 +367,98 @@ pub(crate) fn ensure_virtual_devices(
         )?;
     }
 
+    // Route the soundboard sink's monitor into the virtual mic input via pw-link.
+    // This uses port-level linking because the virtual mic is a source, not a sink,
+    // so module-loopback can't target it.
+    if let Some(sound_sink) = virtual_sinks.iter().find(|s| s.eq_ignore_ascii_case(VENTURI_SOUND_SINK))
+        && let Some(virtual_mic) = virtual_sources.first()
+    {
+        link_soundboard_to_virtual_mic(sound_sink, virtual_mic);
+    }
+
     Ok(())
+}
+
+const VENTURI_SOUND_SINK: &str = "Venturi-Sound";
+
+fn link_soundboard_to_virtual_mic(sound_sink: &str, virtual_mic: &str) {
+    // Venturi-Sound is mono, VirtualMic input is mono — link monitor_MONO to input_MONO.
+    // Retry a few times since the sink ports may not be ready immediately after creation.
+    let args = vec![
+        format!("{sound_sink}:monitor_MONO"),
+        format!("input.{virtual_mic}:input_MONO"),
+    ];
+    for attempt in 0..5 {
+        if run_pw_link(&args).is_ok() {
+            return;
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+fn recreate_sound_sink_as_mono_if_needed(sink_name: &str) -> Result<(), String> {
+    // Check if the existing sink has a monitor_MONO port (mono) or monitor_FL (stereo).
+    let output = run_pw_link_list_outputs()?;
+    let has_mono = output
+        .lines()
+        .any(|line| line.trim() == format!("{sink_name}:monitor_MONO"));
+    if has_mono {
+        return Ok(());
+    }
+
+    // Existing sink is stereo — unload and recreate as mono.
+    let modules_raw = run_pactl(&vec![
+        "list".to_string(),
+        "short".to_string(),
+        "modules".to_string(),
+    ])?;
+    for line in modules_raw.lines() {
+        if line.contains("module-null-sink") && line.contains(&format!("sink_name={sink_name}")) {
+            if let Some(module_id) = line.split_whitespace().next() {
+                unload_pactl_module(module_id)?;
+            }
+        }
+    }
+    let args = vec![
+        "load-module".to_string(),
+        "module-null-sink".to_string(),
+        format!("sink_name={sink_name}"),
+        "channels=1".to_string(),
+        "channel_map=mono".to_string(),
+        format!(
+            "sink_properties={}",
+            build_virtual_module_device_description_properties(sink_description_for(sink_name))
+        ),
+    ];
+    run_pactl(&args)?;
+    Ok(())
+}
+
+fn run_pw_link_list_outputs() -> Result<String, String> {
+    let output = std::process::Command::new("pw-link")
+        .arg("-o")
+        .output()
+        .map_err(|e| format!("failed to run pw-link -o: {e}"))?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|e| e.to_string())
+    } else {
+        Err("pw-link -o failed".to_string())
+    }
+}
+
+fn run_pw_link(args: &[String]) -> Result<(), String> {
+    run_command("pw-link", args)
 }
 
 fn category_mix_monitor_sources(virtual_sinks: &[&str]) -> Vec<String> {
     virtual_sinks
         .iter()
-        .filter(|sink_name| !sink_name.eq_ignore_ascii_case(VENTURI_MAIN_OUTPUT))
+        .filter(|sink_name| {
+            !sink_name.eq_ignore_ascii_case(VENTURI_MAIN_OUTPUT)
+                && !sink_name.eq_ignore_ascii_case(VENTURI_SOUND_SINK)
+        })
         .map(|sink_name| format!("{sink_name}.monitor"))
         .collect()
 }
@@ -414,17 +485,40 @@ fn build_monitor_loopback_plan(
     monitor_source_name: &str,
     output_device: Option<&str>,
 ) -> MonitorLoopbackPlan {
-    let unload_ids = modules_raw
-        .lines()
-        .filter_map(|line| {
-            if !line.contains("module-loopback")
-                || !line.contains(&format!("source={monitor_source_name}"))
-            {
-                return None;
-            }
-            line.split_whitespace().next().map(str::to_string)
-        })
-        .collect::<Vec<_>>();
+    let mut matching_modules: Vec<(String, Option<String>)> = Vec::new();
+
+    for line in modules_raw.lines() {
+        if !line.contains("module-loopback")
+            || !line.contains(&format!("source={monitor_source_name}"))
+        {
+            continue;
+        }
+        let Some(module_id) = line.split_whitespace().next() else {
+            continue;
+        };
+        let sink = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("sink="))
+            .map(str::to_string);
+        matching_modules.push((module_id.to_string(), sink));
+    }
+
+    // If there's exactly one existing loopback already pointing at the desired target,
+    // keep it to avoid an audio pop from unnecessary unload/reload.
+    if let Some(desired) = output_device
+        && matching_modules.len() == 1
+        && matching_modules[0].1.as_deref() == Some(desired)
+    {
+        return MonitorLoopbackPlan {
+            unload_ids: vec![],
+            load_args: None,
+        };
+    }
+
+    let unload_ids = matching_modules
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
 
     let load_args =
         output_device.map(|device| build_monitor_loopback_load_args(monitor_source_name, device));
@@ -687,6 +781,27 @@ mod tests {
     }
 
     #[test]
+    fn plan_keeps_single_correct_loopback_to_avoid_pop() {
+        let modules = r#"
+536870916 module-loopback source=Venturi-Game.monitor sink=Venturi-Output latency_msec=1
+"#;
+
+        let plan = build_monitor_loopback_plan(
+            modules,
+            "Venturi-Game.monitor",
+            Some("Venturi-Output"),
+        );
+
+        assert_eq!(
+            plan,
+            MonitorLoopbackPlan {
+                unload_ids: vec![],
+                load_args: None,
+            }
+        );
+    }
+
+    #[test]
     fn uses_friendly_descriptions_for_main_virtual_devices() {
         assert_eq!(
             sink_description_for("Venturi-Output"),
@@ -826,8 +941,13 @@ mod tests {
     }
 
     #[test]
-    fn collects_category_mix_monitor_sources_from_virtual_sinks() {
-        let virtual_sinks = ["Venturi-Output", "Venturi-Game", "Venturi-Media"];
+    fn collects_category_mix_monitor_sources_excluding_output_and_sound() {
+        let virtual_sinks = [
+            "Venturi-Output",
+            "Venturi-Game",
+            "Venturi-Media",
+            "Venturi-Sound",
+        ];
 
         let monitor_sources = category_mix_monitor_sources(virtual_sinks.as_slice());
 
