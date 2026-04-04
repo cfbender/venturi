@@ -15,7 +15,7 @@ use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, Device
 use crate::core::pipewire_backend::{
     PwPlayProcess, PwTargetSampler, current_default_sink_name, current_default_source_name,
     ensure_virtual_devices, reconcile_monitor_loopback_modules, rewire_virtual_mic_source,
-    run_pw_link, run_pw_metadata, run_pw_metadata_capture, unload_pactl_module,
+    run_pw_metadata, unload_pactl_module,
 };
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
@@ -23,9 +23,7 @@ use crate::core::pipewire_channel_control::{
 use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump};
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{
-    FORCE_LINK_ROUTING_ENV, RoutingMode, build_fallback_link_commands,
     build_metadata_legacy_target_args, build_metadata_target_args, channel_node_name,
-    routing_mode_from_flag,
 };
 
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -39,36 +37,35 @@ pub fn fallback_to_default_device() -> &'static str {
 }
 
 const LOOP_TICK_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_STREAM_PROBES_PER_CHANNEL: usize = 1;
-const ECHO_SUPPRESSION_WINDOW: Duration = Duration::from_millis(200);
-const ECHO_SUPPRESSION_VOLUME_EPSILON: f32 = 0.01;
-const INTENT_REAPPLY_VOLUME_EPSILON: f32 = 0.01;
-const EXTERNAL_INTENT_ADOPTION_WINDOW: Duration = Duration::from_millis(750);
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const DEVICE_SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
 const METER_WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(500);
-const METER_OVERRIDE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const METER_SAMPLE_INTERVAL: Duration = Duration::from_millis(66);
-const VIRTUAL_SINKS: [&str; 5] = [
+
+const BUS_METER_TARGETS: [(Channel, &str); 6] = [
+    (Channel::Main, "Venturi-Output"),
+    (Channel::Game, "Venturi-Game"),
+    (Channel::Media, "Venturi-Media"),
+    (Channel::Chat, "Venturi-Chat"),
+    (Channel::Aux, "Venturi-Aux"),
+    (Channel::Mic, "Venturi-VirtualMic"),
+];
+const VIRTUAL_SINKS: [&str; 6] = [
     "Venturi-Output",
     "Venturi-Game",
     "Venturi-Media",
     "Venturi-Chat",
     "Venturi-Aux",
+    "Venturi-Sound",
 ];
 const VIRTUAL_SOURCES: [&str; 1] = ["Venturi-VirtualMic"];
-const VENTURI_VIRTUAL_MIC_INPUT_TARGET: &str = "input.Venturi-VirtualMic";
+const VENTURI_SOUNDBOARD_SINK: &str = "Venturi-Sound";
 const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
 const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
-const LEGACY_VENTURI_SINKS: [&str; 2] = ["Venturi-Mic", "Venturi-Sound"];
-const PW_SETTINGS_METADATA_NAME: &str = "settings";
-const VENTURI_CHANNEL_GAME_VOLUME_KEY: &str = "venturi.channel.game.volume";
-const VENTURI_CHANNEL_MEDIA_VOLUME_KEY: &str = "venturi.channel.media.volume";
-const VENTURI_CHANNEL_CHAT_VOLUME_KEY: &str = "venturi.channel.chat.volume";
-const VENTURI_CHANNEL_AUX_VOLUME_KEY: &str = "venturi.channel.aux.volume";
+const LEGACY_VENTURI_SINKS: [&str; 1] = ["Venturi-Mic"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SoundboardPlaybackRoute {
@@ -99,7 +96,7 @@ fn soundboard_playback_routes(mode: SoundboardPlaybackMode) -> &'static [Soundbo
 
 fn soundboard_playback_target_for_route(route: SoundboardPlaybackRoute) -> &'static str {
     match route {
-        SoundboardPlaybackRoute::VirtualMicInput => VENTURI_VIRTUAL_MIC_INPUT_TARGET,
+        SoundboardPlaybackRoute::VirtualMicInput => VENTURI_SOUNDBOARD_SINK,
         SoundboardPlaybackRoute::MainOutput => VENTURI_MAIN_OUTPUT,
     }
 }
@@ -171,81 +168,6 @@ fn keep_pipewire_backend_symbols_for_tests() {
     let _ = VENTURI_MAIN_MONITOR;
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LastSentVolume {
-    sent_at: Instant,
-    volume: f32,
-}
-
-fn should_suppress_recent_echo(
-    last_sent: Option<&LastSentVolume>,
-    observed_volume: f32,
-    suppression_window: Duration,
-    volume_epsilon: f32,
-) -> bool {
-    let Some(last_sent) = last_sent else {
-        return false;
-    };
-
-    last_sent.sent_at.elapsed() < suppression_window
-        && (last_sent.volume - observed_volume).abs() <= volume_epsilon
-}
-
-fn should_suppress_channel_volume_echo(
-    last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
-    channel: Channel,
-    observed_volume: f32,
-) -> bool {
-    should_suppress_recent_echo(
-        last_volume_sent.get(&channel),
-        observed_volume,
-        ECHO_SUPPRESSION_WINDOW,
-        ECHO_SUPPRESSION_VOLUME_EPSILON,
-    )
-}
-
-fn volume_drift_exceeds_intent_epsilon(observed_volume: f32, intent_volume: f32) -> bool {
-    (observed_volume - intent_volume).abs() >= INTENT_REAPPLY_VOLUME_EPSILON
-}
-
-fn should_adopt_external_channel_drift(
-    last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
-    channel: Channel,
-    observed_volume: f32,
-) -> bool {
-    let Some(last_sent) = last_volume_sent.get(&channel) else {
-        return true;
-    };
-
-    if (last_sent.volume - observed_volume).abs() > ECHO_SUPPRESSION_VOLUME_EPSILON {
-        return true;
-    }
-
-    last_sent.sent_at.elapsed() >= EXTERNAL_INTENT_ADOPTION_WINDOW
-}
-
-fn persisted_channel_volume(state: &crate::config::schema::State, channel: Channel) -> f32 {
-    match channel {
-        Channel::Main => state.volumes.main,
-        Channel::Game => state.volumes.game,
-        Channel::Media => state.volumes.media,
-        Channel::Chat => state.volumes.chat,
-        Channel::Aux => state.volumes.aux,
-        Channel::Mic => state.volumes.mic,
-    }
-}
-
-fn persisted_channel_mute(state: &crate::config::schema::State, channel: Channel) -> bool {
-    match channel {
-        Channel::Main => state.muted.main,
-        Channel::Game => state.muted.game,
-        Channel::Media => state.muted.media,
-        Channel::Chat => state.muted.chat,
-        Channel::Aux => state.muted.aux,
-        Channel::Mic => state.muted.mic,
-    }
-}
-
 fn set_persisted_channel_volume(
     state: &mut crate::config::schema::State,
     channel: Channel,
@@ -275,90 +197,6 @@ fn set_persisted_channel_mute(
         Channel::Aux => state.muted.aux = muted,
         Channel::Mic => state.muted.mic = muted,
     }
-}
-
-fn channel_volume_intent_key(channel: Channel) -> Option<&'static str> {
-    match channel {
-        Channel::Game => Some(VENTURI_CHANNEL_GAME_VOLUME_KEY),
-        Channel::Media => Some(VENTURI_CHANNEL_MEDIA_VOLUME_KEY),
-        Channel::Chat => Some(VENTURI_CHANNEL_CHAT_VOLUME_KEY),
-        Channel::Aux => Some(VENTURI_CHANNEL_AUX_VOLUME_KEY),
-        Channel::Main | Channel::Mic => None,
-    }
-}
-
-fn channel_from_volume_intent_key(key: &str) -> Option<Channel> {
-    match key {
-        VENTURI_CHANNEL_GAME_VOLUME_KEY => Some(Channel::Game),
-        VENTURI_CHANNEL_MEDIA_VOLUME_KEY => Some(Channel::Media),
-        VENTURI_CHANNEL_CHAT_VOLUME_KEY => Some(Channel::Chat),
-        VENTURI_CHANNEL_AUX_VOLUME_KEY => Some(Channel::Aux),
-        _ => None,
-    }
-}
-
-fn parse_metadata_field(line: &str, label: &str) -> Option<String> {
-    let start = line.find(label)? + label.len();
-    let rest = line.get(start..)?.trim_start();
-    if let Some(stripped) = rest.strip_prefix('\'') {
-        let end = stripped.find('\'')?;
-        return Some(stripped[..end].to_string());
-    }
-    rest.split_whitespace().next().map(ToString::to_string)
-}
-
-fn parse_channel_volume_intents(raw: &str) -> BTreeMap<Channel, f32> {
-    let mut intents = BTreeMap::new();
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("update:") {
-            continue;
-        }
-
-        let id = parse_metadata_field(trimmed, "id:").and_then(|v| v.parse::<u32>().ok());
-        if id != Some(0) {
-            continue;
-        }
-
-        let Some(key) = parse_metadata_field(trimmed, "key:") else {
-            continue;
-        };
-        let Some(channel) = channel_from_volume_intent_key(&key) else {
-            continue;
-        };
-        let Some(raw_value) = parse_metadata_field(trimmed, "value:") else {
-            continue;
-        };
-        let Ok(value) = raw_value.parse::<f32>() else {
-            continue;
-        };
-
-        intents.insert(channel, value.clamp(0.0, 1.0));
-    }
-
-    intents
-}
-
-fn load_channel_volume_intents() -> Result<BTreeMap<Channel, f32>, String> {
-    let args = vec!["-n".to_string(), PW_SETTINGS_METADATA_NAME.to_string()];
-    let raw = run_pw_metadata_capture(&args)?;
-    Ok(parse_channel_volume_intents(&raw))
-}
-
-fn persist_channel_volume_intent(channel: Channel, volume: f32) -> Result<(), String> {
-    let Some(key) = channel_volume_intent_key(channel) else {
-        return Ok(());
-    };
-
-    let args = vec![
-        "-n".to_string(),
-        PW_SETTINGS_METADATA_NAME.to_string(),
-        "0".to_string(),
-        key.to_string(),
-        volume.clamp(0.0, 1.0).to_string(),
-    ];
-    run_pw_metadata(&args)
 }
 
 /// Map only Venturi-owned channel node IDs to a Channel.
@@ -510,58 +348,6 @@ fn apply_structural_monitor_delta(
     }
 }
 
-fn build_channel_level_targets(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-) -> BTreeMap<crate::core::messages::Channel, Vec<u32>> {
-    let mut targets = BTreeMap::new();
-
-    if let Some(main_id) = snapshot
-        .output_meter_targets
-        .get(VENTURI_MAIN_OUTPUT)
-        .copied()
-    {
-        targets
-            .entry(crate::core::messages::Channel::Main)
-            .or_insert_with(Vec::new)
-            .push(main_id);
-    }
-
-    if let Some(mic_id) = snapshot
-        .input_meter_targets
-        .get(VIRTUAL_SOURCES[0])
-        .copied()
-    {
-        targets
-            .entry(crate::core::messages::Channel::Mic)
-            .or_insert_with(Vec::new)
-            .push(mic_id);
-    }
-
-    for stream in snapshot.streams.values() {
-        let channel = classify_with_priority(
-            overrides,
-            Some(&stream.app_key),
-            Some(&stream.display_name),
-            stream.media_role.as_deref(),
-        );
-        if matches!(
-            channel,
-            crate::core::messages::Channel::Game
-                | crate::core::messages::Channel::Media
-                | crate::core::messages::Channel::Chat
-                | crate::core::messages::Channel::Aux
-        ) {
-            targets
-                .entry(channel)
-                .or_insert_with(Vec::new)
-                .push(stream.meter_target);
-        }
-    }
-
-    targets
-}
-
 fn snapshot_channel_volumes(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
@@ -641,16 +427,6 @@ fn apply_snapshot_volume_hint(
                 snapshot.volumes.insert(mix_id, volume);
             }
         }
-    }
-}
-
-fn apply_volume_intents_to_snapshot(
-    snapshot: &mut Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    intents: &BTreeMap<Channel, f32>,
-) {
-    for (&channel, &volume) in intents {
-        apply_snapshot_volume_hint(snapshot, overrides, channel, volume);
     }
 }
 
@@ -739,56 +515,6 @@ fn collect_stream_route_targets_for_reconcile(
     targets_by_stream.into_iter().collect()
 }
 
-fn collect_drifted_intent_channels(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    intents: &BTreeMap<Channel, f32>,
-    last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
-) -> BTreeSet<Channel> {
-    let mut channels = BTreeSet::new();
-
-    for (&channel, &intent_volume) in intents {
-        let Some(observed_volume) = channel_volume_from_snapshot(snapshot, overrides, channel)
-        else {
-            continue;
-        };
-
-        let drifted = volume_drift_exceeds_intent_epsilon(observed_volume, intent_volume);
-        let suppressed =
-            should_suppress_channel_volume_echo(last_volume_sent, channel, observed_volume);
-
-        if drifted && !suppressed {
-            channels.insert(channel);
-        }
-    }
-
-    channels
-}
-
-fn should_emit_observed_channel_volume(
-    channel: Channel,
-    observed_volume: f32,
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    intents: &BTreeMap<Channel, f32>,
-    last_volume_sent: &BTreeMap<Channel, LastSentVolume>,
-) -> bool {
-    if should_suppress_channel_volume_echo(last_volume_sent, channel, observed_volume) {
-        return false;
-    }
-
-    let Some(intent_volume) = intents.get(&channel).copied() else {
-        return true;
-    };
-
-    let Some(current_channel_volume) = channel_volume_from_snapshot(snapshot, overrides, channel)
-    else {
-        return true;
-    };
-
-    !volume_drift_exceeds_intent_epsilon(current_channel_volume, intent_volume)
-}
-
 fn emit_snapshot_channel_volumes(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
@@ -809,49 +535,6 @@ fn emit_snapshot_channel_volumes(
     }
 }
 
-fn build_stream_name_level_targets(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-) -> BTreeMap<crate::core::messages::Channel, Vec<String>> {
-    let mut targets = BTreeMap::new();
-
-    for stream in snapshot.streams.values() {
-        let channel = classify_with_priority(
-            overrides,
-            Some(&stream.app_key),
-            Some(&stream.display_name),
-            stream.media_role.as_deref(),
-        );
-        if matches!(
-            channel,
-            crate::core::messages::Channel::Game
-                | crate::core::messages::Channel::Media
-                | crate::core::messages::Channel::Chat
-                | crate::core::messages::Channel::Aux
-        ) && !stream.is_corked
-            && let Some(node_name) = &stream.node_name
-        {
-            targets
-                .entry(channel)
-                .or_insert_with(Vec::new)
-                .push(node_name.clone());
-        }
-    }
-
-    targets
-}
-
-fn retain_primary_numeric_meter_targets(
-    targets: &mut BTreeMap<crate::core::messages::Channel, Vec<u32>>,
-) {
-    targets.retain(|channel, _| {
-        matches!(
-            channel,
-            crate::core::messages::Channel::Main | crate::core::messages::Channel::Mic
-        )
-    });
-}
-
 pub struct PipeWireManager {
     handle: std::thread::JoinHandle<()>,
     meter_handle: std::thread::JoinHandle<()>,
@@ -868,7 +551,6 @@ enum CommandLoopControl {
 }
 
 struct CoreRuntimeState {
-    routing_mode: RoutingMode,
     paths: Paths,
     runtime_config: crate::config::schema::Config,
     hotkey_bindings: HotkeyBindings,
@@ -886,10 +568,8 @@ struct CoreRuntimeState {
     last_source_mute_by_target: BTreeMap<String, bool>,
     runtime_state: crate::config::schema::State,
     state_saver: DebouncedSaver,
-    channel_volume_intents: BTreeMap<Channel, f32>,
     soundboard_players: BTreeMap<(u32, SoundboardPlaybackRoute), PwPlayProcess>,
     meter_enabled: Arc<AtomicBool>,
-    last_volume_sent: BTreeMap<Channel, LastSentVolume>,
     pub shared_snapshot: Arc<Mutex<Snapshot>>,
     consecutive_failures: u32,
     first_failure_at: Instant,
@@ -905,8 +585,6 @@ impl CoreRuntimeState {
         meter_enabled: Arc<AtomicBool>,
         shared_snapshot: Arc<Mutex<Snapshot>>,
     ) -> Self {
-        let routing_mode =
-            routing_mode_from_flag(std::env::var(FORCE_LINK_ROUTING_ENV).ok().as_deref());
         let paths = Paths::resolve();
         if let Err(err) = ensure_dirs(&paths) {
             let _ = event_tx.send(CoreEvent::Error(format!(
@@ -916,15 +594,6 @@ impl CoreRuntimeState {
 
         let runtime_config = load_config(&paths);
         let runtime_state = crate::config::schema::State::default();
-        let channel_volume_intents = match load_channel_volume_intents() {
-            Ok(intents) => intents,
-            Err(err) => {
-                let _ = event_tx.send(CoreEvent::Error(format!(
-                    "failed to load channel volume intents from PipeWire metadata: {err}"
-                )));
-                BTreeMap::new()
-            }
-        };
         let hotkey_bindings = HotkeyBindings::from(&runtime_config.hotkeys);
         let mut hotkey_adapter =
             build_adapter(std::env::var("XDG_SESSION_TYPE").ok().as_deref(), false);
@@ -950,7 +619,6 @@ impl CoreRuntimeState {
         };
 
         let mut state = Self {
-            routing_mode,
             paths,
             runtime_config,
             hotkey_bindings,
@@ -971,10 +639,8 @@ impl CoreRuntimeState {
             last_source_mute_by_target: BTreeMap::new(),
             runtime_state,
             state_saver: DebouncedSaver::new(),
-            channel_volume_intents,
             soundboard_players: BTreeMap::new(),
             meter_enabled,
-            last_volume_sent: BTreeMap::new(),
             shared_snapshot,
             consecutive_failures: 0,
             first_failure_at: Instant::now(),
@@ -1025,16 +691,10 @@ impl CoreRuntimeState {
         event_tx: &Sender<CoreEvent>,
     ) -> Result<CommandLoopControl, String> {
         match command {
-            CoreCommand::Ping => {
-                event_tx
-                    .send(CoreEvent::Pong)
-                    .map_err(|err| format!("failed to emit Pong event: {err}"))?;
-            }
             CoreCommand::RequestSnapshot => {
                 self.resend_initial_state(event_tx);
             }
             CoreCommand::SetVolume(channel, volume) => {
-                self.update_channel_volume_intent(channel, volume, event_tx);
                 let applied_volume = apply_channel_volume(
                     channel,
                     volume,
@@ -1055,13 +715,6 @@ impl CoreRuntimeState {
                         applied_volume,
                     );
                     let _ = event_tx.send(CoreEvent::VolumeChanged(channel, applied_volume));
-                    self.last_volume_sent.insert(
-                        channel,
-                        LastSentVolume {
-                            sent_at: Instant::now(),
-                            volume: applied_volume,
-                        },
-                    );
                 }
                 set_persisted_channel_volume(&mut self.runtime_state, channel, volume);
                 self.state_saver.mark_dirty(Instant::now());
@@ -1170,43 +823,18 @@ impl CoreRuntimeState {
         stream_id: u32,
         channel: crate::core::messages::Channel,
     ) -> Result<(), String> {
-        let route_result = match self.routing_mode {
-            RoutingMode::MetadataFirst => {
-                let target_args = build_metadata_target_args(stream_id, channel);
-                let legacy_target_args = build_metadata_legacy_target_args(stream_id, channel);
+        let target_args = build_metadata_target_args(stream_id, channel);
+        let legacy_target_args = build_metadata_legacy_target_args(stream_id, channel);
 
-                let target_result = run_pw_metadata(&target_args);
-                let legacy_result = run_pw_metadata(&legacy_target_args);
+        let target_result = run_pw_metadata(&target_args);
+        let legacy_result = run_pw_metadata(&legacy_target_args);
 
-                match (target_result, legacy_result) {
-                    (Ok(()), _) | (_, Ok(())) => Ok(()),
-                    (Err(target_err), Err(legacy_err)) => Err(format!(
-                        "failed to set stream route metadata (target.object: {target_err}; target.node: {legacy_err})"
-                    )),
-                }
-            }
-            RoutingMode::FallbackLinks => {
-                let mut result = Ok(());
-                for args in build_fallback_link_commands(stream_id, channel) {
-                    if let Err(err) = run_pw_link(&args) {
-                        result = Err(err);
-                        break;
-                    }
-                }
-                result
-            }
-        };
-
-        route_result.map_err(|err| format!("failed to move stream {stream_id}: {err}"))?;
-
-        if matches!(
-            channel,
-            Channel::Game | Channel::Media | Channel::Chat | Channel::Aux
-        ) {
-            self.apply_persisted_channel_mix(channel);
+        match (target_result, legacy_result) {
+            (Ok(()), _) | (_, Ok(())) => Ok(()),
+            (Err(target_err), Err(legacy_err)) => Err(format!(
+                "failed to move stream {stream_id}: target.object: {target_err}; target.node: {legacy_err}"
+            )),
         }
-
-        Ok(())
     }
 
     fn route_stream_targets_for_reconcile(
@@ -1227,40 +855,6 @@ impl CoreRuntimeState {
                 )));
             }
         }
-    }
-
-    fn apply_persisted_channel_mix(&mut self, channel: Channel) {
-        let volume = self
-            .channel_volume_intents
-            .get(&channel)
-            .copied()
-            .unwrap_or_else(|| persisted_channel_volume(&self.runtime_state, channel));
-        apply_channel_volume(
-            channel,
-            volume,
-            &self.last_snapshot,
-            &self.overrides,
-            ChannelControlTargets {
-                virtual_input_source_name: VIRTUAL_SOURCES[0],
-                main_output_sink_name: VENTURI_MAIN_OUTPUT,
-            },
-            &mut self.last_sink_volume_by_target,
-            &mut self.last_source_volume_by_target,
-        );
-
-        let muted = persisted_channel_mute(&self.runtime_state, channel);
-        apply_channel_mute(
-            channel,
-            muted,
-            &self.last_snapshot,
-            &self.overrides,
-            ChannelControlTargets {
-                virtual_input_source_name: VIRTUAL_SOURCES[0],
-                main_output_sink_name: VENTURI_MAIN_OUTPUT,
-            },
-            &mut self.last_sink_mute_by_target,
-            &mut self.last_source_mute_by_target,
-        );
     }
 
     fn handle_play_sound(
@@ -1310,120 +904,6 @@ impl CoreRuntimeState {
     fn cleanup_soundboard_players(&mut self) {
         self.soundboard_players
             .retain(|_, player| !player.is_finished());
-    }
-
-    fn update_channel_volume_intent(
-        &mut self,
-        channel: Channel,
-        volume: f32,
-        event_tx: &Sender<CoreEvent>,
-    ) {
-        if channel_volume_intent_key(channel).is_none() {
-            return;
-        }
-
-        let normalized = volume.clamp(0.0, 1.0);
-        self.channel_volume_intents.insert(channel, normalized);
-        if let Err(err) = persist_channel_volume_intent(channel, normalized) {
-            let _ = event_tx.send(CoreEvent::Error(format!(
-                "failed to persist channel volume intent for {:?}: {err}",
-                channel
-            )));
-        }
-    }
-
-    fn adopt_external_channel_volume_intent_if_drifted(
-        &mut self,
-        channel: Channel,
-        observed_volume: f32,
-        event_tx: &Sender<CoreEvent>,
-    ) {
-        let Some(intent_volume) = self.channel_volume_intents.get(&channel).copied() else {
-            return;
-        };
-
-        if !volume_drift_exceeds_intent_epsilon(observed_volume, intent_volume) {
-            return;
-        }
-
-        if !should_adopt_external_channel_drift(&self.last_volume_sent, channel, observed_volume) {
-            return;
-        }
-
-        self.update_channel_volume_intent(channel, observed_volume, event_tx);
-    }
-
-    fn apply_channel_volume_intents_for_channels(
-        &mut self,
-        channels: &BTreeSet<Channel>,
-        event_tx: &Sender<CoreEvent>,
-    ) {
-        for channel in channels {
-            let Some(intent_volume) = self.channel_volume_intents.get(channel).copied() else {
-                continue;
-            };
-
-            let applied = apply_channel_volume(
-                *channel,
-                intent_volume,
-                &self.last_snapshot,
-                &self.overrides,
-                ChannelControlTargets {
-                    virtual_input_source_name: VIRTUAL_SOURCES[0],
-                    main_output_sink_name: VENTURI_MAIN_OUTPUT,
-                },
-                &mut self.last_sink_volume_by_target,
-                &mut self.last_source_volume_by_target,
-            );
-
-            if applied.is_some() {
-                apply_snapshot_volume_hint(
-                    &mut self.last_snapshot,
-                    &self.overrides,
-                    *channel,
-                    intent_volume,
-                );
-                self.last_volume_sent.insert(
-                    *channel,
-                    LastSentVolume {
-                        sent_at: Instant::now(),
-                        volume: intent_volume,
-                    },
-                );
-                let _ = event_tx.send(CoreEvent::VolumeChanged(*channel, intent_volume));
-            }
-        }
-    }
-
-    fn apply_channel_volume_intents_for_active_categories(&mut self, event_tx: &Sender<CoreEvent>) {
-        let channels: BTreeSet<Channel> = self.channel_volume_intents.keys().copied().collect();
-        self.apply_channel_volume_intents_for_channels(&channels, event_tx);
-    }
-
-    fn collect_new_stream_intent_channels(
-        &self,
-        stream_ids_before: &BTreeSet<u32>,
-    ) -> BTreeSet<Channel> {
-        let mut channels = BTreeSet::new();
-
-        for (stream_id, stream) in &self.last_snapshot.streams {
-            if stream_ids_before.contains(stream_id) {
-                continue;
-            }
-
-            let channel = classify_with_priority(
-                &self.overrides,
-                Some(&stream.app_key),
-                Some(&stream.display_name),
-                stream.media_role.as_deref(),
-            );
-
-            if self.channel_volume_intents.contains_key(&channel) {
-                channels.insert(channel);
-            }
-        }
-
-        channels
     }
 
     fn emit_device_selection_changed(&self, event_tx: &Sender<CoreEvent>) {
@@ -1716,12 +1196,6 @@ impl CoreRuntimeState {
                     &output_ids_before,
                     event_tx,
                 );
-                apply_volume_intents_to_snapshot(
-                    &mut self.last_snapshot,
-                    &self.overrides,
-                    &self.channel_volume_intents,
-                );
-                self.apply_channel_volume_intents_for_active_categories(event_tx);
                 self.poll_selected_device_restore(event_tx, true);
                 // Update shared snapshot for meter worker
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
@@ -1811,33 +1285,15 @@ impl CoreRuntimeState {
                 if vol_changed {
                     self.last_snapshot.volumes.insert(id, new_vol);
 
-                    if let Some(channel) =
-                        node_id_to_channel(id, &self.last_snapshot, &self.overrides)
-                    {
+                    if let Some(channel) = node_id_to_channel(id, &self.last_snapshot, &self.overrides) {
                         let channel_volume = channel_volume_from_snapshot(
                             &self.last_snapshot,
                             &self.overrides,
                             channel,
                         )
                         .unwrap_or(new_vol);
-
-                        self.adopt_external_channel_volume_intent_if_drifted(
-                            channel,
-                            channel_volume,
-                            event_tx,
-                        );
-
-                        if should_emit_observed_channel_volume(
-                            channel,
-                            channel_volume,
-                            &self.last_snapshot,
-                            &self.overrides,
-                            &self.channel_volume_intents,
-                            &self.last_volume_sent,
-                        ) {
-                            let _ =
-                                event_tx.send(CoreEvent::VolumeChanged(channel, channel_volume));
-                        }
+                        let _ =
+                            event_tx.send(CoreEvent::VolumeChanged(channel, channel_volume));
                     }
                 }
             }
@@ -1863,149 +1319,7 @@ impl CoreRuntimeState {
         }
 
         self.route_stream_targets_for_reconcile(&stream_ids_before, &output_ids_before, event_tx);
-
-        let mut channels = self.collect_new_stream_intent_channels(&stream_ids_before);
-        channels.extend(collect_drifted_intent_channels(
-            &self.last_snapshot,
-            &self.overrides,
-            &self.channel_volume_intents,
-            &self.last_volume_sent,
-        ));
-        self.apply_channel_volume_intents_for_channels(&channels, event_tx);
     }
-}
-
-#[cfg(test)]
-fn compute_channel_level_updates_with<F>(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    max_stream_probes_per_channel: usize,
-    sample_target: F,
-) -> Vec<(crate::core::messages::Channel, (f32, f32))>
-where
-    F: FnMut(u32) -> Option<(f32, f32)>,
-{
-    let targets = limit_channel_level_targets(
-        &build_channel_level_targets(snapshot, overrides),
-        max_stream_probes_per_channel,
-    );
-    compute_channel_level_updates_for_targets_with(&targets, sample_target)
-}
-
-fn compute_channel_level_updates_for_targets_with<F>(
-    targets: &BTreeMap<crate::core::messages::Channel, Vec<u32>>,
-    mut sample_target: F,
-) -> Vec<(crate::core::messages::Channel, (f32, f32))>
-where
-    F: FnMut(u32) -> Option<(f32, f32)>,
-{
-    let mut updates = Vec::new();
-
-    for channel in [
-        crate::core::messages::Channel::Main,
-        crate::core::messages::Channel::Mic,
-        crate::core::messages::Channel::Game,
-        crate::core::messages::Channel::Media,
-        crate::core::messages::Channel::Chat,
-        crate::core::messages::Channel::Aux,
-    ] {
-        let mut left_peak = 0.0f32;
-        let mut right_peak = 0.0f32;
-
-        if let Some(ids) = targets.get(&channel) {
-            for id in ids {
-                if let Some((left, right)) = sample_target(*id) {
-                    left_peak = left_peak.max(left);
-                    right_peak = right_peak.max(right);
-                }
-            }
-        }
-
-        updates.push((channel, (left_peak, right_peak)));
-    }
-
-    updates
-}
-
-fn limit_channel_level_targets(
-    targets: &BTreeMap<crate::core::messages::Channel, Vec<u32>>,
-    per_channel_limit: usize,
-) -> BTreeMap<crate::core::messages::Channel, Vec<u32>> {
-    let mut limited = BTreeMap::new();
-    for (channel, ids) in targets {
-        limited.insert(
-            *channel,
-            ids.iter().take(per_channel_limit).copied().collect(),
-        );
-    }
-    limited
-}
-
-fn limit_channel_level_name_targets(
-    targets: &BTreeMap<crate::core::messages::Channel, Vec<String>>,
-    per_channel_limit: usize,
-) -> BTreeMap<crate::core::messages::Channel, Vec<String>> {
-    let mut limited = BTreeMap::new();
-    for (channel, ids) in targets {
-        limited.insert(
-            *channel,
-            ids.iter().take(per_channel_limit).cloned().collect(),
-        );
-    }
-    limited
-}
-
-fn collect_unique_level_targets(
-    targets: &BTreeMap<crate::core::messages::Channel, Vec<u32>>,
-) -> BTreeSet<u32> {
-    targets
-        .values()
-        .flat_map(|ids| ids.iter().copied())
-        .collect()
-}
-
-fn collect_unique_name_level_targets(
-    targets: &BTreeMap<crate::core::messages::Channel, Vec<String>>,
-) -> BTreeSet<String> {
-    targets
-        .values()
-        .flat_map(|ids| ids.iter().cloned())
-        .collect()
-}
-
-fn compute_channel_level_updates_for_name_targets_with<F>(
-    targets: &BTreeMap<crate::core::messages::Channel, Vec<String>>,
-    mut sample_target: F,
-) -> Vec<(crate::core::messages::Channel, (f32, f32))>
-where
-    F: FnMut(&str) -> Option<(f32, f32)>,
-{
-    let mut updates = Vec::new();
-
-    for channel in [
-        crate::core::messages::Channel::Main,
-        crate::core::messages::Channel::Mic,
-        crate::core::messages::Channel::Game,
-        crate::core::messages::Channel::Media,
-        crate::core::messages::Channel::Chat,
-        crate::core::messages::Channel::Aux,
-    ] {
-        let mut left_peak = 0.0f32;
-        let mut right_peak = 0.0f32;
-
-        if let Some(ids) = targets.get(&channel) {
-            for id in ids {
-                if let Some((left, right)) = sample_target(id.as_str()) {
-                    left_peak = left_peak.max(left);
-                    right_peak = right_peak.max(right);
-                }
-            }
-        }
-
-        updates.push((channel, (left_peak, right_peak)));
-    }
-
-    updates
 }
 
 /// Coalesce a batch of commands: keep only the last SetVolume per channel,
@@ -2020,8 +1334,10 @@ fn coalesce_commands(commands: Vec<CoreCommand>) -> Vec<CoreCommand> {
                 volume_map.insert(channel, vol);
             }
             CoreCommand::Shutdown => {
-                // Shutdown discards everything — pending volumes and remaining commands
-                return vec![CoreCommand::Shutdown];
+                // Shutdown discards pending volumes and remaining commands, but keeps
+                // previously queued non-volume commands in order.
+                result.push(CoreCommand::Shutdown);
+                return result;
             }
             other => {
                 result.push(other);
@@ -2048,23 +1364,17 @@ fn compute_level_sample_count(sample_rate_hz: u32, sample_interval: Duration) ->
 
 fn spawn_meter_worker(
     event_tx: Sender<CoreEvent>,
-    shared_snapshot: Arc<Mutex<Snapshot>>,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let paths = Paths::resolve();
         let level_sample_count = compute_level_sample_count(48_000, METER_SAMPLE_INTERVAL);
-        let mut meter_overrides = BTreeMap::new();
-        let mut last_override_refresh = Instant::now() - METER_OVERRIDE_REFRESH_INTERVAL;
         let mut last_meter_sample = Instant::now() - METER_SAMPLE_INTERVAL;
-        let mut cached_snapshot: Option<Snapshot> = None;
-        const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-        let mut last_snapshot_clone = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
-        let mut samplers: BTreeMap<u32, PwTargetSampler> = BTreeMap::new();
-        let mut stream_name_samplers: BTreeMap<String, PwTargetSampler> = BTreeMap::new();
+        let mut samplers: BTreeMap<Channel, PwTargetSampler> = BTreeMap::new();
+
         while running.load(Ordering::Relaxed) {
             if !enabled.load(Ordering::Relaxed) {
+                samplers.clear();
                 std::thread::sleep(METER_WORKER_IDLE_INTERVAL);
                 continue;
             }
@@ -2073,97 +1383,38 @@ fn spawn_meter_worker(
                 continue;
             }
             last_meter_sample = Instant::now();
-            if last_override_refresh.elapsed() >= METER_OVERRIDE_REFRESH_INTERVAL {
-                meter_overrides = deserialize_overrides(&load_config(&paths).categorizer.overrides);
-                last_override_refresh = Instant::now();
-            }
-            if last_snapshot_clone.elapsed() >= SNAPSHOT_REFRESH_INTERVAL
-                || cached_snapshot.is_none()
-            {
-                let snapshot = shared_snapshot.lock().unwrap().clone();
-                cached_snapshot = Some(snapshot);
-                last_snapshot_clone = Instant::now();
-            }
 
-            if let Some(snapshot) = cached_snapshot.as_ref() {
-                let mut targets = limit_channel_level_targets(
-                    &build_channel_level_targets(snapshot, &meter_overrides),
-                    MAX_STREAM_PROBES_PER_CHANNEL,
-                );
-                retain_primary_numeric_meter_targets(&mut targets);
-                let required_targets = collect_unique_level_targets(&targets);
-
-                let stream_name_targets = limit_channel_level_name_targets(
-                    &build_stream_name_level_targets(snapshot, &meter_overrides),
-                    MAX_STREAM_PROBES_PER_CHANNEL,
-                );
-                let required_stream_names = collect_unique_name_level_targets(&stream_name_targets);
-
-                samplers.retain(|target, _| required_targets.contains(target));
-                for target in &required_targets {
-                    if !samplers.contains_key(target)
-                        && let Ok(sampler) = PwTargetSampler::spawn(&target.to_string())
-                    {
-                        samplers.insert(*target, sampler);
+            for (channel, target_name) in &BUS_METER_TARGETS {
+                if !samplers.contains_key(channel) {
+                    if let Ok(sampler) = PwTargetSampler::spawn(target_name) {
+                        samplers.insert(*channel, sampler);
                     }
                 }
+            }
 
-                stream_name_samplers.retain(|target, _| required_stream_names.contains(target));
-                for target in &required_stream_names {
-                    if !stream_name_samplers.contains_key(target)
-                        && let Ok(sampler) = PwTargetSampler::spawn(target)
-                    {
-                        stream_name_samplers.insert(target.clone(), sampler);
-                    }
-                }
+            let mut updates = Vec::new();
+            let mut failed = Vec::new();
 
-                let mut failed_targets = BTreeSet::new();
-                let mut updates =
-                    compute_channel_level_updates_for_targets_with(&targets, |target_id| {
-                        let sampler = samplers.get_mut(&target_id)?;
-                        match sampler.sample_levels(level_sample_count) {
-                            Ok(levels) => Some(levels),
-                            Err(_) => {
-                                failed_targets.insert(target_id);
-                                None
-                            }
+            for (channel, _) in &BUS_METER_TARGETS {
+                let levels = if let Some(sampler) = samplers.get_mut(channel) {
+                    match sampler.sample_levels(level_sample_count) {
+                        Ok(levels) => levels,
+                        Err(_) => {
+                            failed.push(*channel);
+                            (0.0, 0.0)
                         }
-                    });
-
-                let mut failed_stream_names = BTreeSet::new();
-                let stream_name_updates = compute_channel_level_updates_for_name_targets_with(
-                    &stream_name_targets,
-                    |target_name| {
-                        let sampler = stream_name_samplers.get_mut(target_name)?;
-                        match sampler.sample_levels(level_sample_count) {
-                            Ok(levels) => Some(levels),
-                            Err(_) => {
-                                failed_stream_names.insert(target_name.to_string());
-                                None
-                            }
-                        }
-                    },
-                );
-
-                for channel in [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux] {
-                    if stream_name_targets.contains_key(&channel)
-                        && let Some((_, stream_levels)) =
-                            stream_name_updates.iter().find(|(ch, _)| *ch == channel)
-                        && let Some((_, numeric_levels)) =
-                            updates.iter_mut().find(|(ch, _)| *ch == channel)
-                    {
-                        *numeric_levels = *stream_levels;
                     }
-                }
-
-                for target in failed_targets {
-                    samplers.remove(&target);
-                }
-                for target in failed_stream_names {
-                    stream_name_samplers.remove(&target);
-                }
-                let _ = event_tx.send(CoreEvent::LevelsUpdate(updates));
+                } else {
+                    (0.0, 0.0)
+                };
+                updates.push((*channel, levels));
             }
+
+            for channel in failed {
+                samplers.remove(&channel);
+            }
+
+            let _ = event_tx.send(CoreEvent::LevelsUpdate(updates));
             std::thread::sleep(METER_WORKER_INTERVAL);
         }
     })
@@ -2172,11 +1423,12 @@ fn spawn_meter_worker(
 impl PipeWireManager {
     pub fn spawn(command_rx: Receiver<CoreCommand>, event_tx: Sender<CoreEvent>) -> Self {
         let meter_running = Arc::new(AtomicBool::new(true));
-        let meter_enabled = Arc::new(AtomicBool::new(true));
+        // Start disabled — the GUI sends SetMeteringEnabled(true) after the window is
+        // presented, which avoids pw-record connection pops during startup.
+        let meter_enabled = Arc::new(AtomicBool::new(false));
         let shared_snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let meter_handle = spawn_meter_worker(
             event_tx.clone(),
-            shared_snapshot.clone(),
             meter_running.clone(),
             meter_enabled.clone(),
         );
@@ -2311,20 +1563,15 @@ mod tests {
     use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, DeviceKind};
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
     use crate::core::pw_monitor::PwMonitorEvent;
-    use crate::core::router::RoutingMode;
-
     use super::{
-        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, EXTERNAL_INTENT_ADOPTION_WINDOW,
-        LastSentVolume, SoundboardPlaybackMode, apply_snapshot_volume_hint,
-        apply_structural_monitor_delta, apply_volume_intents_to_snapshot,
-        build_channel_level_targets, build_stream_name_level_targets, coalesce_commands,
-        collect_drifted_intent_channels, collect_new_stream_route_targets,
-        collect_stream_route_targets_for_reconcile, compute_channel_level_updates_with,
-        compute_level_sample_count, node_id_to_channel, parse_channel_volume_intents,
-        persisted_channel_mute, persisted_channel_volume, resolve_output_loopback_target,
-        selected_device_available, should_adopt_external_channel_drift,
-        should_emit_observed_channel_volume, should_skip_output_device_reconcile,
-        should_suppress_recent_echo, snapshot_channel_volumes, soundboard_playback_targets,
+        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, SoundboardPlaybackMode,
+        apply_snapshot_volume_hint, apply_structural_monitor_delta,
+        coalesce_commands, collect_new_stream_route_targets,
+        collect_stream_route_targets_for_reconcile,
+        compute_level_sample_count, node_id_to_channel, resolve_output_loopback_target,
+        selected_device_available,
+        should_skip_output_device_reconcile, snapshot_channel_volumes,
+        soundboard_playback_targets,
     };
 
     fn build_test_runtime_state(
@@ -2336,7 +1583,6 @@ mod tests {
         let hotkey_bindings = HotkeyBindings::from(&runtime_config.hotkeys);
 
         CoreRuntimeState {
-            routing_mode: RoutingMode::MetadataFirst,
             paths,
             runtime_config,
             hotkey_bindings,
@@ -2357,10 +1603,8 @@ mod tests {
             last_source_mute_by_target: BTreeMap::new(),
             runtime_state: State::default(),
             state_saver: DebouncedSaver::new(),
-            channel_volume_intents: BTreeMap::new(),
             soundboard_players: BTreeMap::new(),
             meter_enabled: Arc::new(AtomicBool::new(true)),
-            last_volume_sent: BTreeMap::new(),
             shared_snapshot: Arc::new(Mutex::new(Snapshot::default())),
             consecutive_failures: 0,
             first_failure_at: Instant::now(),
@@ -2372,75 +1616,15 @@ mod tests {
     }
 
     #[test]
-    fn full_soundboard_playback_targets_virtual_mic_and_main_output() {
+    fn full_soundboard_playback_targets_sound_sink_and_main_output() {
         let targets = soundboard_playback_targets(SoundboardPlaybackMode::Full);
-        assert_eq!(targets, vec!["input.Venturi-VirtualMic", "Venturi-Output"]);
+        assert_eq!(targets, vec!["Venturi-Sound", "Venturi-Output"]);
     }
 
     #[test]
     fn preview_soundboard_playback_targets_main_output_only() {
         let targets = soundboard_playback_targets(SoundboardPlaybackMode::Preview);
         assert_eq!(targets, vec!["Venturi-Output"]);
-    }
-
-    #[test]
-    fn builds_level_targets_for_main_mic_and_classified_stream_channels() {
-        let mut snapshot = Snapshot::default();
-        snapshot
-            .output_ids
-            .insert("Venturi-Output".to_string(), 128);
-        snapshot
-            .input_ids
-            .insert("Venturi-VirtualMic".to_string(), 281);
-        snapshot
-            .output_meter_targets
-            .insert("Venturi-Output".to_string(), 37284);
-        snapshot
-            .input_meter_targets
-            .insert("Venturi-VirtualMic".to_string(), 37393);
-        snapshot.streams.insert(
-            900,
-            StreamInfo {
-                id: 900,
-                meter_target: 9900,
-                node_name: Some("discord-node".to_string()),
-                is_corked: false,
-                app_key: "discord".to_string(),
-                display_name: "Discord".to_string(),
-                media_role: Some("communication".to_string()),
-            },
-        );
-        snapshot.streams.insert(
-            901,
-            StreamInfo {
-                id: 901,
-                meter_target: 9901,
-                node_name: Some("spotify-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-        snapshot.streams.insert(
-            902,
-            StreamInfo {
-                id: 902,
-                meter_target: 9902,
-                node_name: Some("paused-node".to_string()),
-                is_corked: true,
-                app_key: "paused-app".to_string(),
-                display_name: "Paused App".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-
-        let targets = build_channel_level_targets(&snapshot, &BTreeMap::new());
-
-        assert_eq!(targets.get(&Channel::Main), Some(&vec![37284]));
-        assert_eq!(targets.get(&Channel::Mic), Some(&vec![37393]));
-        assert_eq!(targets.get(&Channel::Chat), Some(&vec![9900]));
-        assert_eq!(targets.get(&Channel::Media), Some(&vec![9901]));
     }
 
     #[test]
@@ -2512,258 +1696,6 @@ mod tests {
         let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
 
         assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.33));
-    }
-
-    #[test]
-    fn startup_snapshot_uses_metadata_intent_for_category_volume() {
-        let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Media".to_string(), 333);
-        snapshot.streams.insert(
-            100,
-            StreamInfo {
-                id: 100,
-                meter_target: 9100,
-                node_name: Some("media-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-        snapshot.volumes.insert(100, 0.03);
-        snapshot.volumes.insert(333, 0.14);
-
-        let mut intents = BTreeMap::new();
-        intents.insert(Channel::Media, 0.50);
-
-        apply_volume_intents_to_snapshot(&mut snapshot, &BTreeMap::new(), &intents);
-
-        let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
-        assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.50));
-        assert_eq!(snapshot.volumes.get(&100).copied(), Some(0.03));
-        assert_eq!(snapshot.volumes.get(&333).copied(), Some(0.50));
-    }
-
-    #[test]
-    fn parses_channel_volume_intents_from_pw_metadata_output() {
-        let raw = r#"
-Found "settings" metadata 31
-update: id:0 key:'venturi.channel.media.volume' value:'0.50' type:'(null)'
-update: id:0 key:'venturi.channel.chat.volume' value:'0.25' type:'(null)'
-update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
-"#;
-
-        let intents = parse_channel_volume_intents(raw);
-
-        assert_eq!(intents.get(&Channel::Media).copied(), Some(0.50));
-        assert_eq!(intents.get(&Channel::Chat).copied(), Some(0.25));
-        assert_eq!(intents.get(&Channel::Game), None);
-    }
-
-    #[test]
-    fn detects_drifted_category_intent_channels_from_snapshot_volume() {
-        let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
-        snapshot.volumes.insert(444, 0.27);
-
-        let mut intents = BTreeMap::new();
-        intents.insert(Channel::Media, 0.60);
-
-        let drifted = collect_drifted_intent_channels(
-            &snapshot,
-            &BTreeMap::new(),
-            &intents,
-            &BTreeMap::new(),
-        );
-
-        assert_eq!(drifted, BTreeSet::from([Channel::Media]));
-    }
-
-    #[test]
-    fn suppresses_drifted_intent_reapply_for_recent_matching_echo() {
-        let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
-        snapshot.volumes.insert(444, 0.60);
-
-        let mut intents = BTreeMap::new();
-        intents.insert(Channel::Media, 0.60);
-
-        let mut last_sent = BTreeMap::new();
-        last_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: std::time::Instant::now(),
-                volume: 0.60,
-            },
-        );
-
-        let drifted =
-            collect_drifted_intent_channels(&snapshot, &BTreeMap::new(), &intents, &last_sent);
-
-        assert!(drifted.is_empty());
-    }
-
-    #[test]
-    fn suppresses_observed_volume_emit_while_channel_is_drifted_from_intent() {
-        let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
-        snapshot.volumes.insert(444, 0.19);
-
-        let mut intents = BTreeMap::new();
-        intents.insert(Channel::Media, 0.57);
-
-        let should_emit = should_emit_observed_channel_volume(
-            Channel::Media,
-            0.19,
-            &snapshot,
-            &BTreeMap::new(),
-            &intents,
-            &BTreeMap::new(),
-        );
-
-        assert!(!should_emit);
-    }
-
-    #[test]
-    fn external_drift_is_adopted_after_grace_window() {
-        let mut last_sent = BTreeMap::new();
-        last_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: Instant::now()
-                    - EXTERNAL_INTENT_ADOPTION_WINDOW
-                    - Duration::from_millis(1),
-                volume: 0.42,
-            },
-        );
-
-        assert!(should_adopt_external_channel_drift(
-            &last_sent,
-            Channel::Media,
-            0.42,
-        ));
-    }
-
-    #[test]
-    fn external_drift_is_not_adopted_during_grace_window() {
-        let mut last_sent = BTreeMap::new();
-        last_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: Instant::now(),
-                volume: 0.42,
-            },
-        );
-
-        assert!(!should_adopt_external_channel_drift(
-            &last_sent,
-            Channel::Media,
-            0.42,
-        ));
-    }
-
-    #[test]
-    fn external_drift_is_adopted_immediately_when_volume_diverges() {
-        let mut last_sent = BTreeMap::new();
-        last_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: Instant::now(),
-                volume: 0.80,
-            },
-        );
-
-        assert!(should_adopt_external_channel_drift(
-            &last_sent,
-            Channel::Media,
-            0.25,
-        ));
-    }
-
-    #[test]
-    fn runtime_state_adopts_external_drifted_intent_after_grace_window() {
-        let mut state = build_test_runtime_state(None, None);
-        state.channel_volume_intents.insert(Channel::Media, 0.80);
-        state.last_volume_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: Instant::now()
-                    - EXTERNAL_INTENT_ADOPTION_WINDOW
-                    - Duration::from_millis(1),
-                volume: 0.80,
-            },
-        );
-        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
-
-        state.adopt_external_channel_volume_intent_if_drifted(Channel::Media, 0.25, &event_tx);
-
-        assert_eq!(
-            state.channel_volume_intents.get(&Channel::Media),
-            Some(&0.25)
-        );
-    }
-
-    #[test]
-    fn runtime_state_does_not_adopt_recent_matching_echo_too_soon() {
-        let mut state = build_test_runtime_state(None, None);
-        state.channel_volume_intents.insert(Channel::Media, 0.80);
-        state.last_volume_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: Instant::now(),
-                volume: 0.80,
-            },
-        );
-        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
-
-        state.adopt_external_channel_volume_intent_if_drifted(Channel::Media, 0.79, &event_tx);
-
-        assert_eq!(
-            state.channel_volume_intents.get(&Channel::Media),
-            Some(&0.80)
-        );
-    }
-
-    #[test]
-    fn runtime_state_adopts_external_drifted_intent_immediately_when_volume_differs() {
-        let mut state = build_test_runtime_state(None, None);
-        state.channel_volume_intents.insert(Channel::Media, 0.80);
-        state.last_volume_sent.insert(
-            Channel::Media,
-            LastSentVolume {
-                sent_at: Instant::now(),
-                volume: 0.80,
-            },
-        );
-        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
-
-        state.adopt_external_channel_volume_intent_if_drifted(Channel::Media, 0.25, &event_tx);
-
-        assert_eq!(
-            state.channel_volume_intents.get(&Channel::Media),
-            Some(&0.25)
-        );
-    }
-
-    #[test]
-    fn emits_observed_volume_when_intent_matches_channel_volume() {
-        let mut snapshot = Snapshot::default();
-        snapshot.output_ids.insert("Venturi-Media".to_string(), 444);
-        snapshot.volumes.insert(444, 0.57);
-
-        let mut intents = BTreeMap::new();
-        intents.insert(Channel::Media, 0.57);
-
-        let should_emit = should_emit_observed_channel_volume(
-            Channel::Media,
-            0.57,
-            &snapshot,
-            &BTreeMap::new(),
-            &intents,
-            &BTreeMap::new(),
-        );
-
-        assert!(should_emit);
     }
 
     #[test]
@@ -2948,88 +1880,6 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
-    fn meter_updates_respect_category_overrides() {
-        let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(
-            901,
-            StreamInfo {
-                id: 901,
-                meter_target: 9901,
-                node_name: Some("zen-node".to_string()),
-                is_corked: false,
-                app_key: "zen-bin".to_string(),
-                display_name: "Zen".to_string(),
-                media_role: None,
-            },
-        );
-
-        let mut overrides = BTreeMap::new();
-        overrides.insert("zen-bin".to_string(), Channel::Media);
-
-        let updates = compute_channel_level_updates_with(&snapshot, &overrides, 1, |target_id| {
-            if target_id == 9901 {
-                Some((0.4, 0.5))
-            } else {
-                None
-            }
-        });
-
-        let media = updates
-            .iter()
-            .find(|(channel, _)| *channel == Channel::Media)
-            .map(|(_, levels)| *levels)
-            .expect("media channel update");
-        let aux = updates
-            .iter()
-            .find(|(channel, _)| *channel == Channel::Aux)
-            .map(|(_, levels)| *levels)
-            .expect("aux channel update");
-
-        assert!(media.0 > 0.0 || media.1 > 0.0);
-        assert_eq!(aux, (0.0, 0.0));
-    }
-
-    #[test]
-    fn stream_name_targets_use_stream_node_names() {
-        let mut snapshot = Snapshot::default();
-        snapshot.streams.insert(
-            900,
-            StreamInfo {
-                id: 900,
-                meter_target: 9900,
-                node_name: Some("discord-node".to_string()),
-                is_corked: false,
-                app_key: "discord".to_string(),
-                display_name: "Discord".to_string(),
-                media_role: Some("communication".to_string()),
-            },
-        );
-        snapshot.streams.insert(
-            901,
-            StreamInfo {
-                id: 901,
-                meter_target: 9901,
-                node_name: Some("spotify-node".to_string()),
-                is_corked: false,
-                app_key: "spotify".to_string(),
-                display_name: "Spotify".to_string(),
-                media_role: Some("music".to_string()),
-            },
-        );
-
-        let targets = build_stream_name_level_targets(&snapshot, &BTreeMap::new());
-
-        assert_eq!(
-            targets.get(&Channel::Chat),
-            Some(&vec!["discord-node".to_string()])
-        );
-        assert_eq!(
-            targets.get(&Channel::Media),
-            Some(&vec!["spotify-node".to_string()])
-        );
-    }
-
-    #[test]
     fn collects_route_targets_for_new_streams_from_classification() {
         let mut snapshot = Snapshot::default();
         snapshot.streams.insert(
@@ -3107,16 +1957,6 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
             compute_level_sample_count(48_000, Duration::from_millis(1)),
             48
         );
-    }
-
-    #[test]
-    fn reads_persisted_volume_and_mute_for_channel() {
-        let mut state = State::default();
-        state.volumes.chat = 0.42;
-        state.muted.chat = true;
-
-        assert!((persisted_channel_volume(&state, Channel::Chat) - 0.42).abs() < 0.0001);
-        assert!(persisted_channel_mute(&state, Channel::Chat));
     }
 
     #[test]
@@ -3357,11 +2197,14 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
             "stream id should be pruned when reassigned to source"
         );
 
-        let targets = build_channel_level_targets(&snapshot, &overrides);
-        assert_eq!(targets.get(&Channel::Mic), Some(&vec![225]));
+        assert_eq!(
+            snapshot.input_ids.get("Venturi-VirtualMic"),
+            Some(&225),
+            "mic source should be mapped to reassigned id"
+        );
         assert!(
-            !targets.contains_key(&Channel::Media),
-            "media target must not persist with reassigned mic source id"
+            snapshot.streams.is_empty(),
+            "media stream must not persist with reassigned mic source id"
         );
 
         let removed = event_rx
@@ -3422,6 +2265,22 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     }
 
     #[test]
+    fn coalesce_preserves_non_volume_commands_before_shutdown() {
+        let commands = vec![
+            CoreCommand::RequestSnapshot,
+            CoreCommand::SetVolume(Channel::Main, 0.5),
+            CoreCommand::Shutdown,
+            CoreCommand::SetMute(Channel::Game, true),
+        ];
+
+        let result = coalesce_commands(commands);
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], CoreCommand::RequestSnapshot));
+        assert!(matches!(result[1], CoreCommand::Shutdown));
+    }
+
+    #[test]
     fn coalesce_shutdown_discards_remaining() {
         let commands = vec![
             CoreCommand::SetVolume(Channel::Main, 0.5),
@@ -3438,112 +2297,6 @@ update: id:113 key:'target.node' value:'Venturi-Media' type:'(null)'
     fn coalesce_empty_batch_returns_empty() {
         let result = coalesce_commands(vec![]);
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn echo_suppression_blocks_recent_volume_changes() {
-        use std::time::{Duration, Instant};
-
-        let mut last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
-        let channel = Channel::Main;
-
-        // Simulate: we just sent a volume command
-        last_volume_sent.insert(
-            channel,
-            LastSentVolume {
-                sent_at: Instant::now(),
-                volume: 0.80,
-            },
-        );
-
-        // Check suppression — should be suppressed (within 200ms)
-        let suppressed = should_suppress_recent_echo(
-            last_volume_sent.get(&channel),
-            0.80,
-            Duration::from_millis(200),
-            0.01,
-        );
-        assert!(
-            suppressed,
-            "volume change within 200ms should be suppressed"
-        );
-    }
-
-    #[test]
-    fn echo_suppression_allows_recent_server_corrected_volume() {
-        use std::time::{Duration, Instant};
-
-        let mut last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
-        let channel = Channel::Main;
-
-        // Simulate: we just sent 100%
-        last_volume_sent.insert(
-            channel,
-            LastSentVolume {
-                sent_at: Instant::now(),
-                volume: 1.0,
-            },
-        );
-
-        // PipeWire reports a rounded/corrected value shortly after.
-        let suppressed = should_suppress_recent_echo(
-            last_volume_sent.get(&channel),
-            0.98,
-            Duration::from_millis(200),
-            0.01,
-        );
-
-        assert!(
-            !suppressed,
-            "recent volume correction should NOT be suppressed"
-        );
-    }
-
-    #[test]
-    fn echo_suppression_allows_old_volume_changes() {
-        use std::time::{Duration, Instant};
-
-        let mut last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
-        let channel = Channel::Main;
-
-        // Simulate: we sent a volume command 300ms ago
-        last_volume_sent.insert(
-            channel,
-            LastSentVolume {
-                sent_at: Instant::now() - Duration::from_millis(300),
-                volume: 0.65,
-            },
-        );
-
-        let suppressed = should_suppress_recent_echo(
-            last_volume_sent.get(&channel),
-            0.65,
-            Duration::from_millis(200),
-            0.01,
-        );
-        assert!(
-            !suppressed,
-            "volume change after 200ms should NOT be suppressed"
-        );
-    }
-
-    #[test]
-    fn echo_suppression_allows_unseen_channels() {
-        use std::time::Duration;
-
-        let last_volume_sent: BTreeMap<Channel, LastSentVolume> = BTreeMap::new();
-        let channel = Channel::Game;
-
-        let suppressed = should_suppress_recent_echo(
-            last_volume_sent.get(&channel),
-            0.33,
-            Duration::from_millis(200),
-            0.01,
-        );
-        assert!(
-            !suppressed,
-            "channel with no prior send should NOT be suppressed"
-        );
     }
 
     #[test]

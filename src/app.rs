@@ -77,17 +77,6 @@ impl<G: GuiLauncher> AppRunner<G> {
             "core did not become ready",
         )?;
 
-        bootstrap
-            .command_tx
-            .send(CoreCommand::Ping)
-            .map_err(|e| e.to_string())?;
-        wait_for_event(
-            &bootstrap.event_rx,
-            std::time::Duration::from_secs(1),
-            |event| matches!(event, CoreEvent::Pong),
-            "core did not answer ping",
-        )?;
-
         let paths = Paths::resolve();
         let config = load_config(&paths);
         let _tray = if should_create_tray(config.general.show_tray_icon) {

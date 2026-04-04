@@ -25,9 +25,12 @@ pub(crate) struct Snapshot {
     pub volumes: BTreeMap<u32, f32>,
 }
 
-/// Extract the maximum linear volume from a PipeWire node's channelVolumes property.
+/// Extract the volume from a PipeWire node's channelVolumes property, converted to linear scale.
 ///
-/// Looks at `info.params.Props[].channelVolumes` and returns the max across channels.
+/// PipeWire stores `channelVolumes` in cubic scale (where `linear^3 = channelVolume`).
+/// This converts back to the linear scale that `wpctl set-volume` / `wpctl get-volume` use,
+/// so slider values correspond 1:1 with what users see in system tools.
+///
 /// Returns `None` if the node has no volume information.
 pub(crate) fn extract_volume(item: &serde_json::Value) -> Option<f32> {
     let props_array = item.get("info")?.get("params")?.get("Props")?.as_array()?;
@@ -37,10 +40,22 @@ pub(crate) fn extract_volume(item: &serde_json::Value) -> Option<f32> {
                 .iter()
                 .filter_map(|v| v.as_f64())
                 .fold(0.0_f64, f64::max);
-            return Some(max_vol as f32);
+            return Some(cubic_to_linear(max_vol as f32));
         }
     }
     None
+}
+
+/// Convert PipeWire cubic volume to linear scale.
+///
+/// PipeWire internally stores volumes as `linear^3`. This reverses that
+/// to match `wpctl get-volume` output (the scale users interact with).
+fn cubic_to_linear(cubic: f32) -> f32 {
+    if cubic <= 0.0 {
+        0.0
+    } else {
+        cubic.cbrt()
+    }
 }
 
 pub(crate) fn parse_pw_dump(
@@ -501,35 +516,38 @@ mod tests {
     }
 
     #[test]
-    fn extract_volume_from_node_with_channel_volumes() {
+    fn extract_volume_converts_cubic_to_linear() {
+        // PipeWire stores channelVolumes in cubic scale.
+        // 0.5^3 = 0.125, so channelVolumes=[0.125] should yield linear ≈ 0.5
         let node: serde_json::Value = serde_json::json!({
             "id": 42,
             "info": {
                 "params": {
                     "Props": [
-                        { "channelVolumes": [0.7, 0.7] }
+                        { "channelVolumes": [0.125, 0.125] }
                     ]
                 }
             }
         });
-        assert_eq!(extract_volume(&node), Some(0.7));
+        let vol = extract_volume(&node).unwrap();
+        assert!((vol - 0.5).abs() < 0.001);
     }
 
     #[test]
-    fn extract_volume_picks_max_channel() {
+    fn extract_volume_picks_max_channel_and_converts() {
+        // 0.8^3 = 0.512, 0.4^3 = 0.064
         let node: serde_json::Value = serde_json::json!({
             "id": 42,
             "info": {
                 "params": {
                     "Props": [
-                        { "channelVolumes": [0.3, 0.9] }
+                        { "channelVolumes": [0.064, 0.512] }
                     ]
                 }
             }
         });
-        // Max of channels
         let vol = extract_volume(&node).unwrap();
-        assert!((vol - 0.9).abs() < 0.001);
+        assert!((vol - 0.8).abs() < 0.001);
     }
 
     #[test]

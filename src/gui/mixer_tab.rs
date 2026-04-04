@@ -9,12 +9,8 @@ use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::messages::{DeviceEntry, DeviceKind};
 use crate::core::meter::decay_peak;
 use crate::gui::app_chip::{AppChip, ChipStatus, DndPayload, build_chip_widget};
-use crate::gui::channel_strip::{
-    ChannelStrip, SliderHandle, build_strip_widget_with_meter, linear_to_slider_fraction,
-};
+use crate::gui::channel_strip::{ChannelStrip, SliderHandle, build_strip_widget_with_meter};
 use gtk::prelude::*;
-use venturi_application::AppEvent;
-use venturi_domain::StableDeviceId;
 
 pub const NO_DEVICES_FOUND: &str = "No devices found";
 
@@ -189,14 +185,6 @@ impl MixerTab {
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
             _ => {}
-        }
-    }
-
-    pub fn apply_runtime_event(&mut self, event: &AppEvent) {
-        if let AppEvent::MeterUpdated(snapshot) = event {
-            let channel: Channel = snapshot.channel.into();
-            self.levels.insert(channel, (snapshot.level, snapshot.peak));
-            self.ui_dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -410,7 +398,7 @@ pub fn build_mixer_widget(
             {
                 state.devices.set_selected_output(chosen.clone());
                 state.mark_ui_dirty();
-                let _ = tx.send(CoreCommand::typed_select_output(StableDeviceId(chosen)));
+                let _ = tx.send(CoreCommand::SetOutputDevice(chosen));
             }
         });
     }
@@ -434,7 +422,7 @@ pub fn build_mixer_widget(
             {
                 state.devices.set_selected_input(chosen.clone());
                 state.mark_ui_dirty();
-                let _ = tx.send(CoreCommand::typed_select_input(StableDeviceId(chosen)));
+                let _ = tx.send(CoreCommand::SetInputDevice(chosen));
             }
         });
     }
@@ -618,7 +606,7 @@ pub fn build_mixer_widget(
                     let max_fraction = state
                         .strips
                         .get(&channel)
-                        .map(|strip| linear_to_slider_fraction(strip.volume_linear))
+                        .map(|strip| strip.volume_linear.clamp(0.0, 1.0))
                         .unwrap_or(1.0);
                     let current = meter_display_fraction(left.max(right), max_fraction);
                     let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
@@ -788,7 +776,7 @@ fn compute_slider_sync_update(
     current_slider_value: f64,
     strip_data: &ChannelStrip,
 ) -> (Option<f64>, String) {
-    let model_volume = linear_to_slider_fraction(strip_data.volume_linear) as f64;
+    let model_volume = strip_data.volume_linear.clamp(0.0, 1.0) as f64;
     let next_slider_value =
         ((current_slider_value - model_volume).abs() > 0.005).then_some(model_volume);
     (next_slider_value, strip_data.volume_text())
@@ -935,15 +923,15 @@ mod tests {
             muted: false,
         };
 
-        let current_slider = super::linear_to_slider_fraction(0.26) as f64;
+        let current_slider = 0.26;
         let (next_slider, next_label) = compute_slider_sync_update(current_slider, &strip);
 
         assert_eq!(next_slider, None);
-        assert_eq!(next_label, "64%");
+        assert_eq!(next_label, "26%");
     }
 
     #[test]
-    fn compute_slider_sync_update_uses_os_style_slider_scale() {
+    fn compute_slider_sync_update_realigns_slider_with_linear_model_volume() {
         let strip = ChannelStrip {
             channel: Channel::Media,
             icon: "🎵",
@@ -954,8 +942,12 @@ mod tests {
 
         let (next_slider, next_label) = compute_slider_sync_update(0.75, &strip);
 
-        assert_eq!(next_slider, None);
-        assert_eq!(next_label, "75%");
+        let next_slider_value = match next_slider {
+            Some(value) => value,
+            None => panic!("expected slider to resync to model volume"),
+        };
+        assert!((next_slider_value - 0.421_875).abs() < 0.0001);
+        assert_eq!(next_label, "42%");
     }
 
     #[test]

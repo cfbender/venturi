@@ -2,7 +2,11 @@ use crate::config::schema;
 use crate::core::messages::{Channel, CoreCommand};
 use std::collections::VecDeque;
 #[cfg(test)]
-use venturi_platform_adapter::HotkeyAction;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HotkeyAction {
+    Pressed { chord: String },
+    Released { chord: String },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyBackend {
@@ -161,7 +165,7 @@ pub fn commands_for_hotkey_event(
     }
 
     if bindings.matches_press(event, &bindings.toggle_window) {
-        return vec![CoreCommand::typed_toggle_window()];
+        return vec![CoreCommand::ToggleWindow];
     }
 
     Vec::new()
