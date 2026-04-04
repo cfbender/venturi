@@ -104,7 +104,7 @@ pub fn build_strip_widget_with_meter(
     meter.set_can_target(false);
     meter.set_visible(false);
     meter.add_css_class("slider-meter");
-    meter.add_css_class(meter_css_class_for(channel));
+    meter.add_css_class(&meter_css_class_for(channel));
 
     let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
     slider.set_value(linear_to_slider_fraction(state.borrow().volume_linear) as f64);
@@ -113,14 +113,7 @@ pub fn build_strip_widget_with_meter(
     slider.set_margin_top(TRACK_TOP_INSET_PX);
     slider.set_margin_bottom(SLIDER_BOTTOM_OFFSET_ADJUST_PX);
 
-    match channel {
-        Channel::Main => slider.add_css_class("slider-main"),
-        Channel::Mic => slider.add_css_class("slider-mic"),
-        Channel::Game => slider.add_css_class("slider-game"),
-        Channel::Media => slider.add_css_class("slider-media"),
-        Channel::Chat => slider.add_css_class("slider-chat"),
-        Channel::Aux => slider.add_css_class("slider-aux"),
-    }
+    slider.add_css_class(&format!("slider-{}", channel.css_class()));
 
     let db_label = gtk::Label::new(Some(&state.borrow().volume_text()));
     let last_sent_at = Rc::new(RefCell::new(Instant::now() - Duration::from_secs(1)));
@@ -219,15 +212,8 @@ fn release_volume_command(state: &mut ChannelStrip, slider_value: f64) -> CoreCo
     state.set_volume_command(slider_fraction_to_linear(slider_value))
 }
 
-fn meter_css_class_for(channel: Channel) -> &'static str {
-    match channel {
-        Channel::Main => "meter-main",
-        Channel::Mic => "meter-mic",
-        Channel::Game => "meter-game",
-        Channel::Media => "meter-media",
-        Channel::Chat => "meter-chat",
-        Channel::Aux => "meter-aux",
-    }
+fn meter_css_class_for(channel: Channel) -> String {
+    format!("meter-{}", channel.css_class())
 }
 
 #[cfg(test)]
@@ -243,6 +229,16 @@ mod tests {
         assert_eq!(super::meter_css_class_for(Channel::Media), "meter-media");
         assert_eq!(super::meter_css_class_for(Channel::Chat), "meter-chat");
         assert_eq!(super::meter_css_class_for(Channel::Aux), "meter-aux");
+    }
+
+    #[test]
+    fn channel_css_class_returns_correct_suffix() {
+        assert_eq!(Channel::Main.css_class(), "main");
+        assert_eq!(Channel::Game.css_class(), "game");
+        assert_eq!(Channel::Media.css_class(), "media");
+        assert_eq!(Channel::Chat.css_class(), "chat");
+        assert_eq!(Channel::Aux.css_class(), "aux");
+        assert_eq!(Channel::Mic.css_class(), "mic");
     }
 
     #[test]

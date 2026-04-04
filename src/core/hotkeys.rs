@@ -203,10 +203,10 @@ fn event_from_action(action: HotkeyAction) -> HotkeyEvent {
 }
 
 fn normalize_chord(raw: &str) -> String {
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
-    let mut super_key = false;
+    let mut has_ctrl = false;
+    let mut has_alt = false;
+    let mut has_shift = false;
+    let mut has_super = false;
     let mut keys = Vec::new();
 
     for token in raw.split('+') {
@@ -216,30 +216,37 @@ fn normalize_chord(raw: &str) -> String {
         }
 
         match normalized.as_str() {
-            "ctrl" | "control" | "primary" => ctrl = true,
-            "alt" | "option" => alt = true,
-            "shift" => shift = true,
-            "super" | "meta" | "win" | "cmd" | "command" => super_key = true,
+            "ctrl" | "control" | "primary" => has_ctrl = true,
+            "alt" | "option" => has_alt = true,
+            "shift" => has_shift = true,
+            "super" | "meta" | "win" | "cmd" | "command" => has_super = true,
             _ => keys.push(normalized),
         }
     }
 
-    let mut parts = Vec::new();
-    if ctrl {
-        parts.push("ctrl".to_string());
+    // Build canonical order: ctrl, alt, shift, super, then keys
+    let mut parts: Vec<&str> = Vec::with_capacity(4 + keys.len());
+    if has_ctrl {
+        parts.push("ctrl");
     }
-    if alt {
-        parts.push("alt".to_string());
+    if has_alt {
+        parts.push("alt");
     }
-    if shift {
-        parts.push("shift".to_string());
+    if has_shift {
+        parts.push("shift");
     }
-    if super_key {
-        parts.push("super".to_string());
+    if has_super {
+        parts.push("super");
     }
-    parts.extend(keys);
 
-    parts.join("+")
+    let mut result = parts.join("+");
+    if !keys.is_empty() {
+        if !result.is_empty() {
+            result.push('+');
+        }
+        result.push_str(&keys.join("+"));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -248,8 +255,8 @@ mod tests {
     use crate::core::messages::{Channel, CoreCommand};
 
     use super::{
-        HotkeyBindings, HotkeyEvent, HotkeyState, action_from_event, commands_for_hotkey_event,
-        event_from_action,
+        action_from_event, commands_for_hotkey_event, event_from_action, HotkeyBindings,
+        HotkeyEvent, HotkeyState,
     };
 
     #[test]

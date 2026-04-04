@@ -34,15 +34,7 @@ impl DndPayload {
         let mut parts = raw.split('|');
         let stream_id = parts.next()?.parse::<u32>().ok()?;
         let app_key = parts.next()?.to_string();
-        let channel = match parts.next()? {
-            "Main" => Channel::Main,
-            "Game" => Channel::Game,
-            "Media" => Channel::Media,
-            "Chat" => Channel::Chat,
-            "Aux" => Channel::Aux,
-            "Mic" => Channel::Mic,
-            _ => return None,
-        };
+        let channel = parts.next()?.parse().ok()?;
 
         if parts.next().is_some() {
             return None;
@@ -82,14 +74,7 @@ pub fn build_chip_widget(chip: &AppChip) -> gtk::Button {
     let button = gtk::Button::builder().child(&row).build();
     button.add_css_class("flat");
     button.add_css_class("chip-button");
-    match chip.channel {
-        Channel::Main => button.add_css_class("chip-main"),
-        Channel::Mic => button.add_css_class("chip-mic"),
-        Channel::Game => button.add_css_class("chip-game"),
-        Channel::Media => button.add_css_class("chip-media"),
-        Channel::Chat => button.add_css_class("chip-chat"),
-        Channel::Aux => button.add_css_class("chip-aux"),
-    }
+    button.add_css_class(&format!("chip-{}", chip.channel.css_class()));
     button.set_halign(gtk::Align::Center);
     button.set_valign(gtk::Align::Start);
     button.set_hexpand(false);

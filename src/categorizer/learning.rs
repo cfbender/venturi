@@ -47,13 +47,5 @@ fn channel_to_config(channel: Channel) -> &'static str {
 }
 
 fn channel_from_config(raw: &str) -> Option<Channel> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "main" => Some(Channel::Main),
-        "game" => Some(Channel::Game),
-        "media" => Some(Channel::Media),
-        "chat" => Some(Channel::Chat),
-        "aux" => Some(Channel::Aux),
-        "mic" => Some(Channel::Mic),
-        _ => None,
-    }
+    raw.parse().ok()
 }

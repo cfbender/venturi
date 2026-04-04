@@ -8,6 +8,36 @@ pub enum Channel {
     Mic,
 }
 
+impl std::str::FromStr for Channel {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "main" => Ok(Self::Main),
+            "game" => Ok(Self::Game),
+            "media" => Ok(Self::Media),
+            "chat" => Ok(Self::Chat),
+            "aux" => Ok(Self::Aux),
+            "mic" => Ok(Self::Mic),
+            _ => Err(()),
+        }
+    }
+}
+
+impl Channel {
+    /// Returns the CSS class suffix for this channel (e.g., "main", "game", etc.)
+    pub const fn css_class(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Game => "game",
+            Self::Media => "media",
+            Self::Chat => "chat",
+            Self::Aux => "aux",
+            Self::Mic => "mic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreCommand {
     SetVolume(Channel, f32),

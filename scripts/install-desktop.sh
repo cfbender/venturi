@@ -83,7 +83,7 @@ install() {
     mkdir -p "$APP_DIR" "$ICON_DIR" "$AUTOSTART_DIR"
 
     # Application launcher entry (with absolute path to binary)
-    cat > "$APP_DIR/$DESKTOP_FILE" <<EOF
+    cat >"$APP_DIR/$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Venturi
@@ -100,13 +100,12 @@ EOF
     cp "$PROJECT_DIR/data/$ICON_FILE" "$ICON_DIR/$ICON_FILE"
     echo "  Installed $ICON_DIR/$ICON_FILE"
 
-    # Autostart entry (launches in daemon mode so it runs in the tray)
-    cat > "$AUTOSTART_DIR/$AUTOSTART_FILE" <<EOF
+    cat >"$AUTOSTART_DIR/$AUTOSTART_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Venturi
 Comment=Linux audio mixer for PipeWire
-Exec=$venturi_bin --daemon
+Exec=$venturi_bin
 Icon=org.venturi.Venturi
 Categories=AudioVideo;Audio;
 Terminal=false
@@ -122,14 +121,14 @@ EOF
 }
 
 case "${1:-install}" in
-    remove|uninstall)
-        remove
-        ;;
-    install|"")
-        install
-        ;;
-    *)
-        echo "Usage: $0 [install|remove]"
-        exit 1
-        ;;
+remove | uninstall)
+    remove
+    ;;
+install | "")
+    install
+    ;;
+*)
+    echo "Usage: $0 [install|remove]"
+    exit 1
+    ;;
 esac

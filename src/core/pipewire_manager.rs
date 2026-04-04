@@ -181,14 +181,14 @@ fn set_persisted_channel_volume(
     volume: f32,
 ) {
     let normalized = volume.clamp(0.0, 1.0);
-    match channel {
-        Channel::Main => state.volumes.main = normalized,
-        Channel::Game => state.volumes.game = normalized,
-        Channel::Media => state.volumes.media = normalized,
-        Channel::Chat => state.volumes.chat = normalized,
-        Channel::Aux => state.volumes.aux = normalized,
-        Channel::Mic => state.volumes.mic = normalized,
-    }
+    *match channel {
+        Channel::Main => &mut state.volumes.main,
+        Channel::Game => &mut state.volumes.game,
+        Channel::Media => &mut state.volumes.media,
+        Channel::Chat => &mut state.volumes.chat,
+        Channel::Aux => &mut state.volumes.aux,
+        Channel::Mic => &mut state.volumes.mic,
+    } = normalized;
 }
 
 fn set_persisted_channel_mute(
@@ -196,14 +196,14 @@ fn set_persisted_channel_mute(
     channel: Channel,
     muted: bool,
 ) {
-    match channel {
-        Channel::Main => state.muted.main = muted,
-        Channel::Game => state.muted.game = muted,
-        Channel::Media => state.muted.media = muted,
-        Channel::Chat => state.muted.chat = muted,
-        Channel::Aux => state.muted.aux = muted,
-        Channel::Mic => state.muted.mic = muted,
-    }
+    *match channel {
+        Channel::Main => &mut state.muted.main,
+        Channel::Game => &mut state.muted.game,
+        Channel::Media => &mut state.muted.media,
+        Channel::Chat => &mut state.muted.chat,
+        Channel::Aux => &mut state.muted.aux,
+        Channel::Mic => &mut state.muted.mic,
+    } = muted;
 }
 
 /// Map only Venturi-owned channel node IDs to a Channel.
@@ -359,22 +359,19 @@ fn snapshot_channel_volumes(
     snapshot: &Snapshot,
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
 ) -> BTreeMap<Channel, f32> {
-    let mut channel_volumes = BTreeMap::new();
-
-    for channel in [
+    [
         Channel::Main,
         Channel::Mic,
         Channel::Game,
         Channel::Media,
         Channel::Chat,
         Channel::Aux,
-    ] {
-        if let Some(volume) = channel_volume_from_snapshot(snapshot, overrides, channel) {
-            channel_volumes.insert(channel, volume);
-        }
-    }
-
-    channel_volumes
+    ]
+    .into_iter()
+    .filter_map(|channel| {
+        channel_volume_from_snapshot(snapshot, overrides, channel).map(|v| (channel, v))
+    })
+    .collect()
 }
 
 fn channel_volume_from_snapshot(
@@ -527,19 +524,11 @@ fn emit_snapshot_channel_volumes(
     overrides: &BTreeMap<String, crate::core::messages::Channel>,
     event_tx: &Sender<CoreEvent>,
 ) {
-    let channel_volumes = snapshot_channel_volumes(snapshot, overrides);
-    for channel in [
-        Channel::Main,
-        Channel::Mic,
-        Channel::Game,
-        Channel::Media,
-        Channel::Chat,
-        Channel::Aux,
-    ] {
-        if let Some(volume) = channel_volumes.get(&channel) {
-            let _ = event_tx.send(CoreEvent::VolumeChanged(channel, *volume));
-        }
-    }
+    snapshot_channel_volumes(snapshot, overrides)
+        .into_iter()
+        .for_each(|(channel, volume)| {
+            let _ = event_tx.send(CoreEvent::VolumeChanged(channel, volume));
+        });
 }
 
 pub struct PipeWireManager {
