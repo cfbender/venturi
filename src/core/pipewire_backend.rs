@@ -90,8 +90,18 @@ pub(crate) fn run_pactl(args: &[String]) -> Result<String, String> {
     }
 }
 
+/// Marker property set on all Venturi-spawned `pw-play` processes so the
+/// discovery layer can recognise (and skip) them during auto-routing.
+pub(crate) const SOUNDBOARD_APP_NAME: &str = "Venturi-Soundboard";
+
 fn build_pw_play_args(target: &str, file: &str) -> Vec<String> {
-    vec!["--target".to_string(), target.to_string(), file.to_string()]
+    vec![
+        "--target".to_string(),
+        target.to_string(),
+        "--properties".to_string(),
+        format!("application.name={SOUNDBOARD_APP_NAME}"),
+        file.to_string(),
+    ]
 }
 
 pub(crate) struct PwPlayProcess {
@@ -718,7 +728,7 @@ fn find_virtual_mic_module_in_modules_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        MonitorLoopbackPlan, build_monitor_loopback_plan, build_pw_play_args,
+        MonitorLoopbackPlan, SOUNDBOARD_APP_NAME, build_monitor_loopback_plan, build_pw_play_args,
         build_virtual_device_description_property,
         build_virtual_module_device_description_properties, category_mix_monitor_sources,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
@@ -935,6 +945,8 @@ mod tests {
             vec![
                 "--target".to_string(),
                 "input.Venturi-VirtualMic".to_string(),
+                "--properties".to_string(),
+                format!("application.name={SOUNDBOARD_APP_NAME}"),
                 "/tmp/airhorn.wav".to_string()
             ]
         );

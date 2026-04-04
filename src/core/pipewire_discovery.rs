@@ -179,6 +179,9 @@ pub(crate) fn parse_pw_dump(
             if is_loopback_stream(app_name, binary, media_name, node_name) {
                 continue;
             }
+            if is_venturi_soundboard_stream(app_name) {
+                continue;
+            }
             let display_name =
                 preferred_display_name(app_name, binary, media_name, stream_node_name);
             let role = props
@@ -285,6 +288,10 @@ fn is_loopback_name(name: &str) -> bool {
 fn is_loopback_stream(app_name: &str, binary: &str, media_name: &str, node_name: &str) -> bool {
     let haystack = format!("{app_name} {binary} {media_name} {node_name}").to_ascii_lowercase();
     haystack.contains("loopback")
+}
+
+fn is_venturi_soundboard_stream(app_name: &str) -> bool {
+    app_name == crate::core::pipewire_backend::SOUNDBOARD_APP_NAME
 }
 
 fn prettify_binary(binary: &str) -> String {
