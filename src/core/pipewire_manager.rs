@@ -8,23 +8,38 @@ use std::time::{Duration, Instant};
 use crate::categorizer::learning::{deserialize_overrides, serialize_overrides};
 use crate::categorizer::rules::classify_with_priority;
 use crate::config::persistence::{DebouncedSaver, Paths, ensure_dirs, load_config, save_config};
+use crate::core::command_coalescing::coalesce_commands;
+#[cfg_attr(test, allow(unused_imports))]
+use crate::core::device_routing::{
+    config_device_value, resolve_output_loopback_target,
+    resolve_selected_input_name, selected_device_available, should_skip_output_device_reconcile,
+};
 use crate::core::hotkeys::{
     HotkeyAdapter, HotkeyBindings, HotkeyState, build_adapter, collect_adapter_commands,
 };
-use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, DeviceKind};
+use crate::core::messages::{CoreCommand, CoreEvent, DeviceKind};
+use crate::core::meter_worker::spawn_meter_worker;
 use crate::core::pipewire_backend::{
-    PwPlayProcess, PwTargetSampler, current_default_sink_name, current_default_source_name,
-    ensure_virtual_devices, reconcile_monitor_loopback_modules, rewire_virtual_mic_source,
-    run_pw_metadata, unload_pactl_module,
+    PwPlayProcess, current_default_sink_name, ensure_virtual_devices,
+    reconcile_monitor_loopback_modules, rewire_virtual_mic_source, run_pw_metadata,
+    unload_pactl_module,
 };
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
 };
 use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump};
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
-use crate::core::router::{
-    build_metadata_legacy_target_args, build_metadata_target_args, channel_node_name,
+use crate::core::router::{build_metadata_legacy_target_args, build_metadata_target_args};
+use crate::core::snapshot_ops::{
+    apply_snapshot_volume_hint, apply_structural_monitor_delta, channel_volume_from_snapshot,
+    emit_snapshot_channel_volumes, node_id_to_channel, prune_removed_node_ids,
 };
+use crate::core::soundboard_playback::{
+    SoundboardPlaybackMode, SoundboardPlaybackRoute, cleanup_soundboard_players,
+    handle_play_sound, stop_sound,
+};
+use crate::core::state_persistence::{set_persisted_channel_mute, set_persisted_channel_volume};
+use crate::core::stream_routing::collect_stream_route_targets_for_reconcile;
 
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
@@ -32,34 +47,14 @@ pub fn reconnect_delay() -> Duration {
     RECONNECT_DELAY
 }
 
-pub fn fallback_to_default_device() -> &'static str {
-    "Default"
-}
+pub use crate::core::device_routing::fallback_to_default_device;
 
 const LOOP_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const DEVICE_SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30);
-const METER_WORKER_INTERVAL: Duration = Duration::from_millis(33);
-const METER_WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(500);
-const METER_SAMPLE_INTERVAL: Duration = Duration::from_millis(66);
 
-/// Channels whose bus-level meters the meter worker should maintain.
-///
-/// Each entry maps a mixer [`Channel`] to the PipeWire node name used to look
-/// up the numeric `object.serial` in the [`Snapshot`].  The serial is then
-/// passed to `pw-record --target <serial>` because `pw-record` cannot resolve
-/// sink names — it only matches source names, so using a sink name causes it
-/// to silently fall back to the default source (the physical mic).
-const BUS_METER_CHANNELS: [(Channel, &str); 6] = [
-    (Channel::Main, "Venturi-Output"),
-    (Channel::Game, "Venturi-Game"),
-    (Channel::Media, "Venturi-Media"),
-    (Channel::Chat, "Venturi-Chat"),
-    (Channel::Aux, "Venturi-Aux"),
-    (Channel::Mic, "Venturi-VirtualMic"),
-];
 const VIRTUAL_SINKS: [&str; 6] = [
     "Venturi-Output",
     "Venturi-Game",
@@ -69,102 +64,9 @@ const VIRTUAL_SINKS: [&str; 6] = [
     "Venturi-Sound",
 ];
 const VIRTUAL_SOURCES: [&str; 1] = ["Venturi-VirtualMic"];
-const VENTURI_SOUNDBOARD_SINK: &str = "Venturi-Sound";
 const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
 const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
 const LEGACY_VENTURI_SINKS: [&str; 1] = ["Venturi-Mic"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SoundboardPlaybackRoute {
-    VirtualMicInput,
-    MainOutput,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SoundboardPlaybackMode {
-    Full,
-    Preview,
-}
-
-const SOUNDBOARD_PLAYBACK_ROUTES_FULL: [SoundboardPlaybackRoute; 2] = [
-    SoundboardPlaybackRoute::VirtualMicInput,
-    SoundboardPlaybackRoute::MainOutput,
-];
-
-const SOUNDBOARD_PLAYBACK_ROUTES_PREVIEW: [SoundboardPlaybackRoute; 1] =
-    [SoundboardPlaybackRoute::MainOutput];
-
-fn soundboard_playback_routes(mode: SoundboardPlaybackMode) -> &'static [SoundboardPlaybackRoute] {
-    match mode {
-        SoundboardPlaybackMode::Full => SOUNDBOARD_PLAYBACK_ROUTES_FULL.as_slice(),
-        SoundboardPlaybackMode::Preview => SOUNDBOARD_PLAYBACK_ROUTES_PREVIEW.as_slice(),
-    }
-}
-
-fn soundboard_playback_target_for_route(route: SoundboardPlaybackRoute) -> &'static str {
-    match route {
-        SoundboardPlaybackRoute::VirtualMicInput => VENTURI_SOUNDBOARD_SINK,
-        SoundboardPlaybackRoute::MainOutput => VENTURI_MAIN_OUTPUT,
-    }
-}
-
-#[cfg(test)]
-fn soundboard_playback_targets(mode: SoundboardPlaybackMode) -> Vec<&'static str> {
-    soundboard_playback_routes(mode)
-        .iter()
-        .map(|route| soundboard_playback_target_for_route(*route))
-        .collect()
-}
-
-fn resolve_selected_input_name(selected_input: Option<&str>) -> Result<Option<String>, String> {
-    match selected_input {
-        Some(name) if !name.is_empty() && name != fallback_to_default_device() => {
-            Ok(Some(name.to_string()))
-        }
-        _ => current_default_source_name(),
-    }
-}
-
-fn config_device_value(device: &str) -> String {
-    if device.eq_ignore_ascii_case(fallback_to_default_device()) {
-        "default".to_string()
-    } else {
-        device.to_string()
-    }
-}
-
-fn resolve_output_loopback_target(device: &str, default_sink: Option<&str>) -> Option<String> {
-    if !device.eq_ignore_ascii_case(fallback_to_default_device()) {
-        return Some(device.to_string());
-    }
-
-    default_sink
-        .filter(|name| !name.eq_ignore_ascii_case(VENTURI_MAIN_OUTPUT))
-        .map(ToOwned::to_owned)
-}
-
-fn should_skip_output_device_reconcile(
-    current_selection: Option<&str>,
-    requested_device: &str,
-    force: bool,
-) -> bool {
-    !force && current_selection == Some(requested_device)
-}
-
-fn selected_device_available(
-    devices: &[DeviceEntry],
-    kind: DeviceKind,
-    selected: Option<&str>,
-) -> bool {
-    let Some(selected) = selected else {
-        return false;
-    };
-
-    selected.eq_ignore_ascii_case(fallback_to_default_device())
-        || devices
-            .iter()
-            .any(|device| device.kind == kind && device.id == selected)
-}
 
 #[cfg(test)]
 fn keep_pipewire_backend_symbols_for_tests() {
@@ -173,362 +75,6 @@ fn keep_pipewire_backend_symbols_for_tests() {
         as fn(&str, Option<&str>) -> Result<Option<String>, String>;
     let _ = unload_pactl_module as fn(&str) -> Result<(), String>;
     let _ = VENTURI_MAIN_MONITOR;
-}
-
-fn set_persisted_channel_volume(
-    state: &mut crate::config::schema::State,
-    channel: Channel,
-    volume: f32,
-) {
-    let normalized = volume.clamp(0.0, 1.0);
-    *match channel {
-        Channel::Main => &mut state.volumes.main,
-        Channel::Game => &mut state.volumes.game,
-        Channel::Media => &mut state.volumes.media,
-        Channel::Chat => &mut state.volumes.chat,
-        Channel::Aux => &mut state.volumes.aux,
-        Channel::Mic => &mut state.volumes.mic,
-    } = normalized;
-}
-
-fn set_persisted_channel_mute(
-    state: &mut crate::config::schema::State,
-    channel: Channel,
-    muted: bool,
-) {
-    *match channel {
-        Channel::Main => &mut state.muted.main,
-        Channel::Game => &mut state.muted.game,
-        Channel::Media => &mut state.muted.media,
-        Channel::Chat => &mut state.muted.chat,
-        Channel::Aux => &mut state.muted.aux,
-        Channel::Mic => &mut state.muted.mic,
-    } = muted;
-}
-
-/// Map only Venturi-owned channel node IDs to a Channel.
-///
-/// This intentionally ignores app stream IDs to preserve strict separation between
-/// app-local stream gain and Venturi channel bus gain.
-fn node_id_to_channel(
-    id: u32,
-    snapshot: &Snapshot,
-    _overrides: &BTreeMap<String, Channel>,
-) -> Option<Channel> {
-    // Only map Venturi main sink ID to Main.
-    if snapshot.output_ids.get(VENTURI_MAIN_OUTPUT).copied() == Some(id) {
-        return Some(Channel::Main);
-    }
-    // Only map Venturi virtual mic ID to Mic.
-    if snapshot.input_ids.get(VIRTUAL_SOURCES[0]).copied() == Some(id) {
-        return Some(Channel::Mic);
-    }
-
-    for channel in [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux] {
-        if category_mix_output_id(snapshot, channel) == Some(id) {
-            return Some(channel);
-        }
-    }
-
-    None
-}
-
-fn upsert_devices(
-    devices: &mut Vec<crate::core::messages::DeviceEntry>,
-    updates: Vec<crate::core::messages::DeviceEntry>,
-) {
-    for update in updates {
-        if let Some(existing) = devices
-            .iter_mut()
-            .find(|entry| entry.kind == update.kind && entry.id == update.id)
-        {
-            *existing = update;
-        } else {
-            devices.push(update);
-        }
-    }
-}
-
-fn prune_removed_node_ids(
-    snapshot: &mut Snapshot,
-    removed_ids: &[u32],
-    event_tx: &Sender<CoreEvent>,
-) {
-    if removed_ids.is_empty() {
-        return;
-    }
-
-    let removed: BTreeSet<u32> = removed_ids.iter().copied().collect();
-
-    for id in &removed {
-        if snapshot.streams.remove(id).is_some() {
-            let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
-        }
-        snapshot.volumes.remove(id);
-    }
-
-    snapshot
-        .output_ids
-        .retain(|_, node_id| !removed.contains(node_id));
-    snapshot
-        .input_ids
-        .retain(|_, node_id| !removed.contains(node_id));
-}
-
-fn apply_structural_monitor_delta(
-    snapshot: &mut Snapshot,
-    partial: Snapshot,
-    removed_ids: &[u32],
-    structural_ids: &[u32],
-    overrides: &BTreeMap<String, Channel>,
-    event_tx: &Sender<CoreEvent>,
-) {
-    let devices_before = snapshot.devices.clone();
-
-    let partial_stream_ids: BTreeSet<u32> = partial.streams.keys().copied().collect();
-    let partial_output_ids: BTreeSet<u32> = partial.output_ids.values().copied().collect();
-    let partial_input_ids: BTreeSet<u32> = partial.input_ids.values().copied().collect();
-    let structural: BTreeSet<u32> = structural_ids.iter().copied().collect();
-
-    for id in &structural {
-        if !partial_stream_ids.contains(id) && snapshot.streams.remove(id).is_some() {
-            let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
-        }
-        snapshot.volumes.remove(id);
-    }
-
-    snapshot
-        .output_ids
-        .retain(|_, node_id| !structural.contains(node_id) || partial_output_ids.contains(node_id));
-    snapshot
-        .input_ids
-        .retain(|_, node_id| !structural.contains(node_id) || partial_input_ids.contains(node_id));
-
-    snapshot.output_ids.extend(partial.output_ids);
-    snapshot.input_ids.extend(partial.input_ids);
-    snapshot
-        .output_meter_targets
-        .extend(partial.output_meter_targets);
-    snapshot
-        .input_meter_targets
-        .extend(partial.input_meter_targets);
-    snapshot.volumes.extend(partial.volumes);
-
-    for (id, stream_info) in partial.streams {
-        if !snapshot.streams.contains_key(&id) {
-            let category = classify_with_priority(
-                overrides,
-                Some(&stream_info.app_key),
-                Some(&stream_info.display_name),
-                stream_info.media_role.as_deref(),
-            );
-            let _ = event_tx.send(CoreEvent::StreamAppeared {
-                id,
-                app_key: stream_info.app_key.clone(),
-                name: stream_info.display_name.clone(),
-                category,
-            });
-        }
-        snapshot.streams.insert(id, stream_info);
-    }
-
-    upsert_devices(&mut snapshot.devices, partial.devices);
-    prune_removed_node_ids(snapshot, removed_ids, event_tx);
-
-    let output_node_names: BTreeSet<String> = snapshot.output_ids.keys().cloned().collect();
-    let input_node_names: BTreeSet<String> = snapshot.input_ids.keys().cloned().collect();
-
-    snapshot
-        .output_meter_targets
-        .retain(|node_name, _| output_node_names.contains(node_name));
-    snapshot
-        .input_meter_targets
-        .retain(|node_name, _| input_node_names.contains(node_name));
-
-    snapshot.devices.retain(|device| match device.kind {
-        crate::core::messages::DeviceKind::Output => output_node_names.contains(&device.id),
-        crate::core::messages::DeviceKind::Input => input_node_names.contains(&device.id),
-    });
-
-    if snapshot.devices != devices_before {
-        let _ = event_tx.send(CoreEvent::DevicesChanged(snapshot.devices.clone()));
-    }
-}
-
-fn snapshot_channel_volumes(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-) -> BTreeMap<Channel, f32> {
-    [
-        Channel::Main,
-        Channel::Mic,
-        Channel::Game,
-        Channel::Media,
-        Channel::Chat,
-        Channel::Aux,
-    ]
-    .into_iter()
-    .filter_map(|channel| {
-        channel_volume_from_snapshot(snapshot, overrides, channel).map(|v| (channel, v))
-    })
-    .collect()
-}
-
-fn channel_volume_from_snapshot(
-    snapshot: &Snapshot,
-    _overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    channel: Channel,
-) -> Option<f32> {
-    match channel {
-        Channel::Main => snapshot
-            .output_ids
-            .get(VENTURI_MAIN_OUTPUT)
-            .and_then(|main_id| snapshot.volumes.get(main_id).copied()),
-        Channel::Mic => snapshot
-            .input_ids
-            .get(VIRTUAL_SOURCES[0])
-            .and_then(|mic_id| snapshot.volumes.get(mic_id).copied()),
-        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            category_mix_output_id(snapshot, channel)
-                .and_then(|mix_id| snapshot.volumes.get(&mix_id).copied())
-        }
-    }
-}
-
-fn category_mix_output_node_name(channel: Channel) -> Option<&'static str> {
-    match channel {
-        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            Some(channel_node_name(channel))
-        }
-        Channel::Main | Channel::Mic => None,
-    }
-}
-
-fn category_mix_output_id(snapshot: &Snapshot, channel: Channel) -> Option<u32> {
-    let node_name = category_mix_output_node_name(channel)?;
-    snapshot.output_ids.get(node_name).copied()
-}
-
-fn apply_snapshot_volume_hint(
-    snapshot: &mut Snapshot,
-    _overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    channel: Channel,
-    volume: f32,
-) {
-    match channel {
-        Channel::Main => {
-            if let Some(main_id) = snapshot.output_ids.get(VENTURI_MAIN_OUTPUT).copied() {
-                snapshot.volumes.insert(main_id, volume);
-            }
-        }
-        Channel::Mic => {
-            if let Some(mic_id) = snapshot.input_ids.get(VIRTUAL_SOURCES[0]).copied() {
-                snapshot.volumes.insert(mic_id, volume);
-            }
-        }
-        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            if let Some(mix_id) = category_mix_output_id(snapshot, channel) {
-                snapshot.volumes.insert(mix_id, volume);
-            }
-        }
-    }
-}
-
-fn collect_new_stream_route_targets(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, Channel>,
-    stream_ids_before: &BTreeSet<u32>,
-) -> Vec<(u32, Channel)> {
-    snapshot
-        .streams
-        .iter()
-        .filter(|(stream_id, _)| !stream_ids_before.contains(stream_id))
-        .map(|(stream_id, stream)| {
-            let channel = classify_with_priority(
-                overrides,
-                Some(&stream.app_key),
-                Some(&stream.display_name),
-                stream.media_role.as_deref(),
-            );
-            (*stream_id, channel)
-        })
-        .collect()
-}
-
-fn collect_category_stream_route_targets(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, Channel>,
-) -> Vec<(u32, Channel)> {
-    snapshot
-        .streams
-        .iter()
-        .filter_map(|(stream_id, stream)| {
-            let channel = classify_with_priority(
-                overrides,
-                Some(&stream.app_key),
-                Some(&stream.display_name),
-                stream.media_role.as_deref(),
-            );
-
-            if matches!(
-                channel,
-                Channel::Game | Channel::Media | Channel::Chat | Channel::Aux
-            ) {
-                Some((*stream_id, channel))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn category_mix_sink_ids_changed(
-    output_ids_before: &BTreeMap<String, u32>,
-    snapshot: &Snapshot,
-) -> bool {
-    [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux]
-        .iter()
-        .any(|channel| {
-            let Some(node_name) = category_mix_output_node_name(*channel) else {
-                return false;
-            };
-            output_ids_before.get(node_name) != snapshot.output_ids.get(node_name)
-        })
-}
-
-fn collect_stream_route_targets_for_reconcile(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, Channel>,
-    stream_ids_before: &BTreeSet<u32>,
-    output_ids_before: &BTreeMap<String, u32>,
-) -> Vec<(u32, Channel)> {
-    let mut targets_by_stream = BTreeMap::new();
-
-    for (stream_id, channel) in
-        collect_new_stream_route_targets(snapshot, overrides, stream_ids_before)
-    {
-        targets_by_stream.insert(stream_id, channel);
-    }
-
-    if category_mix_sink_ids_changed(output_ids_before, snapshot) {
-        for (stream_id, channel) in collect_category_stream_route_targets(snapshot, overrides) {
-            targets_by_stream.insert(stream_id, channel);
-        }
-    }
-
-    targets_by_stream.into_iter().collect()
-}
-
-fn emit_snapshot_channel_volumes(
-    snapshot: &Snapshot,
-    overrides: &BTreeMap<String, crate::core::messages::Channel>,
-    event_tx: &Sender<CoreEvent>,
-) {
-    snapshot_channel_volumes(snapshot, overrides)
-        .into_iter()
-        .for_each(|(channel, volume)| {
-            let _ = event_tx.send(CoreEvent::VolumeChanged(channel, volume));
-        });
 }
 
 pub struct PipeWireManager {
@@ -695,7 +241,6 @@ impl CoreRuntimeState {
                     channel,
                     volume,
                     &self.last_snapshot,
-                    &self.overrides,
                     ChannelControlTargets {
                         virtual_input_source_name: VIRTUAL_SOURCES[0],
                         main_output_sink_name: VENTURI_MAIN_OUTPUT,
@@ -706,9 +251,10 @@ impl CoreRuntimeState {
                 if let Some(applied_volume) = applied_volume {
                     apply_snapshot_volume_hint(
                         &mut self.last_snapshot,
-                        &self.overrides,
                         channel,
                         applied_volume,
+                        VENTURI_MAIN_OUTPUT,
+                        VIRTUAL_SOURCES[0],
                     );
                     let _ = event_tx.send(CoreEvent::VolumeChanged(channel, applied_volume));
                 }
@@ -742,13 +288,25 @@ impl CoreRuntimeState {
                 return Ok(CommandLoopControl::Shutdown);
             }
             CoreCommand::PlaySound { pad_id, file } => {
-                self.handle_play_sound(pad_id, &file, SoundboardPlaybackMode::Full, event_tx);
+                handle_play_sound(
+                    &mut self.soundboard_players,
+                    pad_id,
+                    &file,
+                    SoundboardPlaybackMode::Full,
+                    event_tx,
+                );
             }
             CoreCommand::PreviewSound { pad_id, file } => {
-                self.handle_play_sound(pad_id, &file, SoundboardPlaybackMode::Preview, event_tx);
+                handle_play_sound(
+                    &mut self.soundboard_players,
+                    pad_id,
+                    &file,
+                    SoundboardPlaybackMode::Preview,
+                    event_tx,
+                );
             }
             CoreCommand::StopSound(pad_id) => {
-                self.stop_sound(pad_id);
+                stop_sound(&mut self.soundboard_players, pad_id);
             }
         }
         Ok(CommandLoopControl::Continue)
@@ -786,7 +344,6 @@ impl CoreRuntimeState {
             channel,
             muted,
             &self.last_snapshot,
-            &self.overrides,
             ChannelControlTargets {
                 virtual_input_source_name: VIRTUAL_SOURCES[0],
                 main_output_sink_name: VENTURI_MAIN_OUTPUT,
@@ -851,55 +408,6 @@ impl CoreRuntimeState {
                 )));
             }
         }
-    }
-
-    fn handle_play_sound(
-        &mut self,
-        pad_id: u32,
-        file: &str,
-        mode: SoundboardPlaybackMode,
-        event_tx: &Sender<CoreEvent>,
-    ) {
-        let trimmed_file = file.trim();
-        if trimmed_file.is_empty() {
-            let _ = event_tx.send(CoreEvent::Error(format!(
-                "cannot play soundboard pad {pad_id}: no file configured"
-            )));
-            return;
-        }
-
-        self.stop_sound(pad_id);
-
-        for route in soundboard_playback_routes(mode) {
-            let target = soundboard_playback_target_for_route(*route);
-            match PwPlayProcess::spawn(target, trimmed_file) {
-                Ok(player) => {
-                    self.soundboard_players.insert((pad_id, *route), player);
-                }
-                Err(err) => {
-                    let _ = event_tx.send(CoreEvent::Error(format!(
-                        "failed to play soundboard pad {pad_id} on {target}: {err}"
-                    )));
-                }
-            }
-        }
-    }
-
-    fn stop_sound(&mut self, pad_id: u32) {
-        self.soundboard_players
-            .retain(|(existing_pad_id, _), player| {
-                if *existing_pad_id == pad_id {
-                    player.stop();
-                    false
-                } else {
-                    true
-                }
-            });
-    }
-
-    fn cleanup_soundboard_players(&mut self) {
-        self.soundboard_players
-            .retain(|_, player| !player.is_finished());
     }
 
     fn emit_device_selection_changed(&self, event_tx: &Sender<CoreEvent>) {
@@ -999,7 +507,7 @@ impl CoreRuntimeState {
                 None
             };
             let desired_output_owned =
-                resolve_output_loopback_target(device, default_sink.as_deref());
+                resolve_output_loopback_target(device, default_sink.as_deref(), VENTURI_MAIN_OUTPUT);
             let desired_output = desired_output_owned.as_deref();
             self.output_loopback_module =
                 reconcile_monitor_loopback_modules(VENTURI_MAIN_MONITOR, desired_output).map_err(
@@ -1141,7 +649,12 @@ impl CoreRuntimeState {
                 category,
             });
         }
-        emit_snapshot_channel_volumes(&self.last_snapshot, &self.overrides, event_tx);
+        emit_snapshot_channel_volumes(
+            &self.last_snapshot,
+            event_tx,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
     }
 
     fn handle_monitor_event(
@@ -1195,7 +708,12 @@ impl CoreRuntimeState {
                 self.poll_selected_device_restore(event_tx, true);
                 // Update shared snapshot for meter worker
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
-                emit_snapshot_channel_volumes(&self.last_snapshot, &self.overrides, event_tx);
+                emit_snapshot_channel_volumes(
+                    &self.last_snapshot,
+                    event_tx,
+                    VENTURI_MAIN_OUTPUT,
+                    VIRTUAL_SOURCES[0],
+                );
             }
             PwMonitorEvent::ObjectsChanged(objects) => {
                 self.merge_changed_objects(&objects, event_tx);
@@ -1281,11 +799,17 @@ impl CoreRuntimeState {
                 if vol_changed {
                     self.last_snapshot.volumes.insert(id, new_vol);
 
-                    if let Some(channel) = node_id_to_channel(id, &self.last_snapshot, &self.overrides) {
+                    if let Some(channel) = node_id_to_channel(
+                        id,
+                        &self.last_snapshot,
+                        VENTURI_MAIN_OUTPUT,
+                        VIRTUAL_SOURCES[0],
+                    ) {
                         let channel_volume = channel_volume_from_snapshot(
                             &self.last_snapshot,
-                            &self.overrides,
                             channel,
+                            VENTURI_MAIN_OUTPUT,
+                            VIRTUAL_SOURCES[0],
                         )
                         .unwrap_or(new_vol);
                         let _ =
@@ -1316,125 +840,6 @@ impl CoreRuntimeState {
 
         self.route_stream_targets_for_reconcile(&stream_ids_before, &output_ids_before, event_tx);
     }
-}
-
-/// Coalesce a batch of commands: keep only the last SetVolume per channel,
-/// preserve all other commands in order, and stop early on Shutdown.
-fn coalesce_commands(commands: Vec<CoreCommand>) -> Vec<CoreCommand> {
-    let mut volume_map: BTreeMap<Channel, f32> = BTreeMap::new();
-    let mut result: Vec<CoreCommand> = Vec::new();
-
-    for cmd in commands {
-        match cmd {
-            CoreCommand::SetVolume(channel, vol) => {
-                volume_map.insert(channel, vol);
-            }
-            CoreCommand::Shutdown => {
-                // Shutdown discards pending volumes and remaining commands, but keeps
-                // previously queued non-volume commands in order.
-                result.push(CoreCommand::Shutdown);
-                return result;
-            }
-            other => {
-                result.push(other);
-            }
-        }
-    }
-
-    // Append coalesced volumes in deterministic Channel order
-    for (channel, vol) in volume_map {
-        result.push(CoreCommand::SetVolume(channel, vol));
-    }
-
-    result
-}
-
-fn compute_level_sample_count(sample_rate_hz: u32, sample_interval: Duration) -> u32 {
-    let interval_ms = sample_interval.as_millis() as u64;
-    let sample_count = (sample_rate_hz as u64)
-        .saturating_mul(interval_ms)
-        .saturating_div(1000)
-        .max(1);
-    sample_count.min(u32::MAX as u64) as u32
-}
-
-fn spawn_meter_worker(
-    event_tx: Sender<CoreEvent>,
-    running: Arc<AtomicBool>,
-    enabled: Arc<AtomicBool>,
-    shared_snapshot: Arc<Mutex<Snapshot>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let level_sample_count = compute_level_sample_count(48_000, METER_SAMPLE_INTERVAL);
-        let mut last_meter_sample = Instant::now() - METER_SAMPLE_INTERVAL;
-        let mut samplers: BTreeMap<Channel, PwTargetSampler> = BTreeMap::new();
-
-        while running.load(Ordering::Relaxed) {
-            if !enabled.load(Ordering::Relaxed) {
-                samplers.clear();
-                std::thread::sleep(METER_WORKER_IDLE_INTERVAL);
-                continue;
-            }
-            if last_meter_sample.elapsed() < METER_SAMPLE_INTERVAL {
-                std::thread::sleep(METER_WORKER_INTERVAL);
-                continue;
-            }
-            last_meter_sample = Instant::now();
-
-            // Look up numeric object serials from the current snapshot.  `pw-record --target`
-            // only resolves sinks correctly by serial — string node names silently fall back
-            // to the default source.
-            let (output_targets, input_targets) = {
-                if let Ok(snap) = shared_snapshot.try_lock() {
-                    (
-                        snap.output_meter_targets.clone(),
-                        snap.input_meter_targets.clone(),
-                    )
-                } else {
-                    (BTreeMap::new(), BTreeMap::new())
-                }
-            };
-
-            for (channel, node_name) in &BUS_METER_CHANNELS {
-                if !samplers.contains_key(channel) {
-                    let serial = output_targets
-                        .get(*node_name)
-                        .or_else(|| input_targets.get(*node_name));
-                    if let Some(&target_serial) = serial {
-                        let target_str = target_serial.to_string();
-                        if let Ok(sampler) = PwTargetSampler::spawn(&target_str) {
-                            samplers.insert(*channel, sampler);
-                        }
-                    }
-                }
-            }
-
-            let mut updates = Vec::new();
-            let mut failed = Vec::new();
-
-            for (channel, _) in &BUS_METER_CHANNELS {
-                let levels = if let Some(sampler) = samplers.get_mut(channel) {
-                    match sampler.sample_levels(level_sample_count) {
-                        Ok(levels) => levels,
-                        Err(_) => {
-                            failed.push(*channel);
-                            (0.0, 0.0)
-                        }
-                    }
-                } else {
-                    (0.0, 0.0)
-                };
-                updates.push((*channel, levels));
-            }
-
-            for channel in failed {
-                samplers.remove(&channel);
-            }
-
-            let _ = event_tx.send(CoreEvent::LevelsUpdate(updates));
-            std::thread::sleep(METER_WORKER_INTERVAL);
-        }
-    })
 }
 
 impl PipeWireManager {
@@ -1543,7 +948,7 @@ impl PipeWireManager {
                 state.handle_hotkey_tick(&event_tx);
                 state.poll_selected_device_restore(&event_tx, false);
                 state.flush_persisted_state_if_due(&event_tx);
-                state.cleanup_soundboard_players();
+                cleanup_soundboard_players(&mut state.soundboard_players);
             }
             meter_running_for_core.store(false, Ordering::Relaxed);
         });
@@ -1577,19 +982,25 @@ mod tests {
 
     use crate::config::persistence::{DebouncedSaver, Paths, load_config};
     use crate::config::schema::State;
+    use crate::core::command_coalescing::coalesce_commands;
+    use crate::core::device_routing::{
+        resolve_output_loopback_target, selected_device_available,
+        should_skip_output_device_reconcile,
+    };
     use crate::core::hotkeys::{HotkeyBindings, HotkeyState, build_adapter};
     use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceEntry, DeviceKind};
+    use crate::core::meter_worker::compute_level_sample_count;
     use crate::core::pipewire_discovery::{Snapshot, StreamInfo};
     use crate::core::pw_monitor::PwMonitorEvent;
+    use crate::core::snapshot_ops::{
+        apply_snapshot_volume_hint, apply_structural_monitor_delta, node_id_to_channel,
+        snapshot_channel_volumes,
+    };
+    use crate::core::soundboard_playback::{SoundboardPlaybackMode, soundboard_playback_targets};
+    use crate::core::stream_routing::collect_new_stream_route_targets;
+    use crate::core::stream_routing::collect_stream_route_targets_for_reconcile;
     use super::{
-        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, SoundboardPlaybackMode,
-        apply_snapshot_volume_hint, apply_structural_monitor_delta,
-        coalesce_commands, collect_new_stream_route_targets,
-        collect_stream_route_targets_for_reconcile,
-        compute_level_sample_count, node_id_to_channel, resolve_output_loopback_target,
-        selected_device_available,
-        should_skip_output_device_reconcile, snapshot_channel_volumes,
-        soundboard_playback_targets,
+        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES,
     };
 
     fn build_test_runtime_state(
@@ -1672,7 +1083,11 @@ mod tests {
         );
         snapshot.volumes.insert(901, 0.99);
 
-        let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
+        let volumes = snapshot_channel_volumes(
+            &snapshot,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
 
         assert_eq!(volumes.get(&Channel::Main).copied(), Some(0.41));
         assert_eq!(volumes.get(&Channel::Mic).copied(), Some(0.73));
@@ -1711,7 +1126,11 @@ mod tests {
         snapshot.volumes.insert(100, 0.40);
         snapshot.volumes.insert(200, 0.04);
 
-        let volumes = snapshot_channel_volumes(&snapshot, &BTreeMap::new());
+        let volumes = snapshot_channel_volumes(
+            &snapshot,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
 
         assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.33));
     }
@@ -1753,9 +1172,27 @@ mod tests {
             },
         );
 
-        apply_snapshot_volume_hint(&mut snapshot, &BTreeMap::new(), Channel::Main, 0.31);
-        apply_snapshot_volume_hint(&mut snapshot, &BTreeMap::new(), Channel::Mic, 0.62);
-        apply_snapshot_volume_hint(&mut snapshot, &BTreeMap::new(), Channel::Media, 0.47);
+        apply_snapshot_volume_hint(
+            &mut snapshot,
+            Channel::Main,
+            0.31,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
+        apply_snapshot_volume_hint(
+            &mut snapshot,
+            Channel::Mic,
+            0.62,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
+        apply_snapshot_volume_hint(
+            &mut snapshot,
+            Channel::Media,
+            0.47,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
 
         assert_eq!(snapshot.volumes.get(&128).copied(), Some(0.31));
         assert_eq!(snapshot.volumes.get(&281).copied(), Some(0.62));
@@ -1769,18 +1206,20 @@ mod tests {
         assert_eq!(
             resolve_output_loopback_target(
                 "Default",
-                Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo")
+                Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo"),
+                VENTURI_MAIN_OUTPUT,
             ),
             Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo".to_string())
         );
         assert_eq!(
-            resolve_output_loopback_target("Default", Some("Venturi-Output")),
+            resolve_output_loopback_target("Default", Some("Venturi-Output"), VENTURI_MAIN_OUTPUT),
             None
         );
         assert_eq!(
             resolve_output_loopback_target(
                 "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo",
-                Some("ignored")
+                Some("ignored"),
+                VENTURI_MAIN_OUTPUT,
             ),
             Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo".to_string())
         );
@@ -1981,9 +1420,8 @@ mod tests {
     fn node_id_to_channel_maps_output_sink_to_main() {
         let mut snapshot = Snapshot::default();
         snapshot.output_ids.insert("Venturi-Output".to_string(), 50);
-        let overrides = BTreeMap::new();
         assert_eq!(
-            node_id_to_channel(50, &snapshot, &overrides),
+            node_id_to_channel(50, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
             Some(Channel::Main)
         );
     }
@@ -1994,9 +1432,8 @@ mod tests {
         snapshot
             .input_ids
             .insert("Venturi-VirtualMic".to_string(), 60);
-        let overrides = BTreeMap::new();
         assert_eq!(
-            node_id_to_channel(60, &snapshot, &overrides),
+            node_id_to_channel(60, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
             Some(Channel::Mic)
         );
     }
@@ -2005,9 +1442,8 @@ mod tests {
     fn node_id_to_channel_maps_category_mix_sink() {
         let mut snapshot = Snapshot::default();
         snapshot.output_ids.insert("Venturi-Media".to_string(), 100);
-        let overrides = BTreeMap::new();
         assert_eq!(
-            node_id_to_channel(100, &snapshot, &overrides),
+            node_id_to_channel(100, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
             Some(Channel::Media)
         );
     }
@@ -2027,16 +1463,20 @@ mod tests {
                 media_role: None,
             },
         );
-        let overrides = BTreeMap::new();
 
-        assert_eq!(node_id_to_channel(100, &snapshot, &overrides), None);
+        assert_eq!(
+            node_id_to_channel(100, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
+            None,
+        );
     }
 
     #[test]
     fn node_id_to_channel_returns_none_for_unknown_id() {
         let snapshot = Snapshot::default();
-        let overrides = BTreeMap::new();
-        assert_eq!(node_id_to_channel(999, &snapshot, &overrides), None);
+        assert_eq!(
+            node_id_to_channel(999, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
+            None,
+        );
     }
 
     #[test]
@@ -2046,9 +1486,11 @@ mod tests {
         snapshot
             .output_ids
             .insert("alsa_output.real".to_string(), 88);
-        let overrides = BTreeMap::new();
 
-        assert_eq!(node_id_to_channel(88, &snapshot, &overrides), None);
+        assert_eq!(
+            node_id_to_channel(88, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
+            None,
+        );
     }
 
     #[test]
@@ -2060,9 +1502,11 @@ mod tests {
         snapshot
             .input_ids
             .insert("alsa_input.real_mic".to_string(), 61);
-        let overrides = BTreeMap::new();
 
-        assert_eq!(node_id_to_channel(61, &snapshot, &overrides), None);
+        assert_eq!(
+            node_id_to_channel(61, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
+            None,
+        );
     }
 
     #[test]
@@ -2119,11 +1563,11 @@ mod tests {
         assert_eq!(snapshot.output_ids.get("Venturi-Output"), Some(&412));
         assert_eq!(snapshot.input_ids.get("Venturi-VirtualMic"), Some(&225));
         assert_eq!(
-            node_id_to_channel(412, &snapshot, &overrides),
+            node_id_to_channel(412, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
             Some(Channel::Main)
         );
         assert_eq!(
-            node_id_to_channel(225, &snapshot, &overrides),
+            node_id_to_channel(225, &snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]),
             Some(Channel::Mic)
         );
     }

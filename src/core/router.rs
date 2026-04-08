@@ -29,6 +29,15 @@ pub fn channel_node_name(channel: Channel) -> &'static str {
     }
 }
 
+pub fn category_mix_output_node_name(channel: Channel) -> Option<&'static str> {
+    match channel {
+        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
+            Some(channel_node_name(channel))
+        }
+        Channel::Main | Channel::Mic => None,
+    }
+}
+
 pub fn resolve_output_target(
     selected_output: Option<&str>,
     output_ids: &BTreeMap<String, u32>,

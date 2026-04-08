@@ -1,5 +1,5 @@
 use crate::core::messages::{Channel, CoreCommand};
-use crate::core::volume::apply_mute;
+use crate::core::meter::apply_mute;
 use crossbeam_channel::Sender;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};

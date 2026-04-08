@@ -323,6 +323,217 @@ impl Default for MixerTab {
     }
 }
 
+const ALL_CHANNELS: [Channel; 6] = [
+    Channel::Main,
+    Channel::Mic,
+    Channel::Game,
+    Channel::Media,
+    Channel::Chat,
+    Channel::Aux,
+];
+
+struct MixerRefreshState {
+    model: Arc<Mutex<MixerTab>>,
+    out_model: gtk::StringList,
+    in_model: gtk::StringList,
+    banner_widget: gtk::Label,
+    output_dropdown: gtk::DropDown,
+    input_dropdown: gtk::DropDown,
+    suppress_device_notify: Rc<Cell<bool>>,
+    meter_widgets: BTreeMap<Channel, gtk::ProgressBar>,
+    slider_widgets: BTreeMap<Channel, SliderHandle>,
+    chip_lists: BTreeMap<Channel, gtk::FlowBox>,
+    last_banner: String,
+    last_out_devices: Vec<String>,
+    last_in_devices: Vec<String>,
+    last_out_selected: Option<u32>,
+    last_in_selected: Option<u32>,
+    last_chips_snapshot: BTreeMap<Channel, Vec<AppChip>>,
+    last_meter_levels: BTreeMap<Channel, f32>,
+    last_meter_tick: Instant,
+}
+
+impl MixerRefreshState {
+    fn tick(&mut self) {
+        let Ok(state) = self.model.try_lock() else {
+            return;
+        };
+
+        // Snapshot everything we need while holding the lock, then release it
+        // so `&mut self` methods can operate freely.
+        let levels_snapshot = state.levels.clone();
+        let strips_snapshot: BTreeMap<Channel, (f32, bool)> = state
+            .strips
+            .iter()
+            .map(|(ch, s)| (*ch, (s.volume_linear, s.muted)))
+            .collect();
+        let ui_dirty = state.take_ui_dirty();
+
+        // Clone strip data for slider label sync
+        let strips_for_sliders = state.strips.clone();
+
+        let (banner_text, out_devices, in_devices, selected_out, selected_in,
+             out_labels_by_id, in_labels_by_id, chips_snapshot) = if ui_dirty {
+            let banner_text = state.banner.clone().unwrap_or_default();
+            let out_devices = if state.devices.output_devices.is_empty() {
+                vec![NO_DEVICES_FOUND.to_string()]
+            } else {
+                state.devices.output_devices.clone()
+            };
+            let in_devices = if state.devices.input_devices.is_empty() {
+                vec![NO_DEVICES_FOUND.to_string()]
+            } else {
+                state.devices.input_devices.clone()
+            };
+            let selected_out = state
+                .devices
+                .selected_output
+                .as_ref()
+                .and_then(|sel| state.devices.output_devices.iter().position(|d| d == sel));
+            let selected_in = state
+                .devices
+                .selected_input
+                .as_ref()
+                .and_then(|sel| state.devices.input_devices.iter().position(|d| d == sel));
+            let out_labels_by_id = state.devices.output_labels_by_id.clone();
+            let in_labels_by_id = state.devices.input_labels_by_id.clone();
+            let chips_snapshot = state.chips.clone();
+            (Some(banner_text), Some(out_devices), Some(in_devices),
+             selected_out, selected_in,
+             Some(out_labels_by_id), Some(in_labels_by_id), Some(chips_snapshot))
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
+
+        drop(state);
+
+        self.tick_meters(&levels_snapshot, &strips_snapshot);
+        self.tick_sliders(&strips_for_sliders);
+
+        if !ui_dirty {
+            return;
+        }
+
+        if let Some(banner_text) = banner_text {
+            self.sync_banner(banner_text);
+        }
+        if let (Some(out_devices), Some(out_labels_by_id)) = (&out_devices, &out_labels_by_id) {
+            self.sync_device_list(out_devices, out_labels_by_id, true);
+        }
+        if let (Some(in_devices), Some(in_labels_by_id)) = (&in_devices, &in_labels_by_id) {
+            self.sync_device_list(in_devices, in_labels_by_id, false);
+        }
+        self.sync_device_selection(selected_out, true);
+        self.sync_device_selection(selected_in, false);
+        if let Some(chips_snapshot) = chips_snapshot {
+            self.sync_chips(chips_snapshot);
+        }
+    }
+
+    fn tick_meters(
+        &mut self,
+        levels: &BTreeMap<Channel, (f32, f32)>,
+        strips: &BTreeMap<Channel, (f32, bool)>,
+    ) {
+        let now = Instant::now();
+        let elapsed_ms = now.duration_since(self.last_meter_tick).as_millis() as u32;
+        self.last_meter_tick = now;
+
+        for channel in ALL_CHANNELS {
+            let (left, right) = levels.get(&channel).copied().unwrap_or((0.0, 0.0));
+            let max_fraction = strips
+                .get(&channel)
+                .map(|(vol, _)| vol.clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            let current = meter_display_fraction(left.max(right), max_fraction);
+            let previous = *self.last_meter_levels.get(&channel).unwrap_or(&0.0);
+            let next = decay_peak(previous, current, elapsed_ms);
+            if let Some(widget) = self.meter_widgets.get(&channel) {
+                widget.set_fraction(next as f64);
+                widget.set_visible(meter_should_be_visible(next));
+            }
+            self.last_meter_levels.insert(channel, next);
+        }
+    }
+
+    fn tick_sliders(&self, strips: &BTreeMap<Channel, ChannelStrip>) {
+        for (channel, handle) in &self.slider_widgets {
+            if handle.is_dragging.get() {
+                continue;
+            }
+            if let Some(strip_data) = strips.get(channel) {
+                sync_slider_widget_from_model(handle, strip_data);
+            }
+        }
+    }
+
+    fn sync_banner(&mut self, text: String) {
+        if text != self.last_banner {
+            self.banner_widget.set_text(&text);
+            self.last_banner = text;
+        }
+    }
+
+    fn sync_device_list(
+        &mut self,
+        devices: &[String],
+        labels_by_id: &BTreeMap<String, String>,
+        is_output: bool,
+    ) {
+        let (last, list_model) = if is_output {
+            (&mut self.last_out_devices, &self.out_model)
+        } else {
+            (&mut self.last_in_devices, &self.in_model)
+        };
+
+        if devices != last.as_slice() {
+            const EMPTY_STRS: [&str; 0] = [];
+            self.suppress_device_notify.set(true);
+            list_model.splice(0, list_model.n_items(), EMPTY_STRS.as_slice());
+            for dev in devices {
+                list_model.append(&display_device_label(labels_by_id, dev));
+            }
+            *last = devices.to_vec();
+            self.suppress_device_notify.set(false);
+        }
+    }
+
+    fn sync_device_selection(&mut self, selected: Option<usize>, is_output: bool) {
+        let next_selected = selected.map(|idx| idx as u32);
+        let (last, dropdown) = if is_output {
+            (&mut self.last_out_selected, &self.output_dropdown)
+        } else {
+            (&mut self.last_in_selected, &self.input_dropdown)
+        };
+
+        if next_selected != *last {
+            if let Some(idx) = next_selected
+                && dropdown.selected() != idx
+            {
+                self.suppress_device_notify.set(true);
+                dropdown.set_selected(idx);
+                self.suppress_device_notify.set(false);
+            }
+            *last = next_selected;
+        }
+    }
+
+    fn sync_chips(&mut self, chips_snapshot: BTreeMap<Channel, Vec<AppChip>>) {
+        if chips_snapshot != self.last_chips_snapshot {
+            for (channel, list_box) in &self.chip_lists {
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+                let chips = chips_snapshot.get(channel).cloned().unwrap_or_default();
+                for chip in chips {
+                    list_box.insert(&build_chip_widget(&chip), -1);
+                }
+            }
+            self.last_chips_snapshot = chips_snapshot;
+        }
+    }
+}
+
 fn chip_drop_zone_class(channel: Channel) -> Option<&'static str> {
     match channel {
         Channel::Game => Some("chip-drop-zone-game"),
@@ -572,154 +783,31 @@ pub fn build_mixer_widget(
     root.append(&banner);
     root.append(&channels_row);
 
-    let model_for_refresh = model.clone();
-    let out_model = out_model.clone();
-    let in_model = in_model.clone();
-    let mut last_banner = String::new();
-    let mut last_out_devices: Vec<String> = Vec::new();
-    let mut last_in_devices: Vec<String> = Vec::new();
-    let mut last_out_selected: Option<u32> = None;
-    let mut last_in_selected: Option<u32> = None;
-    let mut last_chips_snapshot: BTreeMap<Channel, Vec<AppChip>> = BTreeMap::new();
-    let mut last_meter_levels: BTreeMap<Channel, f32> = BTreeMap::new();
-    let mut last_meter_tick = Instant::now();
+    let mut refresh = MixerRefreshState {
+        model: model.clone(),
+        out_model: out_model.clone(),
+        in_model: in_model.clone(),
+        banner_widget: banner,
+        output_dropdown,
+        input_dropdown,
+        suppress_device_notify,
+        meter_widgets,
+        slider_widgets,
+        chip_lists,
+        last_banner: String::new(),
+        last_out_devices: Vec::new(),
+        last_in_devices: Vec::new(),
+        last_out_selected: None,
+        last_in_selected: None,
+        last_chips_snapshot: BTreeMap::new(),
+        last_meter_levels: BTreeMap::new(),
+        last_meter_tick: Instant::now(),
+    };
+
     gtk::glib::timeout_add_local(
         std::time::Duration::from_millis(METER_UI_TICK_MS),
         move || {
-            if let Ok(state) = model_for_refresh.try_lock() {
-                let levels_snapshot = state.levels.clone();
-                let ui_dirty = state.take_ui_dirty();
-
-                let now = Instant::now();
-                let elapsed_ms = now.duration_since(last_meter_tick).as_millis() as u32;
-                last_meter_tick = now;
-                for channel in [
-                    Channel::Main,
-                    Channel::Mic,
-                    Channel::Game,
-                    Channel::Media,
-                    Channel::Chat,
-                    Channel::Aux,
-                ] {
-                    let (left, right) =
-                        levels_snapshot.get(&channel).copied().unwrap_or((0.0, 0.0));
-                    let max_fraction = state
-                        .strips
-                        .get(&channel)
-                        .map(|strip| strip.volume_linear.clamp(0.0, 1.0))
-                        .unwrap_or(1.0);
-                    let current = meter_display_fraction(left.max(right), max_fraction);
-                    let previous = *last_meter_levels.get(&channel).unwrap_or(&0.0);
-                    let next = decay_peak(previous, current, elapsed_ms);
-                    if let Some(widget) = meter_widgets.get(&channel) {
-                        widget.set_fraction(next as f64);
-                        widget.set_visible(meter_should_be_visible(next));
-                    }
-                    last_meter_levels.insert(channel, next);
-                }
-
-                // Volume sync — update sliders from model state
-                for (channel, handle) in &slider_widgets {
-                    if handle.is_dragging.get() {
-                        continue;
-                    }
-                    if let Some(strip_data) = state.strips.get(channel) {
-                        sync_slider_widget_from_model(handle, strip_data);
-                    }
-                }
-
-                if !ui_dirty {
-                    return gtk::glib::ControlFlow::Continue;
-                }
-
-                let banner_text = state.banner.clone().unwrap_or_default();
-                let out_devices = if state.devices.output_devices.is_empty() {
-                    vec![NO_DEVICES_FOUND.to_string()]
-                } else {
-                    state.devices.output_devices.clone()
-                };
-                let in_devices = if state.devices.input_devices.is_empty() {
-                    vec![NO_DEVICES_FOUND.to_string()]
-                } else {
-                    state.devices.input_devices.clone()
-                };
-                let selected_out = state
-                    .devices
-                    .selected_output
-                    .as_ref()
-                    .and_then(|sel| state.devices.output_devices.iter().position(|d| d == sel));
-                let selected_in = state
-                    .devices
-                    .selected_input
-                    .as_ref()
-                    .and_then(|sel| state.devices.input_devices.iter().position(|d| d == sel));
-                let out_labels_by_id = state.devices.output_labels_by_id.clone();
-                let in_labels_by_id = state.devices.input_labels_by_id.clone();
-                let chips_snapshot = state.chips.clone();
-                drop(state);
-
-                if banner_text != last_banner {
-                    banner.set_text(&banner_text);
-                    last_banner = banner_text;
-                }
-
-                if out_devices != last_out_devices {
-                    suppress_device_notify.set(true);
-                    out_model.splice(0, out_model.n_items(), &EMPTY_STRS);
-                    for dev in &out_devices {
-                        out_model.append(&display_device_label(&out_labels_by_id, dev));
-                    }
-                    last_out_devices = out_devices;
-                    suppress_device_notify.set(false);
-                }
-
-                if in_devices != last_in_devices {
-                    suppress_device_notify.set(true);
-                    in_model.splice(0, in_model.n_items(), &EMPTY_STRS);
-                    for dev in &in_devices {
-                        in_model.append(&display_device_label(&in_labels_by_id, dev));
-                    }
-                    last_in_devices = in_devices;
-                    suppress_device_notify.set(false);
-                }
-
-                let next_out_selected = selected_out.map(|idx| idx as u32);
-                if next_out_selected != last_out_selected {
-                    if let Some(idx) = next_out_selected
-                        && output_dropdown.selected() != idx
-                    {
-                        suppress_device_notify.set(true);
-                        output_dropdown.set_selected(idx);
-                        suppress_device_notify.set(false);
-                    }
-                    last_out_selected = next_out_selected;
-                }
-
-                let next_in_selected = selected_in.map(|idx| idx as u32);
-                if next_in_selected != last_in_selected {
-                    if let Some(idx) = next_in_selected
-                        && input_dropdown.selected() != idx
-                    {
-                        suppress_device_notify.set(true);
-                        input_dropdown.set_selected(idx);
-                        suppress_device_notify.set(false);
-                    }
-                    last_in_selected = next_in_selected;
-                }
-
-                if chips_snapshot != last_chips_snapshot {
-                    for (channel, list_box) in &chip_lists {
-                        while let Some(child) = list_box.first_child() {
-                            list_box.remove(&child);
-                        }
-                        let chips = chips_snapshot.get(channel).cloned().unwrap_or_default();
-                        for chip in chips {
-                            list_box.insert(&build_chip_widget(&chip), -1);
-                        }
-                    }
-                    last_chips_snapshot = chips_snapshot;
-                }
-            }
+            refresh.tick();
             gtk::glib::ControlFlow::Continue
         },
     );

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::config::persistence::{Paths, load_config, save_config};
+use crate::config::persistence::{load_config, save_config, Paths};
 use crate::config::schema::Hotkeys;
 
 #[derive(Debug, Clone)]
@@ -155,12 +155,16 @@ pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>
         hotkeys_group.append(&row);
     }
 
-    {
+    fn connect_hotkey_entry(
+        entry: &gtk::Entry,
+        model: &std::sync::Arc<std::sync::Mutex<SettingsTab>>,
+        setter: fn(&mut SettingsTab, String),
+    ) {
         let model = model.clone();
-        mute_main_entry.connect_changed(move |entry| {
+        entry.connect_changed(move |entry| {
             let mut persist: Option<(String, Hotkeys)> = None;
             if let Ok(mut state) = model.lock() {
-                state.mute_main_hotkey = entry.text().to_string();
+                setter(&mut state, entry.text().to_string());
                 persist = Some((state.config_path_label.clone(), state.hotkeys()));
             }
             if let Some((path, hotkeys)) = persist {
@@ -168,45 +172,13 @@ pub fn build_settings_widget(model: std::sync::Arc<std::sync::Mutex<SettingsTab>
             }
         });
     }
-    {
-        let model = model.clone();
-        mute_mic_entry.connect_changed(move |entry| {
-            let mut persist: Option<(String, Hotkeys)> = None;
-            if let Ok(mut state) = model.lock() {
-                state.mute_mic_hotkey = entry.text().to_string();
-                persist = Some((state.config_path_label.clone(), state.hotkeys()));
-            }
-            if let Some((path, hotkeys)) = persist {
-                let _ = persist_hotkeys_to_config(Path::new(&path), &hotkeys);
-            }
-        });
-    }
-    {
-        let model = model.clone();
-        ptt_entry.connect_changed(move |entry| {
-            let mut persist: Option<(String, Hotkeys)> = None;
-            if let Ok(mut state) = model.lock() {
-                state.push_to_talk_hotkey = entry.text().to_string();
-                persist = Some((state.config_path_label.clone(), state.hotkeys()));
-            }
-            if let Some((path, hotkeys)) = persist {
-                let _ = persist_hotkeys_to_config(Path::new(&path), &hotkeys);
-            }
-        });
-    }
-    {
-        let model = model.clone();
-        toggle_window_entry.connect_changed(move |entry| {
-            let mut persist: Option<(String, Hotkeys)> = None;
-            if let Ok(mut state) = model.lock() {
-                state.toggle_window_hotkey = entry.text().to_string();
-                persist = Some((state.config_path_label.clone(), state.hotkeys()));
-            }
-            if let Some((path, hotkeys)) = persist {
-                let _ = persist_hotkeys_to_config(Path::new(&path), &hotkeys);
-            }
-        });
-    }
+
+    connect_hotkey_entry(&mute_main_entry, &model, |s, v| s.mute_main_hotkey = v);
+    connect_hotkey_entry(&mute_mic_entry, &model, |s, v| s.mute_mic_hotkey = v);
+    connect_hotkey_entry(&ptt_entry, &model, |s, v| s.push_to_talk_hotkey = v);
+    connect_hotkey_entry(&toggle_window_entry, &model, |s, v| {
+        s.toggle_window_hotkey = v
+    });
 
     let config_group = gtk::Box::new(gtk::Orientation::Vertical, 4);
     config_group.add_css_class("settings-section");

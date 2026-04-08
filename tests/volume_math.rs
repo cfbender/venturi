@@ -1,5 +1,4 @@
-use venturi::core::meter::decay_peak;
-use venturi::core::volume::apply_mute;
+use venturi::core::meter::{apply_mute, decay_peak};
 
 #[test]
 fn mute_sets_output_to_zero() {
