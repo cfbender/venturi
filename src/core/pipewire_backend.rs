@@ -108,52 +108,6 @@ pub(crate) struct PwPlayProcess {
     child: Child,
 }
 
-pub(crate) struct SoundboardSession {
-    processes: Vec<Box<dyn DropAudioResource>>,
-}
-
-impl SoundboardSession {
-    pub(crate) fn new() -> Self {
-        Self { processes: Vec::new() }
-    }
-
-    pub(crate) fn add_process(&mut self, process: Box<dyn DropAudioResource>) {
-        self.processes.push(process);
-    }
-}
-
-impl Drop for SoundboardSession {
-    fn drop(&mut self) {
-        // Iterating over processes and relying on their Drop trait implementation
-        // to ensure cleanup happens exactly once per process.
-        // We drain the processes vector to force drop iteration here.
-        let mut processes_to_drop = std::mem::take(&mut self.processes);
-        while let Some(process) = processes_to_drop.pop() {
-            drop(process);
-        }
-    }
-}
-
-// Trait to unify all resources that need explicit cleanup
-pub trait DropAudioResource: Send + Sync {
-    fn stop(&mut self);
-}
-
-// Implement the trait for PwPlayProcess
-impl DropAudioResource for PwPlayProcess {
-    fn stop(&mut self) {
-        self.stop();
-    }
-}
-
-// Implement the trait for PwTargetSampler
-impl DropAudioResource for PwTargetSampler {
-    fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 impl PwPlayProcess {
     pub(crate) fn spawn(target: &str, file: &str) -> Result<Self, String> {
         let args = build_pw_play_args(target, file);
@@ -465,16 +419,17 @@ fn recreate_sound_sink_as_mono_if_needed(sink_name: &str) -> Result<(), String> 
     }
 
     // Existing sink is stereo — unload and recreate as mono.
-    let modules_raw = run_pactl(&vec![
+    let modules_raw = run_pactl(&[
         "list".to_string(),
         "short".to_string(),
         "modules".to_string(),
     ])?;
     for line in modules_raw.lines() {
-        if line.contains("module-null-sink") && line.contains(&format!("sink_name={sink_name}")) {
-            if let Some(module_id) = line.split_whitespace().next() {
-                unload_pactl_module(module_id)?;
-            }
+        if line.contains("module-null-sink")
+            && line.contains(&format!("sink_name={sink_name}"))
+            && let Some(module_id) = line.split_whitespace().next()
+        {
+            unload_pactl_module(module_id)?;
         }
     }
     let args = vec![

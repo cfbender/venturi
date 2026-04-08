@@ -26,13 +26,9 @@ pub(crate) fn node_id_to_channel(
         return Some(Channel::Mic);
     }
 
-    for channel in [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux] {
-        if category_mix_output_id(snapshot, channel) == Some(id) {
-            return Some(channel);
-        }
-    }
-
-    None
+    [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux]
+        .into_iter()
+        .find(|&channel| category_mix_output_id(snapshot, channel) == Some(id))
 }
 
 pub(crate) fn upsert_devices(
