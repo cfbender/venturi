@@ -17,18 +17,38 @@ pub(crate) fn node_id_to_channel(
     main_output_name: &str,
     virtual_source_name: &str,
 ) -> Option<Channel> {
-    // Only map Venturi main sink ID to Main.
-    if snapshot.output_ids.get(main_output_name).copied() == Some(id) {
-        return Some(Channel::Main);
-    }
-    // Only map Venturi virtual mic ID to Mic.
-    if snapshot.input_ids.get(virtual_source_name).copied() == Some(id) {
-        return Some(Channel::Mic);
-    }
+    ALL_CHANNELS.into_iter().find(|&channel| {
+        channel_node_id(snapshot, channel, main_output_name, virtual_source_name) == Some(id)
+    })
+}
 
-    [Channel::Game, Channel::Media, Channel::Chat, Channel::Aux]
-        .into_iter()
-        .find(|&channel| category_mix_output_id(snapshot, channel) == Some(id))
+pub(crate) const ALL_CHANNELS: [Channel; 6] = [
+    Channel::Main,
+    Channel::Mic,
+    Channel::Game,
+    Channel::Media,
+    Channel::Chat,
+    Channel::Aux,
+];
+
+/// Resolve the PipeWire node ID of the Venturi-owned bus that a channel controls.
+///
+/// Returns `None` when the bus node is not (yet) present in the snapshot. Callers
+/// must not fall back to `@DEFAULT_AUDIO_*@` in that case: doing so would apply
+/// volume/mute to whatever the user's system default device happens to be.
+pub(crate) fn channel_node_id(
+    snapshot: &Snapshot,
+    channel: Channel,
+    main_output_name: &str,
+    virtual_source_name: &str,
+) -> Option<u32> {
+    match channel {
+        Channel::Main => snapshot.output_ids.get(main_output_name).copied(),
+        Channel::Mic => snapshot.input_ids.get(virtual_source_name).copied(),
+        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
+            category_mix_output_id(snapshot, channel)
+        }
+    }
 }
 
 pub(crate) fn upsert_devices(
@@ -63,6 +83,7 @@ pub(crate) fn prune_removed_node_ids(
             let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
         }
         snapshot.volumes.remove(id);
+        snapshot.mutes.remove(id);
     }
 
     snapshot
@@ -93,6 +114,7 @@ pub(crate) fn apply_structural_monitor_delta(
             let _ = event_tx.send(CoreEvent::StreamRemoved(*id));
         }
         snapshot.volumes.remove(id);
+        snapshot.mutes.remove(id);
     }
 
     snapshot
@@ -111,6 +133,7 @@ pub(crate) fn apply_structural_monitor_delta(
         .input_meter_targets
         .extend(partial.input_meter_targets);
     snapshot.volumes.extend(partial.volumes);
+    snapshot.mutes.extend(partial.mutes);
 
     for (id, stream_info) in partial.streams {
         if !snapshot.streams.contains_key(&id) {
@@ -158,20 +181,27 @@ pub(crate) fn snapshot_channel_volumes(
     main_output_name: &str,
     virtual_source_name: &str,
 ) -> BTreeMap<Channel, f32> {
-    [
-        Channel::Main,
-        Channel::Mic,
-        Channel::Game,
-        Channel::Media,
-        Channel::Chat,
-        Channel::Aux,
-    ]
-    .into_iter()
-    .filter_map(|channel| {
-        channel_volume_from_snapshot(snapshot, channel, main_output_name, virtual_source_name)
-            .map(|v| (channel, v))
-    })
-    .collect()
+    ALL_CHANNELS
+        .into_iter()
+        .filter_map(|channel| {
+            channel_volume_from_snapshot(snapshot, channel, main_output_name, virtual_source_name)
+                .map(|v| (channel, v))
+        })
+        .collect()
+}
+
+pub(crate) fn snapshot_channel_mutes(
+    snapshot: &Snapshot,
+    main_output_name: &str,
+    virtual_source_name: &str,
+) -> BTreeMap<Channel, bool> {
+    ALL_CHANNELS
+        .into_iter()
+        .filter_map(|channel| {
+            channel_mute_from_snapshot(snapshot, channel, main_output_name, virtual_source_name)
+                .map(|m| (channel, m))
+        })
+        .collect()
 }
 
 pub(crate) fn channel_volume_from_snapshot(
@@ -180,20 +210,18 @@ pub(crate) fn channel_volume_from_snapshot(
     main_output_name: &str,
     virtual_source_name: &str,
 ) -> Option<f32> {
-    match channel {
-        Channel::Main => snapshot
-            .output_ids
-            .get(main_output_name)
-            .and_then(|main_id| snapshot.volumes.get(main_id).copied()),
-        Channel::Mic => snapshot
-            .input_ids
-            .get(virtual_source_name)
-            .and_then(|mic_id| snapshot.volumes.get(mic_id).copied()),
-        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            category_mix_output_id(snapshot, channel)
-                .and_then(|mix_id| snapshot.volumes.get(&mix_id).copied())
-        }
-    }
+    let id = channel_node_id(snapshot, channel, main_output_name, virtual_source_name)?;
+    snapshot.volumes.get(&id).copied()
+}
+
+pub(crate) fn channel_mute_from_snapshot(
+    snapshot: &Snapshot,
+    channel: Channel,
+    main_output_name: &str,
+    virtual_source_name: &str,
+) -> Option<bool> {
+    let id = channel_node_id(snapshot, channel, main_output_name, virtual_source_name)?;
+    snapshot.mutes.get(&id).copied()
 }
 
 pub(crate) fn category_mix_output_id(snapshot: &Snapshot, channel: Channel) -> Option<u32> {
@@ -208,26 +236,25 @@ pub(crate) fn apply_snapshot_volume_hint(
     main_output_name: &str,
     virtual_source_name: &str,
 ) {
-    match channel {
-        Channel::Main => {
-            if let Some(main_id) = snapshot.output_ids.get(main_output_name).copied() {
-                snapshot.volumes.insert(main_id, volume);
-            }
-        }
-        Channel::Mic => {
-            if let Some(mic_id) = snapshot.input_ids.get(virtual_source_name).copied() {
-                snapshot.volumes.insert(mic_id, volume);
-            }
-        }
-        Channel::Game | Channel::Media | Channel::Chat | Channel::Aux => {
-            if let Some(mix_id) = category_mix_output_id(snapshot, channel) {
-                snapshot.volumes.insert(mix_id, volume);
-            }
-        }
+    if let Some(id) = channel_node_id(snapshot, channel, main_output_name, virtual_source_name) {
+        snapshot.volumes.insert(id, volume);
     }
 }
 
-pub(crate) fn emit_snapshot_channel_volumes(
+pub(crate) fn apply_snapshot_mute_hint(
+    snapshot: &mut Snapshot,
+    channel: Channel,
+    muted: bool,
+    main_output_name: &str,
+    virtual_source_name: &str,
+) {
+    if let Some(id) = channel_node_id(snapshot, channel, main_output_name, virtual_source_name) {
+        snapshot.mutes.insert(id, muted);
+    }
+}
+
+/// Emit the current PipeWire volume and mute state of every Venturi channel bus.
+pub(crate) fn emit_snapshot_channel_state(
     snapshot: &Snapshot,
     event_tx: &Sender<CoreEvent>,
     main_output_name: &str,
@@ -237,5 +264,10 @@ pub(crate) fn emit_snapshot_channel_volumes(
         .into_iter()
         .for_each(|(channel, volume)| {
             let _ = event_tx.send(CoreEvent::VolumeChanged(channel, volume));
+        });
+    snapshot_channel_mutes(snapshot, main_output_name, virtual_source_name)
+        .into_iter()
+        .for_each(|(channel, muted)| {
+            let _ = event_tx.send(CoreEvent::MuteChanged(channel, muted));
         });
 }

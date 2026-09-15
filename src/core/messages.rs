@@ -80,6 +80,8 @@ pub enum CoreEvent {
     StreamRemoved(u32),
     LevelsUpdate(Vec<(Channel, (f32, f32))>),
     VolumeChanged(Channel, f32),
+    /// Mute state of a Venturi channel bus as observed in PipeWire.
+    MuteChanged(Channel, bool),
     DevicesChanged(Vec<DeviceEntry>),
     DeviceSelectionChanged {
         selected_output: Option<String>,

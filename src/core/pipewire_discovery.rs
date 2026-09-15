@@ -23,6 +23,70 @@ pub(crate) struct Snapshot {
     pub input_meter_targets: BTreeMap<String, u32>,
     pub streams: BTreeMap<u32, StreamInfo>,
     pub volumes: BTreeMap<u32, f32>,
+    pub mutes: BTreeMap<u32, bool>,
+    /// Effective `default.audio.sink` from the `default` metadata object.
+    pub default_sink: Option<String>,
+    /// Effective `default.audio.source` from the `default` metadata object.
+    pub default_source: Option<String>,
+}
+
+const METADATA_TYPE: &str = "PipeWire:Interface:Metadata";
+pub(crate) const DEFAULT_SINK_METADATA_KEY: &str = "default.audio.sink";
+pub(crate) const DEFAULT_SOURCE_METADATA_KEY: &str = "default.audio.source";
+
+pub(crate) fn is_metadata_object(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some(METADATA_TYPE)
+}
+
+/// Extract `default.audio.sink` / `default.audio.source` updates from a pw-dump
+/// object if it is the `default` metadata object.
+///
+/// Returns one entry per changed key with the new node name (`None` when the key
+/// was cleared). In `--monitor` mode pw-dump only re-emits the entries that
+/// changed, so callers must merge these into existing state rather than replace it.
+pub(crate) fn extract_default_metadata(item: &Value) -> Vec<(&'static str, Option<String>)> {
+    if !is_metadata_object(item) {
+        return Vec::new();
+    }
+    let metadata_name = item
+        .get("props")
+        .and_then(|p| p.get("metadata.name"))
+        .and_then(Value::as_str);
+    if metadata_name != Some("default") {
+        return Vec::new();
+    }
+
+    let Some(entries) = item.get("metadata").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let key = match entry.get("key").and_then(Value::as_str) {
+                Some(DEFAULT_SINK_METADATA_KEY) => DEFAULT_SINK_METADATA_KEY,
+                Some(DEFAULT_SOURCE_METADATA_KEY) => DEFAULT_SOURCE_METADATA_KEY,
+                _ => return None,
+            };
+            let name = entry
+                .get("value")
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned);
+            Some((key, name))
+        })
+        .collect()
+}
+
+/// Extract the mute flag from a PipeWire node's `Props` param.
+///
+/// Returns `None` if the node has no `Props` param or the param has no `mute` field.
+pub(crate) fn extract_mute(item: &Value) -> Option<bool> {
+    let props_array = item.get("info")?.get("params")?.get("Props")?.as_array()?;
+    props_array
+        .iter()
+        .find_map(|props| props.get("mute").and_then(Value::as_bool))
 }
 
 /// Extract the volume from a PipeWire node's channelVolumes property, converted to linear scale.
@@ -75,8 +139,18 @@ pub(crate) fn parse_pw_dump(
     let mut output_meter_targets = BTreeMap::new();
     let mut input_meter_targets = BTreeMap::new();
     let mut streams = BTreeMap::new();
+    let mut default_sink = None;
+    let mut default_source = None;
 
     for item in arr {
+        for (key, name) in extract_default_metadata(item) {
+            match key {
+                DEFAULT_SINK_METADATA_KEY => default_sink = name,
+                DEFAULT_SOURCE_METADATA_KEY => default_source = name,
+                _ => {}
+            }
+        }
+
         let id = item
             .get("id")
             .and_then(Value::as_u64)
@@ -222,13 +296,18 @@ pub(crate) fn parse_pw_dump(
     devices.extend(outputs.into_values());
     devices.extend(inputs.into_values());
 
-    // Extract volumes for all nodes
+    // Extract volumes and mute flags for all nodes
     let mut volumes = BTreeMap::new();
+    let mut mutes = BTreeMap::new();
     for item in arr {
-        if let Some(id) = item.get("id").and_then(|v| v.as_u64())
-            && let Some(vol) = extract_volume(item)
-        {
+        let Some(id) = item.get("id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if let Some(vol) = extract_volume(item) {
             volumes.insert(id as u32, vol);
+        }
+        if let Some(muted) = extract_mute(item) {
+            mutes.insert(id as u32, muted);
         }
     }
 
@@ -240,6 +319,9 @@ pub(crate) fn parse_pw_dump(
         input_meter_targets,
         streams,
         volumes,
+        mutes,
+        default_sink,
+        default_source,
     })
 }
 
@@ -348,7 +430,7 @@ fn preferred_device_label(props: &serde_json::Map<String, Value>, node_name: &st
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_volume, parse_pw_dump};
+    use super::{extract_default_metadata, extract_mute, extract_volume, parse_pw_dump};
     use crate::core::messages::DeviceKind;
 
     #[test]
@@ -582,5 +664,69 @@ mod tests {
         });
         // Empty array → max is 0.0 (or we could return None). Per spec, fold starts at 0.0.
         assert_eq!(extract_volume(&node), Some(0.0));
+    }
+
+    #[test]
+    fn extract_mute_reads_props_mute_flag() {
+        let muted: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": { "params": { "Props": [ { "mute": true, "channelVolumes": [1.0, 1.0] } ] } }
+        });
+        let unmuted: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": { "params": { "Props": [ { "mute": false } ] } }
+        });
+        let no_props: serde_json::Value = serde_json::json!({
+            "id": 42,
+            "info": { "props": { "node.name": "foo" } }
+        });
+
+        assert_eq!(extract_mute(&muted), Some(true));
+        assert_eq!(extract_mute(&unmuted), Some(false));
+        assert_eq!(extract_mute(&no_props), None);
+    }
+
+    #[test]
+    fn parse_pw_dump_collects_mutes_and_default_devices() {
+        let empty: [&'static str; 0] = [];
+        let raw = r#"[
+          {"id": 30, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+           "metadata": [
+             {"subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON", "value": {"name": "alsa_output.usb"}},
+             {"subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON", "value": {"name": "alsa_input.usb"}},
+             {"subject": 0, "key": "default.configured.audio.source", "type": "Spa:String:JSON", "value": {"name": "ignored"}}
+           ]},
+          {"id": 31, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "settings"},
+           "metadata": [ {"subject": 0, "key": "default.audio.sink", "value": {"name": "not-the-default-object"}} ]},
+          {"id": 12, "info": {"props": {"media.class": "Audio/Sink", "node.name": "Venturi-Output"},
+                              "params": {"Props": [{"mute": true, "channelVolumes": [0.125, 0.125]}]}}},
+          {"id": 13, "info": {"props": {"media.class": "Audio/Source", "node.name": "Venturi-VirtualMic"},
+                              "params": {"Props": [{"mute": false}]}}}
+        ]"#;
+
+        let snapshot = parse_pw_dump(raw, &empty, &empty).expect("parse");
+
+        assert_eq!(snapshot.default_sink.as_deref(), Some("alsa_output.usb"));
+        assert_eq!(snapshot.default_source.as_deref(), Some("alsa_input.usb"));
+        assert_eq!(snapshot.mutes.get(&12), Some(&true));
+        assert_eq!(snapshot.mutes.get(&13), Some(&false));
+        assert!((snapshot.volumes.get(&12).copied().unwrap() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn extract_default_metadata_reports_cleared_keys_and_ignores_other_objects() {
+        let cleared: serde_json::Value = serde_json::json!({
+            "id": 30, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+            "metadata": [ {"subject": 0, "key": "default.audio.source", "type": null, "value": null} ]
+        });
+        let node: serde_json::Value = serde_json::json!({
+            "id": 12, "info": {"props": {"media.class": "Audio/Sink"}}
+        });
+
+        assert_eq!(
+            extract_default_metadata(&cleared),
+            vec![("default.audio.source", None)]
+        );
+        assert!(extract_default_metadata(&node).is_empty());
     }
 }

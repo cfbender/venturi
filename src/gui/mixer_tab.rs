@@ -184,6 +184,12 @@ impl MixerTab {
                 }
                 self.ui_dirty.store(true, Ordering::Relaxed);
             }
+            CoreEvent::MuteChanged(channel, muted) => {
+                if let Some(strip) = self.strips.get_mut(channel) {
+                    strip.muted = *muted;
+                }
+                self.ui_dirty.store(true, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -457,8 +463,12 @@ impl MixerRefreshState {
     }
 
     fn tick_sliders(&self, strips: &BTreeMap<Channel, ChannelStrip>) {
+        let now = Instant::now();
         for (channel, handle) in &self.slider_widgets {
-            if handle.is_dragging.get() {
+            // Leave the widgets alone while the user is interacting with them
+            // and for a short grace period afterwards; the core's echo of the
+            // change lands in the model in the meantime.
+            if handle.is_dragging.get() || handle.within_user_input_grace(now) {
                 continue;
             }
             if let Some(strip_data) = strips.get(channel) {
@@ -693,7 +703,7 @@ pub fn build_mixer_widget(
         channel_col.set_valign(gtk::Align::Fill);
         channel_col.add_css_class("channel-surface");
         let (strip_widget, meter, slider_handle) =
-            build_strip_widget_with_meter(strip, command_tx.clone());
+            build_strip_widget_with_meter(strip, model.clone(), command_tx.clone());
         channel_col.append(&strip_widget);
         meter_widgets.insert(channel, meter);
         slider_widgets.insert(channel, slider_handle);
@@ -855,6 +865,12 @@ fn sync_slider_widget_from_model(handle: &SliderHandle, strip_data: &ChannelStri
         handle.suppress_signal.set(false);
     }
 
+    if handle.mute_button.is_active() != strip_data.muted {
+        handle.suppress_signal.set(true);
+        handle.mute_button.set_active(strip_data.muted);
+        handle.suppress_signal.set(false);
+    }
+
     if handle.value_label.text().as_str() != next_label {
         handle.value_label.set_text(&next_label);
     }
@@ -999,6 +1015,31 @@ mod tests {
 
         let strip = mixer.strips.get(&Channel::Main).unwrap();
         assert!((strip.volume_linear - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn apply_mute_changed_updates_strip_model_without_touching_volume() {
+        let mut mixer = MixerTab::default();
+        mixer.strips.insert(
+            Channel::Mic,
+            ChannelStrip {
+                channel: Channel::Mic,
+                icon: "🎤",
+                label: "Mic",
+                volume_linear: 0.5,
+                muted: false,
+            },
+        );
+
+        mixer.apply_event(&CoreEvent::MuteChanged(Channel::Mic, true));
+
+        let strip = mixer.strips.get(&Channel::Mic).unwrap();
+        assert!(strip.muted);
+        assert!((strip.volume_linear - 0.5).abs() < 0.001);
+        assert_eq!(strip.volume_text(), "0%");
+
+        mixer.apply_event(&CoreEvent::MuteChanged(Channel::Mic, false));
+        assert!(!mixer.strips.get(&Channel::Mic).unwrap().muted);
     }
 
     #[test]

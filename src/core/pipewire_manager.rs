@@ -11,28 +11,32 @@ use crate::config::persistence::{DebouncedSaver, Paths, ensure_dirs, load_config
 use crate::core::command_coalescing::coalesce_commands;
 #[cfg_attr(test, allow(unused_imports))]
 use crate::core::device_routing::{
-    config_device_value, resolve_output_loopback_target,
-    resolve_selected_input_name, selected_device_available, should_skip_output_device_reconcile,
+    config_device_value, resolve_output_loopback_target, resolve_virtual_mic_master,
+    selected_device_available, should_skip_output_device_reconcile,
 };
 use crate::core::hotkeys::{
     HotkeyAdapter, HotkeyBindings, HotkeyState, build_adapter, collect_adapter_commands,
 };
-use crate::core::messages::{CoreCommand, CoreEvent, DeviceKind};
+use crate::core::messages::{Channel, CoreCommand, CoreEvent, DeviceKind};
 use crate::core::meter_worker::spawn_meter_worker;
+#[cfg_attr(test, allow(unused_imports))]
 use crate::core::pipewire_backend::{
-    PwPlayProcess, current_default_sink_name, ensure_virtual_devices,
+    PwPlayProcess, current_default_sink_name, current_default_source_name, ensure_virtual_devices,
     reconcile_monitor_loopback_modules, rewire_virtual_mic_source, run_pw_metadata,
-    unload_pactl_module,
 };
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
 };
-use crate::core::pipewire_discovery::{Snapshot, extract_volume, parse_pw_dump};
+use crate::core::pipewire_discovery::{
+    DEFAULT_SINK_METADATA_KEY, DEFAULT_SOURCE_METADATA_KEY, Snapshot, extract_default_metadata,
+    extract_mute, extract_volume, is_metadata_object, parse_pw_dump,
+};
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{build_metadata_legacy_target_args, build_metadata_target_args};
 use crate::core::snapshot_ops::{
-    apply_snapshot_volume_hint, apply_structural_monitor_delta, channel_volume_from_snapshot,
-    emit_snapshot_channel_volumes, node_id_to_channel, prune_removed_node_ids,
+    apply_snapshot_mute_hint, apply_snapshot_volume_hint, apply_structural_monitor_delta,
+    channel_mute_from_snapshot, channel_volume_from_snapshot, emit_snapshot_channel_state,
+    node_id_to_channel, prune_removed_node_ids,
 };
 use crate::core::soundboard_playback::{
     SoundboardPlaybackMode, SoundboardPlaybackRoute, cleanup_soundboard_players,
@@ -71,10 +75,13 @@ const LEGACY_VENTURI_SINKS: [&str; 1] = ["Venturi-Mic"];
 #[cfg(test)]
 fn keep_pipewire_backend_symbols_for_tests() {
     let _ = current_default_sink_name as fn() -> Result<Option<String>, String>;
+    let _ = current_default_source_name as fn() -> Result<Option<String>, String>;
     let _ = reconcile_monitor_loopback_modules
         as fn(&str, Option<&str>) -> Result<Option<String>, String>;
-    let _ = unload_pactl_module as fn(&str) -> Result<(), String>;
+    let _ = rewire_virtual_mic_source as fn(&str, &str, bool) -> Result<String, String>;
+    let _ = ensure_virtual_devices as fn(&[&str], &[&str], &[&str]) -> Result<(), String>;
     let _ = VENTURI_MAIN_MONITOR;
+    let _ = LEGACY_VENTURI_SINKS;
 }
 
 pub struct PipeWireManager {
@@ -104,10 +111,6 @@ struct CoreRuntimeState {
     selected_input: Option<String>,
     output_loopback_module: Option<String>,
     virtual_mic_module: Option<String>,
-    last_sink_volume_by_target: BTreeMap<String, f32>,
-    last_source_volume_by_target: BTreeMap<String, f32>,
-    last_sink_mute_by_target: BTreeMap<String, bool>,
-    last_source_mute_by_target: BTreeMap<String, bool>,
     runtime_state: crate::config::schema::State,
     state_saver: DebouncedSaver,
     soundboard_players: BTreeMap<(u32, SoundboardPlaybackRoute), PwPlayProcess>,
@@ -175,10 +178,6 @@ impl CoreRuntimeState {
             selected_input,
             output_loopback_module: None,
             virtual_mic_module: None,
-            last_sink_volume_by_target: BTreeMap::new(),
-            last_source_volume_by_target: BTreeMap::new(),
-            last_sink_mute_by_target: BTreeMap::new(),
-            last_source_mute_by_target: BTreeMap::new(),
             runtime_state,
             state_saver: DebouncedSaver::new(),
             soundboard_players: BTreeMap::new(),
@@ -194,26 +193,10 @@ impl CoreRuntimeState {
 
         state.overrides = deserialize_overrides(&state.runtime_config.categorizer.overrides);
 
-        if let Err(err) = ensure_virtual_devices(
-            VIRTUAL_SINKS.as_slice(),
-            VIRTUAL_SOURCES.as_slice(),
-            LEGACY_VENTURI_SINKS.as_slice(),
-        ) {
-            let _ = event_tx.send(CoreEvent::Error(format!(
-                "failed to create virtual devices: {err}"
-            )));
-        }
+        state.ensure_virtual_devices_present(event_tx);
 
-        if let Ok(Some(source_name)) = resolve_selected_input_name(state.selected_input.as_deref())
-        {
-            match rewire_virtual_mic_source(&source_name, VIRTUAL_SOURCES[0]) {
-                Ok(module_id) => state.virtual_mic_module = Some(module_id),
-                Err(err) => {
-                    let _ = event_tx.send(CoreEvent::Error(format!(
-                        "failed to route virtual mic from {source_name}: {err}"
-                    )));
-                }
-            }
+        if let Err(err) = state.reconcile_input_route(false) {
+            let _ = event_tx.send(CoreEvent::Error(err));
         }
 
         if let Some(output_name) = selected_output
@@ -237,32 +220,27 @@ impl CoreRuntimeState {
                 self.resend_initial_state(event_tx);
             }
             CoreCommand::SetVolume(channel, volume) => {
+                set_persisted_channel_volume(&mut self.runtime_state, channel, volume);
+                self.state_saver.mark_dirty(Instant::now());
+
                 let applied_volume = apply_channel_volume(
                     channel,
                     volume,
                     &self.last_snapshot,
-                    ChannelControlTargets {
-                        virtual_input_source_name: VIRTUAL_SOURCES[0],
-                        main_output_sink_name: VENTURI_MAIN_OUTPUT,
-                    },
-                    &mut self.last_sink_volume_by_target,
-                    &mut self.last_source_volume_by_target,
+                    channel_control_targets(),
+                )
+                .map_err(|err| format!("failed to set {channel:?} volume: {err}"))?;
+                apply_snapshot_volume_hint(
+                    &mut self.last_snapshot,
+                    channel,
+                    applied_volume,
+                    VENTURI_MAIN_OUTPUT,
+                    VIRTUAL_SOURCES[0],
                 );
-                if let Some(applied_volume) = applied_volume {
-                    apply_snapshot_volume_hint(
-                        &mut self.last_snapshot,
-                        channel,
-                        applied_volume,
-                        VENTURI_MAIN_OUTPUT,
-                        VIRTUAL_SOURCES[0],
-                    );
-                    let _ = event_tx.send(CoreEvent::VolumeChanged(channel, applied_volume));
-                }
-                set_persisted_channel_volume(&mut self.runtime_state, channel, volume);
-                self.state_saver.mark_dirty(Instant::now());
+                let _ = event_tx.send(CoreEvent::VolumeChanged(channel, applied_volume));
             }
             CoreCommand::SetMute(channel, muted) => {
-                self.apply_mute(channel, muted);
+                self.apply_mute(channel, muted, event_tx)?;
             }
             CoreCommand::MoveStream { stream_id, channel } => {
                 self.handle_move_stream(stream_id, channel)?;
@@ -322,7 +300,9 @@ impl CoreRuntimeState {
         for command in commands {
             match command {
                 CoreCommand::SetMute(channel, muted) => {
-                    self.apply_mute(channel, muted);
+                    if let Err(err) = self.apply_mute(channel, muted, event_tx) {
+                        let _ = event_tx.send(CoreEvent::Error(err));
+                    }
                 }
                 CoreCommand::ToggleWindow => {
                     let _ = event_tx.send(CoreEvent::ToggleWindowRequested);
@@ -332,28 +312,74 @@ impl CoreRuntimeState {
         }
     }
 
-    fn apply_mute(&mut self, channel: crate::core::messages::Channel, muted: bool) {
-        if channel == crate::core::messages::Channel::Main {
-            self.hotkey_state.main_muted = muted;
-        }
-        if channel == crate::core::messages::Channel::Mic {
-            self.hotkey_state.mic_muted = muted;
-        }
+    /// Mute/unmute a channel bus in PipeWire and broadcast the resulting state.
+    ///
+    /// The mute state is not cached locally: PipeWire is the source of truth
+    /// and `merge_changed_objects` mirrors external changes back to us, so the
+    /// command is always issued and the snapshot/hotkey view updated from it.
+    fn apply_mute(
+        &mut self,
+        channel: Channel,
+        muted: bool,
+        event_tx: &Sender<CoreEvent>,
+    ) -> Result<(), String> {
+        set_persisted_channel_mute(&mut self.runtime_state, channel, muted);
+        self.state_saver.mark_dirty(Instant::now());
 
         apply_channel_mute(
             channel,
             muted,
             &self.last_snapshot,
-            ChannelControlTargets {
-                virtual_input_source_name: VIRTUAL_SOURCES[0],
-                main_output_sink_name: VENTURI_MAIN_OUTPUT,
-            },
-            &mut self.last_sink_mute_by_target,
-            &mut self.last_source_mute_by_target,
-        );
+            channel_control_targets(),
+        )
+        .map_err(|err| format!("failed to set {channel:?} mute: {err}"))?;
 
-        set_persisted_channel_mute(&mut self.runtime_state, channel, muted);
-        self.state_saver.mark_dirty(Instant::now());
+        apply_snapshot_mute_hint(
+            &mut self.last_snapshot,
+            channel,
+            muted,
+            VENTURI_MAIN_OUTPUT,
+            VIRTUAL_SOURCES[0],
+        );
+        self.note_channel_mute(channel, muted);
+        let _ = event_tx.send(CoreEvent::MuteChanged(channel, muted));
+        Ok(())
+    }
+
+    fn note_channel_mute(&mut self, channel: Channel, muted: bool) {
+        match channel {
+            Channel::Main => self.hotkey_state.main_muted = muted,
+            Channel::Mic => self.hotkey_state.mic_muted = muted,
+            _ => {}
+        }
+    }
+
+    /// (Re)create Venturi's virtual sinks/sources and their internal loopbacks.
+    fn ensure_virtual_devices_present(&mut self, event_tx: &Sender<CoreEvent>) {
+        #[cfg(test)]
+        {
+            let _ = event_tx;
+        }
+
+        #[cfg(not(test))]
+        if let Err(err) = ensure_virtual_devices(
+            VIRTUAL_SINKS.as_slice(),
+            VIRTUAL_SOURCES.as_slice(),
+            LEGACY_VENTURI_SINKS.as_slice(),
+        ) {
+            let _ = event_tx.send(CoreEvent::Error(format!(
+                "failed to create virtual devices: {err}"
+            )));
+        }
+    }
+
+    fn virtual_devices_missing(&self) -> bool {
+        VIRTUAL_SINKS
+            .iter()
+            .any(|sink| !self.last_snapshot.output_ids.contains_key(*sink))
+            || VIRTUAL_SOURCES
+                .iter()
+                .any(|source| !self.last_snapshot.input_ids.contains_key(*source))
     }
 
     fn handle_move_stream(
@@ -523,41 +549,57 @@ impl CoreRuntimeState {
         }
     }
 
-    fn reconcile_input_route(&mut self) -> Result<(), String> {
+    /// The system default source, preferring the live `pw-dump` metadata and
+    /// falling back to `pactl info` before the first snapshot has arrived.
+    fn current_default_source(&self) -> Result<Option<String>, String> {
+        if self.last_snapshot.default_source.is_some() {
+            return Ok(self.last_snapshot.default_source.clone());
+        }
+
+        #[cfg(test)]
+        {
+            Ok(None)
+        }
+
+        #[cfg(not(test))]
+        {
+            current_default_source_name()
+        }
+    }
+
+    /// Point the virtual mic at the hardware source implied by the current
+    /// input selection. Cheap when the remap module already targets that
+    /// source; `force_reload` recreates it regardless (used after the device
+    /// was unplugged and re-appeared, when the remap silently re-attached to
+    /// whatever WirePlumber picked as fallback).
+    fn reconcile_input_route(&mut self, force_reload: bool) -> Result<(), String> {
+        let default_source = self
+            .current_default_source()
+            .map_err(|err| format!("failed to resolve default input source: {err}"))?;
+        let Some(master) = resolve_virtual_mic_master(
+            self.selected_input.as_deref(),
+            default_source.as_deref(),
+            &self.last_snapshot.devices,
+            VIRTUAL_SOURCES[0],
+        ) else {
+            // No hardware input at all; keep whatever module exists and retry
+            // when devices change.
+            return Ok(());
+        };
+
         #[cfg(test)]
         {
             keep_pipewire_backend_symbols_for_tests();
-            self.virtual_mic_module = Some("test-virtual-mic-module".to_string());
+            let _ = force_reload;
+            self.virtual_mic_module = Some(format!("test-virtual-mic-module:{master}"));
             Ok(())
         }
 
         #[cfg(not(test))]
         {
-            match resolve_selected_input_name(self.selected_input.as_deref()) {
-                Ok(Some(source_name)) => {
-                    if let Some(prev_module) = self.virtual_mic_module.take()
-                        && let Err(err) = unload_pactl_module(&prev_module)
-                    {
-                        return Err(format!(
-                            "failed to unload virtual mic module {prev_module}: {err}"
-                        ));
-                    }
-                    match rewire_virtual_mic_source(&source_name, VIRTUAL_SOURCES[0]) {
-                        Ok(module_id) => {
-                            self.virtual_mic_module = Some(module_id);
-                        }
-                        Err(err) => {
-                            return Err(format!(
-                                "failed to route virtual mic from {source_name}: {err}"
-                            ));
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    return Err(format!("failed to resolve selected input source: {err}"));
-                }
-            }
+            let module_id = rewire_virtual_mic_source(&master, VIRTUAL_SOURCES[0], force_reload)
+                .map_err(|err| format!("failed to route virtual mic from {master}: {err}"))?;
+            self.virtual_mic_module = Some(module_id);
             Ok(())
         }
     }
@@ -603,7 +645,10 @@ impl CoreRuntimeState {
         }
 
         self.selected_input = Some(device.to_string());
-        self.reconcile_input_route()?;
+        // `force` is set when restoring a device that re-appeared after being
+        // unplugged; the remap module must then be recreated even though it
+        // still nominally points at the same master.
+        self.reconcile_input_route(force)?;
 
         self.input_restore_pending = false;
         if selection_changed {
@@ -649,12 +694,27 @@ impl CoreRuntimeState {
                 category,
             });
         }
-        emit_snapshot_channel_volumes(
+        emit_snapshot_channel_state(
             &self.last_snapshot,
             event_tx,
             VENTURI_MAIN_OUTPUT,
             VIRTUAL_SOURCES[0],
         );
+    }
+
+    /// Mirror the snapshot's mute flags into the hotkey toggle state so a
+    /// hotkey press toggles relative to what PipeWire actually reports.
+    fn sync_hotkey_state_from_snapshot(&mut self) {
+        for channel in [Channel::Main, Channel::Mic] {
+            if let Some(muted) = channel_mute_from_snapshot(
+                &self.last_snapshot,
+                channel,
+                VENTURI_MAIN_OUTPUT,
+                VIRTUAL_SOURCES[0],
+            ) {
+                self.note_channel_mute(channel, muted);
+            }
+        }
     }
 
     fn handle_monitor_event(
@@ -700,15 +760,32 @@ impl CoreRuntimeState {
                 self.restart_pending_until = None;
 
                 self.last_snapshot = snapshot;
+
+                // A fresh monitor snapshot is also what we get after PipeWire
+                // itself restarted, in which case all of our virtual nodes are
+                // gone and must be recreated before anything can be routed.
+                // (`handle_monitor_died` already flagged the output/input
+                // routes for restore; `ensure_virtual_devices` is idempotent.)
+                if self.virtual_devices_missing() {
+                    self.ensure_virtual_devices_present(event_tx);
+                }
+
                 self.route_stream_targets_for_reconcile(
                     &stream_ids_before,
                     &output_ids_before,
                     event_tx,
                 );
                 self.poll_selected_device_restore(event_tx, true);
+                // The default source may have changed while we were not
+                // watching (or may be Venturi's own virtual mic); make sure the
+                // virtual mic follows a real hardware source.
+                if let Err(err) = self.reconcile_input_route(false) {
+                    let _ = event_tx.send(CoreEvent::Error(err));
+                }
+                self.sync_hotkey_state_from_snapshot();
                 // Update shared snapshot for meter worker
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
-                emit_snapshot_channel_volumes(
+                emit_snapshot_channel_state(
                     &self.last_snapshot,
                     event_tx,
                     VENTURI_MAIN_OUTPUT,
@@ -765,11 +842,28 @@ impl CoreRuntimeState {
         let mut structural_ids = Vec::new();
         let stream_ids_before: BTreeSet<u32> = self.last_snapshot.streams.keys().copied().collect();
         let output_ids_before = self.last_snapshot.output_ids.clone();
+        let default_sink_before = self.last_snapshot.default_sink.clone();
+        let default_source_before = self.last_snapshot.default_source.clone();
 
         for obj in objects {
             let Some(id) = obj.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else {
                 continue;
             };
+
+            // Metadata objects have no `info` and must not be mistaken for node
+            // removals. The "default" metadata object carries the default
+            // sink/source names; in monitor mode only the changed keys are
+            // re-emitted, so merge per key rather than replacing the whole set.
+            if is_metadata_object(obj) {
+                for (key, name) in extract_default_metadata(obj) {
+                    match key {
+                        DEFAULT_SINK_METADATA_KEY => self.last_snapshot.default_sink = name,
+                        DEFAULT_SOURCE_METADATA_KEY => self.last_snapshot.default_source = name,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
 
             let removed = obj.get("info").is_none_or(serde_json::Value::is_null);
             if removed {
@@ -817,6 +911,22 @@ impl CoreRuntimeState {
                     }
                 }
             }
+
+            // Check for mute changes (from us, wpctl, pavucontrol, hardware keys, ...).
+            if let Some(new_mute) = extract_mute(obj)
+                && self.last_snapshot.mutes.get(&id) != Some(&new_mute)
+            {
+                self.last_snapshot.mutes.insert(id, new_mute);
+                if let Some(channel) = node_id_to_channel(
+                    id,
+                    &self.last_snapshot,
+                    VENTURI_MAIN_OUTPUT,
+                    VIRTUAL_SOURCES[0],
+                ) {
+                    self.note_channel_mute(channel, new_mute);
+                    let _ = event_tx.send(CoreEvent::MuteChanged(channel, new_mute));
+                }
+            }
         }
 
         // Incremental structural diffing: re-parse changed objects for device/stream changes.
@@ -839,6 +949,45 @@ impl CoreRuntimeState {
         }
 
         self.route_stream_targets_for_reconcile(&stream_ids_before, &output_ids_before, event_tx);
+        self.follow_default_device_changes(
+            default_sink_before.as_deref(),
+            default_source_before.as_deref(),
+            event_tx,
+        );
+    }
+
+    /// When the user has "Default" selected, re-route whenever the system
+    /// default sink/source changes so the selection actually follows it.
+    fn follow_default_device_changes(
+        &mut self,
+        default_sink_before: Option<&str>,
+        default_source_before: Option<&str>,
+        event_tx: &crossbeam_channel::Sender<CoreEvent>,
+    ) {
+        let selection_is_default = |selected: Option<&str>| {
+            selected.is_some_and(|s| s.eq_ignore_ascii_case(fallback_to_default_device()))
+        };
+
+        if self.last_snapshot.default_source.as_deref() != default_source_before
+            && selection_is_default(self.selected_input.as_deref())
+            && let Err(err) = self.reconcile_input_route(false)
+        {
+            let _ = event_tx.send(CoreEvent::Error(err));
+        }
+
+        if self.last_snapshot.default_sink.as_deref() != default_sink_before
+            && selection_is_default(self.selected_output.as_deref())
+            && let Err(err) = self.reconcile_output_route(fallback_to_default_device())
+        {
+            let _ = event_tx.send(CoreEvent::Error(err));
+        }
+    }
+}
+
+fn channel_control_targets() -> ChannelControlTargets<'static> {
+    ChannelControlTargets {
+        virtual_input_source_name: VIRTUAL_SOURCES[0],
+        main_output_sink_name: VENTURI_MAIN_OUTPUT,
     }
 }
 
@@ -1026,10 +1175,6 @@ mod tests {
             selected_input: selected_input.map(str::to_string),
             output_loopback_module: None,
             virtual_mic_module: None,
-            last_sink_volume_by_target: BTreeMap::new(),
-            last_source_volume_by_target: BTreeMap::new(),
-            last_sink_mute_by_target: BTreeMap::new(),
-            last_source_mute_by_target: BTreeMap::new(),
             runtime_state: State::default(),
             state_saver: DebouncedSaver::new(),
             soundboard_players: BTreeMap::new(),
@@ -1333,6 +1478,129 @@ mod tests {
                 Some(selected_output.to_string()),
                 Some(selected_input.to_string())
             ))
+        );
+    }
+
+    #[test]
+    fn external_mute_change_emits_mute_changed_and_updates_hotkey_state() {
+        let mut state = build_test_runtime_state(Some("Default"), Some("Default"));
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        state
+            .last_snapshot
+            .output_ids
+            .insert(VENTURI_MAIN_OUTPUT.to_string(), 128);
+        state
+            .last_snapshot
+            .input_ids
+            .insert(VIRTUAL_SOURCES[0].to_string(), 281);
+        state.last_snapshot.mutes.insert(128, false);
+        state.last_snapshot.mutes.insert(281, false);
+
+        // Someone muted Venturi-Output via wpctl; the mic mute is unchanged and
+        // an unrelated node muting must not produce a channel event.
+        let objects: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"id": 128, "type": "PipeWire:Interface:Node", "info": {"params": {"Props": [{"mute": true}]}}},
+              {"id": 281, "type": "PipeWire:Interface:Node", "info": {"params": {"Props": [{"mute": false}]}}},
+              {"id": 999, "type": "PipeWire:Interface:Node", "info": {"params": {"Props": [{"mute": true}]}}}
+            ]"#,
+        )
+        .unwrap();
+
+        state.merge_changed_objects(&objects, &event_tx);
+
+        let mute_events: Vec<(Channel, bool)> = event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                CoreEvent::MuteChanged(channel, muted) => Some((channel, muted)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mute_events, vec![(Channel::Main, true)]);
+        assert!(state.hotkey_state.main_muted);
+        assert!(!state.hotkey_state.mic_muted);
+        assert_eq!(state.last_snapshot.mutes.get(&128), Some(&true));
+    }
+
+    #[test]
+    fn default_source_metadata_change_reroutes_virtual_mic_when_default_selected() {
+        let mut state = build_test_runtime_state(Some("Default"), Some("Default"));
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        state.last_snapshot.default_source = Some("alsa_input.webcam".to_string());
+        state.last_snapshot.default_sink = Some("alsa_output.speakers".to_string());
+        state.last_snapshot.devices = vec![DeviceEntry {
+            kind: DeviceKind::Input,
+            id: "alsa_input.headset".to_string(),
+            label: "Headset".to_string(),
+        }];
+        state
+            .last_snapshot
+            .input_ids
+            .insert("alsa_input.headset".to_string(), 42);
+
+        // The user switched their system default source to the headset. Only
+        // the source key is re-emitted; the sink key must survive the merge.
+        let objects: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"id": 3, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+               "metadata": [{"subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON",
+                             "value": {"name": "alsa_input.headset"}}]}
+            ]"#,
+        )
+        .unwrap();
+
+        state.merge_changed_objects(&objects, &event_tx);
+
+        assert_eq!(
+            state.last_snapshot.default_source.as_deref(),
+            Some("alsa_input.headset")
+        );
+        assert_eq!(
+            state.last_snapshot.default_sink.as_deref(),
+            Some("alsa_output.speakers")
+        );
+        assert_eq!(
+            state.virtual_mic_module.as_deref(),
+            Some("test-virtual-mic-module:alsa_input.headset")
+        );
+        // Metadata objects carry no `info`; they must not be treated as node removals.
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, CoreEvent::Error(_)))
+        );
+    }
+
+    #[test]
+    fn default_source_becoming_virtual_mic_falls_back_to_hardware_input() {
+        let mut state = build_test_runtime_state(Some("Default"), Some("Default"));
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        state.last_snapshot.default_source = Some("alsa_input.headset".to_string());
+        state.last_snapshot.devices = vec![DeviceEntry {
+            kind: DeviceKind::Input,
+            id: "alsa_input.headset".to_string(),
+            label: "Headset".to_string(),
+        }];
+        state
+            .last_snapshot
+            .input_ids
+            .insert("alsa_input.headset".to_string(), 42);
+
+        let objects: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"id": 3, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+               "metadata": [{"subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON",
+                             "value": {"name": "Venturi-VirtualMic"}}]}
+            ]"#,
+        )
+        .unwrap();
+
+        state.merge_changed_objects(&objects, &event_tx);
+
+        assert_eq!(
+            state.virtual_mic_module.as_deref(),
+            Some("test-virtual-mic-module:alsa_input.headset"),
+            "virtual mic must never be remapped onto itself"
         );
     }
 

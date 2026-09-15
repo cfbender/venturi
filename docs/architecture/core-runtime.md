@@ -37,13 +37,43 @@ Channel contracts:
 - `monitor_rx` (`PwMonitorEvent`s)
 - timeout tick (`LOOP_TICK_INTERVAL`)
 
-## Volume Sync
+## Volume & Mute Sync
 
-PipeWire is the source of truth for bus volumes. The sync flow is:
+PipeWire is the source of truth for bus volumes and mutes. Core keeps no
+per-channel volume/mute caches of its own; the only cached state is
+`last_snapshot` (`volumes`, `mutes` keyed by node id), which mirrors what
+`pw-dump --monitor` last reported. The sync flow is:
 
-- **UI → PipeWire:** User drags slider → `CoreCommand::SetVolume` → `wpctl set-volume` on the bus node
-- **PipeWire → UI:** `pw-dump --monitor` detects volume change → core emits `CoreEvent::VolumeChanged`
-- **GUI guards:** The slider widget uses `suppress_signal` and `is_dragging` flags to prevent feedback loops during user interaction
+- **UI → PipeWire:** User drags slider / toggles mute → `CoreCommand::SetVolume` /
+  `CoreCommand::SetMute` → `wpctl set-volume` / `wpctl set-mute` on the bus node.
+  Targets are resolved strictly from `last_snapshot` (`channel_node_id`); if the
+  Venturi node is missing the command fails with `CoreEvent::Error` rather than
+  falling back to `@DEFAULT_AUDIO_SINK@`/`@DEFAULT_AUDIO_SOURCE@`.
+- **PipeWire → UI:** `pw-dump --monitor` reports a `Props` change → core updates
+  `last_snapshot` and emits `CoreEvent::VolumeChanged` / `CoreEvent::MuteChanged`.
+  This covers changes made by Venturi itself, hotkeys, `wpctl`, pavucontrol, or
+  hardware keys, so hotkey state and the GUI never drift from PipeWire.
+- **GUI model:** `MixerTab` (shared `Arc<Mutex<_>>`) is the single GUI-side copy
+  of channel state. Widgets write user changes into it directly and the 33 ms
+  slider tick syncs widgets *from* it; a short grace window after user input
+  (`USER_INPUT_GRACE`) plus `suppress_signal`/`is_dragging` flags prevent the
+  tick from snapping a slider or mute button back before PipeWire confirms.
+- **Hotkeys:** key autorepeat is filtered (`HeldKeys`) so a held mute key toggles
+  once per press.
+
+## Default Device Following
+
+`last_snapshot.default_sink` / `default_source` mirror the `default` metadata
+object (`default.audio.sink` / `default.audio.source`). In monitor mode pw-dump
+only re-emits changed keys, so they are merged per key. When the user's selection
+is "Default" and the corresponding default changes, core re-runs the matching
+route reconcile.
+
+The virtual mic master is resolved by `resolve_virtual_mic_master`: a specific
+selection wins; otherwise the system default source is used unless it is a
+Venturi node (e.g. the user set `Venturi-VirtualMic` as their system default),
+in which case the first non-Venturi hardware input is used. This prevents the
+remap module from being pointed at itself, which produced a silent mic.
 
 ## Routing
 

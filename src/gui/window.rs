@@ -161,6 +161,31 @@ fn compose_hotkey_chord(
     Some(parts.join("+"))
 }
 
+/// Physical keys currently held in the window.
+///
+/// GTK delivers keyboard autorepeat as a stream of `key-pressed` signals with
+/// no `key-released` in between, so holding a mute hotkey would otherwise
+/// toggle the mute on every repeat. Only the first press of a keycode counts.
+#[derive(Debug, Default)]
+struct HeldKeys(std::collections::BTreeSet<u32>);
+
+impl HeldKeys {
+    /// Record a press; returns `false` for autorepeat of an already-held key.
+    fn press(&mut self, keycode: u32) -> bool {
+        self.0.insert(keycode)
+    }
+
+    fn release(&mut self, keycode: u32) {
+        self.0.remove(&keycode);
+    }
+
+    /// Forget everything (e.g. when the window loses focus and the releases
+    /// will never be delivered to us).
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 fn chord_from_key_event(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> Option<String> {
     let key_name = key
         .to_unicode()
@@ -353,9 +378,19 @@ pub fn run_gtk_app(
             let command_tx_for_release = command_tx_outer.clone();
             let window_for_release = window.clone();
 
+            let held_keys = Rc::new(RefCell::new(HeldKeys::default()));
+            let held_keys_for_press = held_keys.clone();
+            let held_keys_for_release = held_keys.clone();
+            let held_keys_for_focus = held_keys.clone();
+
             let key_controller = gtk::EventControllerKey::new();
             key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+            key_controller.connect_key_pressed(move |_, key, keycode, modifiers| {
+                if !held_keys_for_press.borrow_mut().press(keycode) {
+                    // Keyboard autorepeat: not a new hotkey press.
+                    return gtk::glib::Propagation::Proceed;
+                }
+
                 if should_ignore_hotkeys_due_to_focus(&window_for_press) {
                     return gtk::glib::Propagation::Proceed;
                 }
@@ -375,7 +410,9 @@ pub fn run_gtk_app(
                     gtk::glib::Propagation::Proceed
                 }
             });
-            key_controller.connect_key_released(move |_, key, _, modifiers| {
+            key_controller.connect_key_released(move |_, key, keycode, modifiers| {
+                held_keys_for_release.borrow_mut().release(keycode);
+
                 if should_ignore_hotkeys_due_to_focus(&window_for_release) {
                     return;
                 }
@@ -391,6 +428,11 @@ pub fn run_gtk_app(
             });
 
             window.add_controller(key_controller);
+            window.connect_is_active_notify(move |window| {
+                if !window.is_active() {
+                    held_keys_for_focus.borrow_mut().clear();
+                }
+            });
         }
 
         {
@@ -798,9 +840,30 @@ mod tests {
     use crate::gui::mixer_tab::MixerTab;
 
     use super::{
-        compose_hotkey_chord, parse_hex_color, should_metering_be_enabled,
+        HeldKeys, compose_hotkey_chord, parse_hex_color, should_metering_be_enabled,
         ui_selected_device_from_config,
     };
+
+    #[test]
+    fn held_keys_ignore_autorepeat_until_release() {
+        let mut held = HeldKeys::default();
+
+        assert!(held.press(58));
+        assert!(!held.press(58), "autorepeat must not count as a new press");
+        assert!(held.press(30), "a different key is still a fresh press");
+
+        held.release(58);
+        assert!(
+            held.press(58),
+            "pressing again after release is a new press"
+        );
+
+        held.clear();
+        assert!(
+            held.press(30),
+            "clearing forgets keys whose release was lost"
+        );
+    }
 
     #[test]
     fn parses_six_digit_hex_colors() {

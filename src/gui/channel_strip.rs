@@ -1,9 +1,11 @@
 use crate::core::messages::{Channel, CoreCommand};
 use crate::core::meter::apply_mute;
+use crate::gui::mixer_tab::MixerTab;
 use crossbeam_channel::Sender;
 use gtk::prelude::*;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TRACK_TOP_INSET_PX: i32 = 8;
@@ -55,39 +57,63 @@ impl ChannelStrip {
     }
 }
 
-/// Handle to a channel strip's slider widget with suppression flags for
+/// Handle to a channel strip's widgets with suppression flags for
 /// coordinating programmatic updates vs user interaction.
 pub struct SliderHandle {
     pub scale: gtk::Scale,
     pub value_label: gtk::Label,
+    pub mute_button: gtk::ToggleButton,
+    /// Set while the refresh tick writes widget state so the change handlers
+    /// don't echo it back as a user action.
     pub suppress_signal: Rc<Cell<bool>>,
     pub is_dragging: Rc<Cell<bool>>,
+    /// Last time the user touched this strip (slider, wheel, keys or mute).
+    /// The refresh tick leaves the widgets alone for a short grace period after
+    /// this so the core's echo can't yank them back to the previous value.
+    pub last_user_input_at: Rc<Cell<Instant>>,
+}
+
+/// How long after a user interaction the refresh tick must not overwrite the
+/// strip's widgets from the model. Long enough for the core to apply the change
+/// and echo the resulting `VolumeChanged`/`MuteChanged` back.
+pub(crate) const USER_INPUT_GRACE: Duration = Duration::from_millis(400);
+
+impl SliderHandle {
+    pub(crate) fn within_user_input_grace(&self, now: Instant) -> bool {
+        user_input_grace_active(self.last_user_input_at.get(), now)
+    }
+}
+
+pub(crate) fn user_input_grace_active(last_user_input_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_user_input_at) < USER_INPUT_GRACE
 }
 
 fn default_slider_flags() -> (Rc<Cell<bool>>, Rc<Cell<bool>>) {
     (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)))
 }
 
-pub fn build_strip_widget(strip: ChannelStrip, command_tx: Sender<CoreCommand>) -> gtk::Box {
-    build_strip_widget_with_meter(strip, command_tx).0
+fn long_ago() -> Instant {
+    Instant::now() - Duration::from_secs(60)
 }
 
+/// Build the widgets for one channel strip.
+///
+/// User interaction writes into the shared `model` (the same one the refresh
+/// tick reads from) and sends the matching `CoreCommand`. The widget never
+/// keeps its own private copy of the volume/mute state, so the label, slider
+/// and mute button can't disagree with the model.
 pub fn build_strip_widget_with_meter(
     strip: ChannelStrip,
+    model: Arc<Mutex<MixerTab>>,
     command_tx: Sender<CoreCommand>,
 ) -> (gtk::Box, gtk::ProgressBar, SliderHandle) {
-    let state = Rc::new(RefCell::new(strip));
-    let channel = state.borrow().channel;
+    let channel = strip.channel;
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.set_hexpand(true);
     root.set_vexpand(true);
 
-    let header = gtk::Label::new(Some(&format!(
-        "{} {}",
-        state.borrow().icon,
-        state.borrow().label
-    )));
+    let header = gtk::Label::new(Some(&format!("{} {}", strip.icon, strip.label)));
     header.add_css_class("title-4");
 
     let meter = gtk::ProgressBar::new();
@@ -107,7 +133,7 @@ pub fn build_strip_widget_with_meter(
     meter.add_css_class(&meter_css_class_for(channel));
 
     let slider = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
-    slider.set_value(linear_to_slider_fraction(state.borrow().volume_linear) as f64);
+    slider.set_value(linear_to_slider_fraction(strip.volume_linear) as f64);
     slider.set_inverted(true);
     slider.set_vexpand(true);
     slider.set_margin_top(TRACK_TOP_INSET_PX);
@@ -115,70 +141,69 @@ pub fn build_strip_widget_with_meter(
 
     slider.add_css_class(&format!("slider-{}", channel.css_class()));
 
-    let db_label = gtk::Label::new(Some(&state.borrow().volume_text()));
-    let last_sent_at = Rc::new(RefCell::new(Instant::now() - Duration::from_secs(1)));
+    let db_label = gtk::Label::new(Some(&strip.volume_text()));
     let (suppress_signal, is_dragging) = default_slider_flags();
+    let last_user_input_at = Rc::new(Cell::new(long_ago()));
 
     let mute = gtk::ToggleButton::with_label("Mute");
-    mute.set_active(state.borrow().muted);
+    mute.set_active(strip.muted);
 
     {
-        let state = state.clone();
+        let model = model.clone();
         let tx = command_tx.clone();
         let db_label = db_label.clone();
-        let last_sent_at = last_sent_at.clone();
-        let suppress_clone = suppress_signal.clone();
+        let suppress_signal = suppress_signal.clone();
+        let last_user_input_at = last_user_input_at.clone();
         slider.connect_value_changed(move |scale| {
-            if suppress_clone.get() {
+            if suppress_signal.get() {
                 return;
             }
-            let mut state = state.borrow_mut();
-            let now = Instant::now();
-            let cmd = state.set_volume_command(slider_fraction_to_linear(scale.value()));
-            db_label.set_text(&state.volume_text());
-
-            if should_emit_volume_update(*last_sent_at.borrow(), now, false) {
+            last_user_input_at.set(Instant::now());
+            let volume = slider_fraction_to_linear(scale.value());
+            if let Some((cmd, text)) = with_strip(&model, channel, |strip| {
+                let cmd = strip.set_volume_command(volume);
+                (cmd, strip.volume_text())
+            }) {
+                db_label.set_text(&text);
                 let _ = tx.send(cmd);
-                *last_sent_at.borrow_mut() = now;
             }
         });
     }
 
     {
-        let state = state.clone();
-        let tx = command_tx.clone();
-        let db_label = db_label.clone();
-        let last_sent_at = last_sent_at.clone();
-        let slider_for_release = slider.clone();
         let is_dragging_press = is_dragging.clone();
         let is_dragging_release = is_dragging.clone();
-        let release = gtk::GestureClick::new();
-        release.connect_pressed(move |_, _, _, _| {
+        let last_user_input_at = last_user_input_at.clone();
+        let drag = gtk::GestureClick::new();
+        drag.connect_pressed(move |_, _, _, _| {
             is_dragging_press.set(true);
         });
-        release.connect_released(move |_, _, _, _| {
+        drag.connect_released(move |_, _, _, _| {
             is_dragging_release.set(false);
-            let now = Instant::now();
-            let mut state = state.borrow_mut();
-            let cmd = release_volume_command(&mut state, slider_for_release.value());
-            if should_emit_volume_update(*last_sent_at.borrow(), now, true) {
-                let _ = tx.send(cmd);
-                *last_sent_at.borrow_mut() = now;
-            }
-            db_label.set_text(&state.volume_text());
+            last_user_input_at.set(Instant::now());
         });
-        slider.add_controller(release);
+        slider.add_controller(drag);
     }
 
     {
-        let state = state.clone();
+        let model = model.clone();
         let tx = command_tx.clone();
         let db_label = db_label.clone();
+        let suppress_signal = suppress_signal.clone();
+        let last_user_input_at = last_user_input_at.clone();
         mute.connect_toggled(move |btn| {
-            let mut state = state.borrow_mut();
-            let cmd = state.set_mute_command(btn.is_active());
-            db_label.set_text(&state.volume_text());
-            let _ = tx.send(cmd);
+            if suppress_signal.get() {
+                return;
+            }
+            last_user_input_at.set(Instant::now());
+            let muted = btn.is_active();
+            if let Some((cmd, text)) = with_strip(&model, channel, |strip| {
+                let cmd = strip.set_mute_command(muted);
+                (cmd, strip.volume_text())
+            }) {
+                db_label.set_text(&text);
+                let _ = tx.send(cmd);
+            }
         });
     }
 
@@ -197,19 +222,23 @@ pub fn build_strip_widget_with_meter(
     let handle = SliderHandle {
         scale: slider.clone(),
         value_label: db_label.clone(),
+        mute_button: mute.clone(),
         suppress_signal,
         is_dragging,
+        last_user_input_at,
     };
 
     (root, meter, handle)
 }
 
-fn should_emit_volume_update(_last_sent_at: Instant, _now: Instant, _is_release: bool) -> bool {
-    true
-}
-
-fn release_volume_command(state: &mut ChannelStrip, slider_value: f64) -> CoreCommand {
-    state.set_volume_command(slider_fraction_to_linear(slider_value))
+/// Run `f` against the shared model's strip for `channel`, if present.
+fn with_strip<T>(
+    model: &Arc<Mutex<MixerTab>>,
+    channel: Channel,
+    f: impl FnOnce(&mut ChannelStrip) -> T,
+) -> Option<T> {
+    let mut mixer = model.lock().ok()?;
+    mixer.strips.get_mut(&channel).map(f)
 }
 
 fn meter_css_class_for(channel: Channel) -> String {
@@ -242,15 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn emits_volume_update_during_fast_drag_without_waiting_for_release() {
-        let now = Instant::now();
-        let just_sent = now - Duration::from_millis(20);
-
-        assert!(super::should_emit_volume_update(just_sent, now, false));
-        assert!(super::should_emit_volume_update(just_sent, now, true));
-    }
-
-    #[test]
     fn slider_handle_suppression_flags_default_to_false() {
         let (suppress_signal, is_dragging) = super::default_slider_flags();
         assert!(!suppress_signal.get());
@@ -258,16 +278,34 @@ mod tests {
     }
 
     #[test]
-    fn release_volume_command_uses_current_slider_value() {
-        let mut strip = super::ChannelStrip::new(Channel::Main, "🔊", "Main");
-        strip.volume_linear = 0.98;
+    fn user_input_grace_blocks_model_sync_only_briefly_after_interaction() {
+        let touched = Instant::now();
 
-        let cmd = super::release_volume_command(&mut strip, 0.42);
+        assert!(super::user_input_grace_active(touched, touched));
+        assert!(super::user_input_grace_active(
+            touched,
+            touched + super::USER_INPUT_GRACE - Duration::from_millis(1)
+        ));
+        assert!(!super::user_input_grace_active(
+            touched,
+            touched + super::USER_INPUT_GRACE
+        ));
+        // A fresh handle starts "long ago" so the first tick syncs immediately.
+        assert!(!super::user_input_grace_active(
+            super::long_ago(),
+            Instant::now()
+        ));
+    }
 
-        assert!(
-            matches!(cmd, CoreCommand::SetVolume(Channel::Main, v) if (v - 0.42).abs() < 0.001)
-        );
-        assert!((strip.volume_linear - 0.42).abs() < 0.001);
+    #[test]
+    fn mute_command_updates_strip_and_targets_channel() {
+        let mut strip = super::ChannelStrip::new(Channel::Mic, "🎤", "Mic");
+
+        let cmd = strip.set_mute_command(true);
+
+        assert!(matches!(cmd, CoreCommand::SetMute(Channel::Mic, true)));
+        assert!(strip.muted);
+        assert_eq!(strip.volume_text(), "0%");
     }
 
     #[test]

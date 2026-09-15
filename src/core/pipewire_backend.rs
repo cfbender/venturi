@@ -24,10 +24,6 @@ pub(crate) fn run_command(program: &str, args: &[String]) -> Result<(), String> 
     }
 }
 
-pub(crate) fn run_wpctl(args: &[String]) {
-    let _ = run_command("wpctl", args);
-}
-
 pub(crate) fn run_wpctl_checked(args: &[String]) -> Result<(), String> {
     run_command("wpctl", args)
 }
@@ -265,17 +261,36 @@ pub(crate) fn reconcile_monitor_loopback_modules(
     }
 }
 
+/// Point the `module-remap-source` behind the virtual mic at `master_source`.
+///
+/// When a module already exists for the same master it is kept (no audio pop)
+/// unless `force_reload` is set, which is used after the master device was
+/// unplugged and reappeared: the remap module then silently follows
+/// WirePlumber's default source, so it must be recreated to re-attach.
+///
+/// Reloading the module recreates the `input.<virtual_source_name>` node, which
+/// drops the soundboard pw-link, so the link is re-established here.
 pub(crate) fn rewire_virtual_mic_source(
     master_source: &str,
     virtual_source_name: &str,
+    force_reload: bool,
 ) -> Result<String, String> {
     if let Some((module_id, existing_master)) = find_virtual_mic_module(virtual_source_name)? {
-        if existing_master.as_deref() == Some(master_source) {
+        if !force_reload && existing_master.as_deref() == Some(master_source) {
             return Ok(module_id);
         }
         unload_pactl_module(&module_id)?;
     }
 
+    let module_id = load_virtual_mic_module(master_source, virtual_source_name)?;
+    link_soundboard_to_virtual_mic(VENTURI_SOUND_SINK, virtual_source_name);
+    Ok(module_id)
+}
+
+fn load_virtual_mic_module(
+    master_source: &str,
+    virtual_source_name: &str,
+) -> Result<String, String> {
     let args = vec![
         "load-module".to_string(),
         "module-remap-source".to_string(),
@@ -459,8 +474,26 @@ fn run_pw_link_list_outputs() -> Result<String, String> {
     }
 }
 
+/// Create a pw-link. An already-existing link ("File exists") is success.
 fn run_pw_link(args: &[String]) -> Result<(), String> {
-    run_command("pw-link", args)
+    let output = Command::new("pw-link")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run pw-link: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if pw_link_result_is_success(output.status.success(), &stderr) {
+        Ok(())
+    } else {
+        Err(format!(
+            "pw-link exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ))
+    }
+}
+
+fn pw_link_result_is_success(status_ok: bool, stderr: &str) -> bool {
+    status_ok || stderr.to_ascii_lowercase().contains("exists")
 }
 
 fn category_mix_monitor_sources(virtual_sinks: &[&str]) -> Vec<String> {
@@ -733,9 +766,22 @@ mod tests {
         build_virtual_device_description_property,
         build_virtual_module_device_description_properties, category_mix_monitor_sources,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
-        find_virtual_mic_module_in_modules_raw, parse_wpctl_volume_output, sink_description_for,
-        source_description_for,
+        find_virtual_mic_module_in_modules_raw, parse_wpctl_volume_output,
+        pw_link_result_is_success, sink_description_for, source_description_for,
     };
+
+    #[test]
+    fn pw_link_treats_existing_link_as_success() {
+        assert!(pw_link_result_is_success(true, ""));
+        assert!(pw_link_result_is_success(
+            false,
+            "failed to link ports: File exists\n"
+        ));
+        assert!(!pw_link_result_is_success(
+            false,
+            "failed to link ports: No such file or directory\n"
+        ));
+    }
 
     #[test]
     fn plan_unloads_all_stale_venturi_monitor_loopbacks_and_loads_single_target() {

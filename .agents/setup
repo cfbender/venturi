@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb to build and test venturi (Rust + GTK4/libadwaita + PipeWire).
+# Idempotent: safe to re-run on a stale snapshot.
+set -euo pipefail
+
+step() { printf '\n==> %s (%s)\n' "$1" "$(date +%T)"; }
+
+step "System packages"
+# Mirrors .github/workflows CI deps plus the CLI tools the runtime shells out to
+# (wpctl/pw-dump/pw-link from pipewire-bin, pactl from pulseaudio-utils).
+packages=(
+  pkg-config clang libclang-dev
+  libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev
+  pipewire-bin pulseaudio-utils
+)
+missing=()
+for pkg in "${packages[@]}"; do
+  dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+done
+if ((${#missing[@]})); then
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq --no-install-recommends "${missing[@]}"
+else
+  echo "all packages present"
+fi
+
+step "Rust toolchain"
+# mise.toml pins rust 1.94.1; install that exact version via rustup so
+# builds match the pin without needing mise itself.
+RUST_VERSION="$(sed -n 's/^rust = "\([^"]*\)"/\1/p' mise.toml)"
+if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION"
+fi
+# The installer cannot update this running script's environment.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt >/dev/null
+rustup default "$RUST_VERSION" >/dev/null
+rustc --version
+
+step "Shell PATH for cargo"
+marker="# venturi: cargo on PATH"
+if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+  printf '\n%s\n[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"\n' "$marker" >> "$HOME/.bash_profile"
+fi
+if ! grep -Fqx "$marker" "$HOME/.bashrc" 2>/dev/null; then
+  printf '\n%s\n[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"\n' "$marker" >> "$HOME/.bashrc"
+fi
+
+step "Warm cargo cache and test build"
+cargo fetch --locked
+cargo test --no-run --locked
+
+step "Done"
