@@ -17,11 +17,19 @@ A Linux audio mixer for PipeWire with channel-based routing, virtual devices, an
 
 ### mise
 
-Add the following to `mise.toml`:
+Installs the prebuilt binary from the latest GitHub Release. Requires GTK 4
+and libadwaita runtime libraries plus PipeWire's CLI tools (`pactl`, `wpctl`,
+`pw-link`, `pw-dump`, `pw-record`, `pw-play`, `pw-metadata`).
+
 ```toml
 [tools]
-"cargo:https://github.com/cfbender/venturi" = "latest"
+"ubi:cfbender/venturi" = "latest"
 ```
+
+`mise upgrade` picks up new releases. (The older
+`"cargo:https://github.com/cfbender/venturi"` form builds from git `HEAD`, which
+mise treats as a single fixed version, so it never upgrades; use
+`mise install --force` if you stay on it.)
 
 ### cargo install
 

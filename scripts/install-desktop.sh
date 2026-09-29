@@ -24,10 +24,18 @@ LEGACY_SYMBOLIC_ICON_FILE="org.venturi.Venturi-symbolic.svg"
 # Resolve the absolute path to the venturi binary.
 # Checks (in order): mise, cargo bin, PATH, local release build.
 find_venturi_bin() {
-    # 1. mise install location (handles both short and URL-style package names)
+    # 1. mise install location (ubi, cargo, URL-style package names).
+    #    Prefer the per-tool `latest` symlink so the desktop entry keeps working
+    #    after `mise upgrade` replaces the versioned install directory.
     local mise_dir="${XDG_DATA_HOME:-$HOME/.local/share}/mise/installs"
     local mise_bin
-    mise_bin="$(find "$mise_dir" -path '*venturi*/bin/venturi' -type f 2>/dev/null | head -1)"
+    mise_bin="$(find "$mise_dir" -maxdepth 1 -name '*venturi*' -type d 2>/dev/null \
+        | while read -r tool_dir; do
+            [[ -x "$tool_dir/latest/bin/venturi" ]] && echo "$tool_dir/latest/bin/venturi"
+        done | head -1)"
+    if [[ -z "$mise_bin" ]]; then
+        mise_bin="$(find "$mise_dir" -path '*venturi*/bin/venturi' -type f 2>/dev/null | head -1)"
+    fi
     if [[ -n "$mise_bin" && -x "$mise_bin" ]]; then
         echo "$mise_bin"
         return
