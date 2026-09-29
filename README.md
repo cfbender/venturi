@@ -23,10 +23,13 @@ and libadwaita runtime libraries plus PipeWire's CLI tools (`pactl`, `wpctl`,
 
 ```toml
 [tools]
-"ubi:cfbender/venturi" = "latest"
+"github:cfbender/venturi" = { version = "latest", minimum_release_age = "0s" }
 ```
 
-`mise upgrade` picks up new releases. (The older
+`mise upgrade` picks up new releases. mise hides releases younger than 24 hours
+by default (`minimum_release_age`); the per-tool override above disables that
+delay for Venturi. mise's GitHub API calls are rate-limited unless a token is
+configured; see <https://mise.jdx.dev/dev-tools/github-tokens.html>. (The older
 `"cargo:https://github.com/cfbender/venturi"` form builds from git `HEAD`, which
 mise treats as a single fixed version, so it never upgrades; use
 `mise install --force` if you stay on it.)

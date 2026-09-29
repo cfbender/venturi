@@ -24,17 +24,20 @@ LEGACY_SYMBOLIC_ICON_FILE="org.venturi.Venturi-symbolic.svg"
 # Resolve the absolute path to the venturi binary.
 # Checks (in order): mise, cargo bin, PATH, local release build.
 find_venturi_bin() {
-    # 1. mise install location (ubi, cargo, URL-style package names).
+    # 1. mise install location (github/ubi release tarballs put the binary at
+    #    the tool root; cargo installs put it under bin/).
     #    Prefer the per-tool `latest` symlink so the desktop entry keeps working
     #    after `mise upgrade` replaces the versioned install directory.
     local mise_dir="${XDG_DATA_HOME:-$HOME/.local/share}/mise/installs"
     local mise_bin
     mise_bin="$(find "$mise_dir" -maxdepth 1 -name '*venturi*' -type d 2>/dev/null \
         | while read -r tool_dir; do
-            [[ -x "$tool_dir/latest/bin/venturi" ]] && echo "$tool_dir/latest/bin/venturi"
+            for candidate in "$tool_dir/latest/venturi" "$tool_dir/latest/bin/venturi"; do
+                [[ -x "$candidate" ]] && echo "$candidate"
+            done
         done | head -1)"
     if [[ -z "$mise_bin" ]]; then
-        mise_bin="$(find "$mise_dir" -path '*venturi*/bin/venturi' -type f 2>/dev/null | head -1)"
+        mise_bin="$(find "$mise_dir" -path '*venturi*' -name venturi -type f -perm -u+x 2>/dev/null | head -1)"
     fi
     if [[ -n "$mise_bin" && -x "$mise_bin" ]]; then
         echo "$mise_bin"
@@ -81,7 +84,7 @@ install() {
         echo "Error: Could not find the venturi binary." >&2
         echo "Install it first with one of:" >&2
         echo "  cargo install --path ." >&2
-        echo "  mise install cargo:https://github.com/cfbender/venturi" >&2
+        echo "  mise install github:cfbender/venturi" >&2
         exit 1
     fi
 
