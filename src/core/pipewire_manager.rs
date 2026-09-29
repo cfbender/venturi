@@ -39,11 +39,12 @@ use crate::core::snapshot_ops::{
     node_id_to_channel, prune_removed_node_ids,
 };
 use crate::core::soundboard_playback::{
-    SoundboardPlaybackMode, SoundboardPlaybackRoute, cleanup_soundboard_players,
-    handle_play_sound, stop_sound,
+    SoundboardPlaybackMode, SoundboardPlaybackRoute, cleanup_soundboard_players, handle_play_sound,
+    stop_sound,
 };
 use crate::core::state_persistence::{set_persisted_channel_mute, set_persisted_channel_volume};
 use crate::core::stream_routing::collect_stream_route_targets_for_reconcile;
+use crate::core::suspend_detector::SuspendDetector;
 
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
@@ -56,6 +57,11 @@ pub use crate::core::device_routing::fallback_to_default_device;
 const LOOP_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const DEVICE_SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long to wait after a resume before recreating the hardware-facing
+/// routes. USB controllers are reset on resume and their ALSA nodes need a
+/// moment to come back; rebuilding the loopback while they are still in flux
+/// just breaks it again.
+const RESUME_SETTLE_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30);
 
@@ -77,9 +83,9 @@ fn keep_pipewire_backend_symbols_for_tests() {
     let _ = current_default_sink_name as fn() -> Result<Option<String>, String>;
     let _ = current_default_source_name as fn() -> Result<Option<String>, String>;
     let _ = reconcile_monitor_loopback_modules
-        as fn(&str, Option<&str>) -> Result<Option<String>, String>;
+        as fn(&str, Option<&str>, bool) -> Result<Option<String>, String>;
     let _ = rewire_virtual_mic_source as fn(&str, &str, bool) -> Result<String, String>;
-    let _ = ensure_virtual_devices as fn(&[&str], &[&str], &[&str]) -> Result<(), String>;
+    let _ = ensure_virtual_devices as fn(&[&str], &[&str], &[&str], bool) -> Result<(), String>;
     let _ = VENTURI_MAIN_MONITOR;
     let _ = LEGACY_VENTURI_SINKS;
 }
@@ -122,6 +128,9 @@ struct CoreRuntimeState {
     last_device_selection_poll_at: Instant,
     output_restore_pending: bool,
     input_restore_pending: bool,
+    suspend_detector: SuspendDetector,
+    /// Set when a resume was detected; when reached, both routes are rebuilt.
+    resume_restore_due: Option<Instant>,
 }
 
 impl CoreRuntimeState {
@@ -189,16 +198,23 @@ impl CoreRuntimeState {
             last_device_selection_poll_at: Instant::now() - DEVICE_SELECTION_POLL_INTERVAL,
             output_restore_pending: false,
             input_restore_pending: false,
+            suspend_detector: SuspendDetector::new(),
+            resume_restore_due: None,
         };
 
         state.overrides = deserialize_overrides(&state.runtime_config.categorizer.overrides);
 
-        state.ensure_virtual_devices_present(event_tx);
+        state.ensure_virtual_devices_present(event_tx, false);
 
         if let Err(err) = state.reconcile_input_route(false) {
             let _ = event_tx.send(CoreEvent::Error(err));
         }
 
+        // `force` here recreates a main-mix loopback left behind by a previous
+        // instance. Its `sink=` may look right while its streams are dead
+        // (restarting Venturi after a bad resume must actually heal audio);
+        // recreating it only touches Venturi's own loopback stream nodes, so
+        // apps playing into Venturi-Output are unaffected.
         if let Some(output_name) = selected_output
             && let Err(err) = state.handle_set_output_device_internal(&output_name, true)
         {
@@ -355,10 +371,16 @@ impl CoreRuntimeState {
     }
 
     /// (Re)create Venturi's virtual sinks/sources and their internal loopbacks.
-    fn ensure_virtual_devices_present(&mut self, event_tx: &Sender<CoreEvent>) {
+    /// `force_reload_loopbacks` recreates the channel→main loopbacks even when
+    /// they are already present (resume path).
+    fn ensure_virtual_devices_present(
+        &mut self,
+        event_tx: &Sender<CoreEvent>,
+        force_reload_loopbacks: bool,
+    ) {
         #[cfg(test)]
         {
-            let _ = event_tx;
+            let _ = (event_tx, force_reload_loopbacks);
         }
 
         #[cfg(not(test))]
@@ -366,6 +388,7 @@ impl CoreRuntimeState {
             VIRTUAL_SINKS.as_slice(),
             VIRTUAL_SOURCES.as_slice(),
             LEGACY_VENTURI_SINKS.as_slice(),
+            force_reload_loopbacks,
         ) {
             let _ = event_tx.send(CoreEvent::Error(format!(
                 "failed to create virtual devices: {err}"
@@ -516,11 +539,47 @@ impl CoreRuntimeState {
         }
     }
 
-    fn reconcile_output_route(&mut self, device: &str) -> Result<(), String> {
+    /// Suspend/resume handling. USB audio devices are reset on resume; the
+    /// main-mix loopback and the virtual-mic remap that point at them can be
+    /// left with dead streams even though their PipeWire nodes keep their ids
+    /// (so the "device disappeared and came back" restore never fires) and
+    /// their pactl modules still list with the right arguments. Detect the
+    /// resume from the clock gap and, once the hardware has settled, rebuild
+    /// both routes through the same forced-restore path.
+    fn poll_resume_restore(&mut self, event_tx: &Sender<CoreEvent>) {
+        let now = Instant::now();
+        if self.suspend_detector.poll() {
+            self.resume_restore_due = Some(now + RESUME_SETTLE_DELAY);
+        }
+        self.run_due_resume_restore(now, event_tx);
+    }
+
+    fn run_due_resume_restore(&mut self, now: Instant, event_tx: &Sender<CoreEvent>) {
+        if let Some(due) = self.resume_restore_due
+            && now >= due
+        {
+            self.resume_restore_due = None;
+            // The internal channel→main loopbacks live in pipewire-pulse and
+            // were seen surviving a resume as listed+running but silent (with
+            // constant xruns), so rebuild them along with both hardware routes.
+            self.ensure_virtual_devices_present(event_tx, true);
+            self.mark_routes_for_restore();
+            self.poll_selected_device_restore(event_tx, true);
+        }
+    }
+
+    /// Flag both routes so the next restore poll rebuilds them (once their
+    /// selected devices are present).
+    fn mark_routes_for_restore(&mut self) {
+        self.output_restore_pending = self.selected_output.is_some();
+        self.input_restore_pending = self.selected_input.is_some();
+    }
+
+    fn reconcile_output_route(&mut self, device: &str, force_reload: bool) -> Result<(), String> {
         #[cfg(test)]
         {
             keep_pipewire_backend_symbols_for_tests();
-            let _ = device;
+            let _ = (device, force_reload);
             self.output_loopback_module = Some("test-output-loopback-module".to_string());
             Ok(())
         }
@@ -532,19 +591,24 @@ impl CoreRuntimeState {
             } else {
                 None
             };
-            let desired_output_owned =
-                resolve_output_loopback_target(device, default_sink.as_deref(), VENTURI_MAIN_OUTPUT);
+            let desired_output_owned = resolve_output_loopback_target(
+                device,
+                default_sink.as_deref(),
+                VENTURI_MAIN_OUTPUT,
+            );
             let desired_output = desired_output_owned.as_deref();
-            self.output_loopback_module =
-                reconcile_monitor_loopback_modules(VENTURI_MAIN_MONITOR, desired_output).map_err(
-                    |err| {
-                        if let Some(target) = desired_output {
-                            format!("failed to route Venturi main mix to {target}: {err}")
-                        } else {
-                            format!("failed to clear Venturi main mix loopbacks: {err}")
-                        }
-                    },
-                )?;
+            self.output_loopback_module = reconcile_monitor_loopback_modules(
+                VENTURI_MAIN_MONITOR,
+                desired_output,
+                force_reload,
+            )
+            .map_err(|err| {
+                if let Some(target) = desired_output {
+                    format!("failed to route Venturi main mix to {target}: {err}")
+                } else {
+                    format!("failed to clear Venturi main mix loopbacks: {err}")
+                }
+            })?;
             Ok(())
         }
     }
@@ -618,7 +682,11 @@ impl CoreRuntimeState {
             return Ok(());
         }
 
-        self.reconcile_output_route(device)?;
+        // `force` is set when restoring a route rather than changing the
+        // selection (startup, device re-appeared, resume from sleep). The
+        // loopback module then has to be recreated even though it nominally
+        // still points at the same sink — see `reconcile_monitor_loopback_modules`.
+        self.reconcile_output_route(device, force)?;
 
         self.selected_output = Some(device.to_string());
         self.output_restore_pending = false;
@@ -767,7 +835,7 @@ impl CoreRuntimeState {
                 // (`handle_monitor_died` already flagged the output/input
                 // routes for restore; `ensure_virtual_devices` is idempotent.)
                 if self.virtual_devices_missing() {
-                    self.ensure_virtual_devices_present(event_tx);
+                    self.ensure_virtual_devices_present(event_tx, false);
                 }
 
                 self.route_stream_targets_for_reconcile(
@@ -827,8 +895,7 @@ impl CoreRuntimeState {
             return; // Stop retrying
         }
 
-        self.output_restore_pending = true;
-        self.input_restore_pending = true;
+        self.mark_routes_for_restore();
         // Schedule non-blocking restart
         self.restart_pending_until = Some(Instant::now() + RESTART_DELAY);
     }
@@ -906,8 +973,7 @@ impl CoreRuntimeState {
                             VIRTUAL_SOURCES[0],
                         )
                         .unwrap_or(new_vol);
-                        let _ =
-                            event_tx.send(CoreEvent::VolumeChanged(channel, channel_volume));
+                        let _ = event_tx.send(CoreEvent::VolumeChanged(channel, channel_volume));
                     }
                 }
             }
@@ -977,7 +1043,7 @@ impl CoreRuntimeState {
 
         if self.last_snapshot.default_sink.as_deref() != default_sink_before
             && selection_is_default(self.selected_output.as_deref())
-            && let Err(err) = self.reconcile_output_route(fallback_to_default_device())
+            && let Err(err) = self.reconcile_output_route(fallback_to_default_device(), false)
         {
             let _ = event_tx.send(CoreEvent::Error(err));
         }
@@ -1093,8 +1159,9 @@ impl PipeWireManager {
                     }
                 }
 
-                // Hotkey tick, device restore poll, state flush — run on every loop iteration
+                // Hotkey tick, resume + device restore polls, state flush — run on every loop iteration
                 state.handle_hotkey_tick(&event_tx);
+                state.poll_resume_restore(&event_tx);
                 state.poll_selected_device_restore(&event_tx, false);
                 state.flush_persisted_state_if_due(&event_tx);
                 cleanup_soundboard_players(&mut state.soundboard_players);
@@ -1120,6 +1187,26 @@ impl PipeWireManager {
         }
         meter_result
     }
+
+    /// Join both worker threads, but give up after `grace`.
+    ///
+    /// Returns `true` when both threads finished. `false` means the core is
+    /// still blocked (typically inside a PipeWire CLI call that never returned)
+    /// and the caller should exit without it.
+    pub fn join_with_grace(self, grace: Duration) -> bool {
+        self.meter_running.store(false, Ordering::Relaxed);
+        self.meter_enabled.store(false, Ordering::Relaxed);
+        let deadline = Instant::now() + grace;
+        while !(self.handle.is_finished() && self.meter_handle.is_finished()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = self.handle.join();
+        let _ = self.meter_handle.join();
+        true
+    }
 }
 
 #[cfg(test)]
@@ -1129,6 +1216,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::{
+        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, RESUME_SETTLE_DELAY, VENTURI_MAIN_OUTPUT,
+        VIRTUAL_SOURCES,
+    };
     use crate::config::persistence::{DebouncedSaver, Paths, load_config};
     use crate::config::schema::State;
     use crate::core::command_coalescing::coalesce_commands;
@@ -1148,9 +1239,8 @@ mod tests {
     use crate::core::soundboard_playback::{SoundboardPlaybackMode, soundboard_playback_targets};
     use crate::core::stream_routing::collect_new_stream_route_targets;
     use crate::core::stream_routing::collect_stream_route_targets_for_reconcile;
-    use super::{
-        CoreRuntimeState, DEVICE_SELECTION_POLL_INTERVAL, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES,
-    };
+    use crate::core::suspend_detector::SuspendDetector;
+    use std::time::SystemTime;
 
     fn build_test_runtime_state(
         selected_output: Option<&str>,
@@ -1186,6 +1276,8 @@ mod tests {
             last_device_selection_poll_at: Instant::now() - DEVICE_SELECTION_POLL_INTERVAL,
             output_restore_pending: false,
             input_restore_pending: false,
+            suspend_detector: SuspendDetector::new(),
+            resume_restore_due: None,
         }
     }
 
@@ -1228,11 +1320,7 @@ mod tests {
         );
         snapshot.volumes.insert(901, 0.99);
 
-        let volumes = snapshot_channel_volumes(
-            &snapshot,
-            VENTURI_MAIN_OUTPUT,
-            VIRTUAL_SOURCES[0],
-        );
+        let volumes = snapshot_channel_volumes(&snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]);
 
         assert_eq!(volumes.get(&Channel::Main).copied(), Some(0.41));
         assert_eq!(volumes.get(&Channel::Mic).copied(), Some(0.73));
@@ -1271,11 +1359,7 @@ mod tests {
         snapshot.volumes.insert(100, 0.40);
         snapshot.volumes.insert(200, 0.04);
 
-        let volumes = snapshot_channel_volumes(
-            &snapshot,
-            VENTURI_MAIN_OUTPUT,
-            VIRTUAL_SOURCES[0],
-        );
+        let volumes = snapshot_channel_volumes(&snapshot, VENTURI_MAIN_OUTPUT, VIRTUAL_SOURCES[0]);
 
         assert_eq!(volumes.get(&Channel::Media).copied(), Some(0.33));
     }
@@ -1479,6 +1563,81 @@ mod tests {
                 Some(selected_input.to_string())
             ))
         );
+    }
+
+    #[test]
+    fn resume_from_sleep_rebuilds_routes_after_settle_delay_even_when_devices_never_left() {
+        let selected_output = "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo";
+        let selected_input = "alsa_input.usb-Elgato_Wave_XLR.mono-fallback";
+        let mut state = build_test_runtime_state(Some(selected_output), Some(selected_input));
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        // Devices are present the whole time: a USB reset on resume does not
+        // necessarily remove the PipeWire nodes, so the plain "device
+        // disappeared" restore never triggers.
+        state.last_snapshot.devices = vec![
+            DeviceEntry {
+                kind: DeviceKind::Output,
+                id: selected_output.to_string(),
+                label: "FiiO K11".to_string(),
+            },
+            DeviceEntry {
+                kind: DeviceKind::Input,
+                id: selected_input.to_string(),
+                label: "Elgato Wave XLR".to_string(),
+            },
+        ];
+        state.suspend_detector = SuspendDetector::with_clocks(
+            SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+            Instant::now(),
+        );
+
+        state.poll_resume_restore(&event_tx);
+
+        // Detected, but the hardware must settle first: nothing rebuilt yet.
+        assert!(state.resume_restore_due.is_some());
+        assert!(!state.output_restore_pending);
+        assert!(!state.input_restore_pending);
+        assert!(event_rx.try_iter().next().is_none());
+
+        state.run_due_resume_restore(Instant::now() + RESUME_SETTLE_DELAY, &event_tx);
+
+        assert!(state.resume_restore_due.is_none());
+        assert!(!state.output_restore_pending);
+        assert!(!state.input_restore_pending);
+        assert_eq!(
+            state.output_loopback_module.as_deref(),
+            Some("test-output-loopback-module")
+        );
+        assert_eq!(
+            state.virtual_mic_module.as_deref(),
+            Some(format!("test-virtual-mic-module:{selected_input}").as_str())
+        );
+        let selection_event = event_rx.try_iter().find_map(|event| match event {
+            CoreEvent::DeviceSelectionChanged {
+                selected_output,
+                selected_input,
+            } => Some((selected_output, selected_input)),
+            _ => None,
+        });
+        assert_eq!(
+            selection_event,
+            Some((
+                Some(selected_output.to_string()),
+                Some(selected_input.to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn ordinary_ticks_do_not_schedule_a_resume_restore() {
+        let mut state = build_test_runtime_state(Some("Default"), Some("Default"));
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        state.poll_resume_restore(&event_tx);
+
+        assert!(state.resume_restore_due.is_none());
+        assert!(event_rx.try_iter().next().is_none());
     }
 
     #[test]

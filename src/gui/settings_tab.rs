@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::config::persistence::{load_config, save_config, Paths};
+use crate::config::persistence::{Paths, load_config, save_config};
 use crate::config::schema::Hotkeys;
 
 #[derive(Debug, Clone)]

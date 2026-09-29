@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::core::device_routing::fallback_to_default_device;
 use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::core::messages::{DeviceEntry, DeviceKind};
 use crate::core::meter::decay_peak;
@@ -13,6 +14,55 @@ use crate::gui::channel_strip::{ChannelStrip, SliderHandle, build_strip_widget_w
 use gtk::prelude::*;
 
 pub const NO_DEVICES_FOUND: &str = "No devices found";
+const UNAVAILABLE_DEVICE_SUFFIX: &str = " (unavailable)";
+
+/// Keep `selected` as the selection even when it is not in `devices`.
+///
+/// A dropdown can only show entries from its list, so a missing selected
+/// device is appended and labelled as unavailable. The previous label map is
+/// used so the user still sees "FiiO K11 (unavailable)" instead of the raw
+/// node name. With no prior selection the first device is chosen; with no
+/// devices at all the selection is cleared so the "no devices" state shows.
+fn keep_selection_visible(
+    selected: &mut Option<String>,
+    devices: &mut Vec<String>,
+    labels_by_id: &mut BTreeMap<String, String>,
+    previous_labels_by_id: &BTreeMap<String, String>,
+) {
+    if devices.is_empty() {
+        *selected = None;
+        return;
+    }
+
+    match selected.as_deref() {
+        Some(sel)
+            if sel.eq_ignore_ascii_case(fallback_to_default_device())
+                && !devices.iter().any(|d| d == sel) =>
+        {
+            // "Default" is a routing mode (follow the system default), not a
+            // node, so it is never "unavailable".
+            labels_by_id.insert(sel.to_string(), sel.to_string());
+            devices.insert(0, sel.to_string());
+        }
+        Some(sel) if !devices.iter().any(|d| d == sel) => {
+            let base_label = previous_labels_by_id
+                .get(sel)
+                .map(|label| {
+                    label
+                        .trim_end_matches(UNAVAILABLE_DEVICE_SUFFIX)
+                        .to_string()
+                })
+                .unwrap_or_else(|| friendly_device_label(sel));
+            labels_by_id.insert(
+                sel.to_string(),
+                format!("{base_label}{UNAVAILABLE_DEVICE_SUFFIX}"),
+            );
+            devices.push(sel.to_string());
+        }
+        Some(_) => {}
+        None => *selected = devices.first().cloned(),
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct DeviceListModel {
@@ -60,16 +110,23 @@ impl DeviceListModel {
             }
         }
 
-        self.selected_output = self
-            .selected_output
-            .clone()
-            .filter(|sel| outputs.iter().any(|d| d == sel))
-            .or_else(|| outputs.first().cloned());
-        self.selected_input = self
-            .selected_input
-            .clone()
-            .filter(|sel| inputs.iter().any(|d| d == sel))
-            .or_else(|| inputs.first().cloned());
+        // The user's choice survives the device going away (unplug, USB reset
+        // on resume). Core keeps routing to it and restores it when it comes
+        // back, so the dropdown must keep showing it rather than silently
+        // jumping to whatever sorts first. Only fall back when nothing was
+        // selected yet.
+        keep_selection_visible(
+            &mut self.selected_output,
+            &mut outputs,
+            &mut output_labels_by_id,
+            &self.output_labels_by_id,
+        );
+        keep_selection_visible(
+            &mut self.selected_input,
+            &mut inputs,
+            &mut input_labels_by_id,
+            &self.input_labels_by_id,
+        );
 
         self.output_devices = outputs;
         self.input_devices = inputs;
@@ -378,8 +435,16 @@ impl MixerRefreshState {
         // Clone strip data for slider label sync
         let strips_for_sliders = state.strips.clone();
 
-        let (banner_text, out_devices, in_devices, selected_out, selected_in,
-             out_labels_by_id, in_labels_by_id, chips_snapshot) = if ui_dirty {
+        let (
+            banner_text,
+            out_devices,
+            in_devices,
+            selected_out,
+            selected_in,
+            out_labels_by_id,
+            in_labels_by_id,
+            chips_snapshot,
+        ) = if ui_dirty {
             let banner_text = state.banner.clone().unwrap_or_default();
             let out_devices = if state.devices.output_devices.is_empty() {
                 vec![NO_DEVICES_FOUND.to_string()]
@@ -404,9 +469,16 @@ impl MixerRefreshState {
             let out_labels_by_id = state.devices.output_labels_by_id.clone();
             let in_labels_by_id = state.devices.input_labels_by_id.clone();
             let chips_snapshot = state.chips.clone();
-            (Some(banner_text), Some(out_devices), Some(in_devices),
-             selected_out, selected_in,
-             Some(out_labels_by_id), Some(in_labels_by_id), Some(chips_snapshot))
+            (
+                Some(banner_text),
+                Some(out_devices),
+                Some(in_devices),
+                selected_out,
+                selected_in,
+                Some(out_labels_by_id),
+                Some(in_labels_by_id),
+                Some(chips_snapshot),
+            )
         } else {
             (None, None, None, None, None, None, None, None)
         };
@@ -935,6 +1007,113 @@ mod tests {
             model.selected_input.as_deref(),
             Some("alsa_input.usb-Logitech_G735_Gaming_Headset-01.mono-fallback")
         );
+    }
+
+    fn output(id: &str, label: &str) -> DeviceEntry {
+        DeviceEntry {
+            kind: DeviceKind::Output,
+            id: id.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn keeps_selected_device_when_it_temporarily_disappears_and_marks_it_unavailable() {
+        let fiio = "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo";
+        let elgato = "alsa_output.usb-Elgato_Wave_XLR.analog-stereo";
+        let mut model = DeviceListModel {
+            selected_output: Some(fiio.to_string()),
+            ..DeviceListModel::default()
+        };
+
+        // Both present: normal labels, FiiO selected.
+        model.set_from_devices_changed(&[
+            output(elgato, "Elgato Wave XLR Analog Stereo"),
+            output(fiio, "FiiO K11 Analog Stereo"),
+        ]);
+        assert_eq!(model.selected_output.as_deref(), Some(fiio));
+
+        // FiiO drops out (USB reset on resume). Elgato sorts first, but the
+        // selection must not jump to it.
+        model.set_from_devices_changed(&[output(elgato, "Elgato Wave XLR Analog Stereo")]);
+        assert_eq!(model.selected_output.as_deref(), Some(fiio));
+        assert_eq!(
+            model.output_devices,
+            vec![elgato.to_string(), fiio.to_string()]
+        );
+        assert_eq!(
+            model.output_labels_by_id.get(fiio).map(String::as_str),
+            Some("FiiO K11 Analog Stereo (unavailable)")
+        );
+
+        // Still gone on the next refresh: the suffix must not stack.
+        model.set_from_devices_changed(&[output(elgato, "Elgato Wave XLR Analog Stereo")]);
+        assert_eq!(
+            model.output_labels_by_id.get(fiio).map(String::as_str),
+            Some("FiiO K11 Analog Stereo (unavailable)")
+        );
+
+        // FiiO comes back: selection intact, label back to normal.
+        model.set_from_devices_changed(&[
+            output(elgato, "Elgato Wave XLR Analog Stereo"),
+            output(fiio, "FiiO K11 Analog Stereo"),
+        ]);
+        assert_eq!(model.selected_output.as_deref(), Some(fiio));
+        assert_eq!(
+            model.output_labels_by_id.get(fiio).map(String::as_str),
+            Some("FiiO K11 Analog Stereo")
+        );
+    }
+
+    #[test]
+    fn unavailable_selected_device_without_known_label_gets_friendly_name() {
+        let mut model = DeviceListModel {
+            selected_output: Some("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo".to_string()),
+            ..DeviceListModel::default()
+        };
+
+        model.set_from_devices_changed(&[output("alsa_output.other", "Other")]);
+
+        assert_eq!(
+            model
+                .output_labels_by_id
+                .get("alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo")
+                .map(String::as_str),
+            Some("usb-FIIO FiiO K11-01 (unavailable)")
+        );
+    }
+
+    #[test]
+    fn default_selection_is_listed_first_and_never_marked_unavailable() {
+        let mut model = DeviceListModel {
+            selected_output: Some("Default".to_string()),
+            ..DeviceListModel::default()
+        };
+
+        model.set_from_devices_changed(&[output("alsa_output.a", "A")]);
+
+        assert_eq!(model.selected_output.as_deref(), Some("Default"));
+        assert_eq!(
+            model.output_devices,
+            vec!["Default".to_string(), "alsa_output.a".to_string()]
+        );
+        assert_eq!(
+            model.output_labels_by_id.get("Default").map(String::as_str),
+            Some("Default")
+        );
+    }
+
+    #[test]
+    fn picks_first_device_only_when_nothing_was_selected() {
+        let mut model = DeviceListModel::default();
+
+        model.set_from_devices_changed(&[
+            output("alsa_output.b", "B"),
+            output("alsa_output.a", "A"),
+        ]);
+
+        assert_eq!(model.selected_output.as_deref(), Some("alsa_output.b"));
+        assert_eq!(model.selected_input, None);
     }
 
     #[test]

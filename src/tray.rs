@@ -1,6 +1,6 @@
 use crossbeam_channel::Sender;
 
-use crate::core::messages::CoreCommand;
+use crate::core::messages::{CoreCommand, CoreEvent};
 
 #[cfg(target_os = "linux")]
 const TRAY_ICON_NAME: &str = "org.venturi.Venturi";
@@ -20,10 +20,42 @@ fn command_for_tray_action(action: TrayMenuAction) -> CoreCommand {
     }
 }
 
+/// Channels the tray dispatches into.
+///
+/// Quit goes to *both* sides on purpose: `CoreCommand::Shutdown` lets the core
+/// flush persisted state, while `CoreEvent::ShutdownRequested` tells the GUI
+/// (or the daemon waiter) to exit right away. Routing Quit only through the
+/// core made it a no-op whenever the core loop was blocked in a `pactl` call
+/// against a wedged PipeWire.
+#[derive(Clone, Debug)]
+pub struct TrayChannels {
+    pub command_tx: Sender<CoreCommand>,
+    pub event_tx: Sender<CoreEvent>,
+}
+
+impl TrayChannels {
+    fn dispatch(&self, action: TrayMenuAction) -> Result<(), String> {
+        // Tell the UI first and unconditionally: a dead or wedged core must not
+        // stop the process from exiting.
+        let ui_result = if action == TrayMenuAction::Quit {
+            self.event_tx
+                .send(CoreEvent::ShutdownRequested)
+                .map_err(|err| err.to_string())
+        } else {
+            Ok(())
+        };
+        let core_result = self
+            .command_tx
+            .send(command_for_tray_action(action))
+            .map_err(|err| err.to_string());
+        ui_result.and(core_result)
+    }
+}
+
 #[derive(Clone)]
 pub struct TrayHandle {
     entries: Vec<TrayMenuAction>,
-    command_tx: Sender<CoreCommand>,
+    channels: TrayChannels,
     #[cfg(target_os = "linux")]
     _backend: Option<LinuxTrayBackend>,
 }
@@ -34,24 +66,22 @@ impl TrayHandle {
     }
 
     pub fn activate(&self, action: TrayMenuAction) -> Result<(), String> {
-        self.command_tx
-            .send(command_for_tray_action(action))
-            .map_err(|err| err.to_string())
+        self.channels.dispatch(action)
     }
 }
 
 #[cfg(target_os = "linux")]
-pub fn create_tray(command_tx: Sender<CoreCommand>) -> Option<TrayHandle> {
-    let backend = LinuxTrayBackend::spawn(command_tx.clone());
+pub fn create_tray(channels: TrayChannels) -> Option<TrayHandle> {
+    let backend = LinuxTrayBackend::spawn(channels.clone());
     Some(TrayHandle {
         entries: vec![TrayMenuAction::ShowHide, TrayMenuAction::Quit],
-        command_tx,
+        channels,
         _backend: backend,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn create_tray(_command_tx: Sender<CoreCommand>) -> Option<TrayHandle> {
+pub fn create_tray(_channels: TrayChannels) -> Option<TrayHandle> {
     None
 }
 
@@ -63,10 +93,10 @@ struct LinuxTrayBackend {
 
 #[cfg(target_os = "linux")]
 impl LinuxTrayBackend {
-    fn spawn(command_tx: Sender<CoreCommand>) -> Option<Self> {
+    fn spawn(channels: TrayChannels) -> Option<Self> {
         use ksni::blocking::TrayMethods;
 
-        let tray = VenturiTray { command_tx };
+        let tray = VenturiTray { channels };
         match tray.assume_sni_available(true).spawn() {
             Ok(handle) => Some(Self { _handle: handle }),
             Err(error) => {
@@ -80,7 +110,7 @@ impl LinuxTrayBackend {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 struct VenturiTray {
-    command_tx: Sender<CoreCommand>,
+    channels: TrayChannels,
 }
 
 #[cfg(target_os = "linux")]
@@ -236,7 +266,7 @@ impl ksni::Tray for VenturiTray {
             ksni::menu::StandardItem {
                 label: "Show/Hide".to_string(),
                 activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.command_tx.send(command_for_tray_action(TrayMenuAction::ShowHide));
+                    let _ = tray.channels.dispatch(TrayMenuAction::ShowHide);
                 }),
                 ..Default::default()
             }
@@ -244,7 +274,7 @@ impl ksni::Tray for VenturiTray {
             ksni::menu::StandardItem {
                 label: "Quit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.command_tx.send(command_for_tray_action(TrayMenuAction::Quit));
+                    let _ = tray.channels.dispatch(TrayMenuAction::Quit);
                 }),
                 ..Default::default()
             }
@@ -260,12 +290,18 @@ mod tests {
     use crossbeam_channel::unbounded;
     use tempfile::tempdir;
 
-    use super::{TRAY_ICON_NAME, VenturiTray, resolve_installed_tray_icon};
+    use super::{TRAY_ICON_NAME, TrayChannels, VenturiTray, resolve_installed_tray_icon};
 
     #[test]
     fn tray_reports_venturi_icon_name() {
-        let (tx, _rx) = unbounded();
-        let tray = VenturiTray { command_tx: tx };
+        let (command_tx, _command_rx) = unbounded();
+        let (event_tx, _event_rx) = unbounded();
+        let tray = VenturiTray {
+            channels: TrayChannels {
+                command_tx,
+                event_tx,
+            },
+        };
 
         let icon_name = <VenturiTray as ksni::Tray>::icon_name(&tray);
         assert_eq!(icon_name, TRAY_ICON_NAME);
@@ -273,8 +309,14 @@ mod tests {
 
     #[test]
     fn tray_exposes_icon_pixmap_data() {
-        let (tx, _rx) = unbounded();
-        let tray = VenturiTray { command_tx: tx };
+        let (command_tx, _command_rx) = unbounded();
+        let (event_tx, _event_rx) = unbounded();
+        let tray = VenturiTray {
+            channels: TrayChannels {
+                command_tx,
+                event_tx,
+            },
+        };
 
         let pixmaps = <VenturiTray as ksni::Tray>::icon_pixmap(&tray);
         assert!(

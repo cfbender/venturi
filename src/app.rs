@@ -4,7 +4,14 @@ use crate::config::persistence::{Paths, load_config};
 use crate::core::messages::{CoreCommand, CoreEvent};
 use crate::core::pipewire_manager::PipeWireManager;
 use crate::gui::window::MainWindow;
-use crate::tray::create_tray;
+use crate::tray::{TrayChannels, create_tray};
+
+/// How long to wait for the core thread after the UI has gone away.
+///
+/// The core normally exits within milliseconds of `Shutdown`. If it is stuck
+/// in a PipeWire call we still want the process to quit, so after this we give
+/// up on a clean join, reap our helper processes and return.
+const CORE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct AppBootstrap {
@@ -80,7 +87,10 @@ impl<G: GuiLauncher> AppRunner<G> {
         let paths = Paths::resolve();
         let config = load_config(&paths);
         let _tray = if should_create_tray(config.general.show_tray_icon) {
-            create_tray(bootstrap.command_tx.clone())
+            create_tray(TrayChannels {
+                command_tx: bootstrap.command_tx.clone(),
+                event_tx: bootstrap.event_tx.clone(),
+            })
         } else {
             None
         };
@@ -90,16 +100,30 @@ impl<G: GuiLauncher> AppRunner<G> {
         } else {
             self.gui_launcher
                 .launch(bootstrap.command_tx.clone(), bootstrap.event_rx.clone())?;
-
-            bootstrap
-                .command_tx
-                .send(CoreCommand::Shutdown)
-                .map_err(|e| e.to_string())?;
         }
 
-        let _ = manager.join();
+        // Best effort: the core may already have processed a tray-initiated
+        // Shutdown and dropped its receiver, which is fine.
+        let _ = bootstrap.command_tx.send(CoreCommand::Shutdown);
+
+        if !manager.join_with_grace(CORE_SHUTDOWN_GRACE) {
+            tracing::warn!(
+                "core did not shut down within {}s; exiting anyway",
+                CORE_SHUTDOWN_GRACE.as_secs()
+            );
+            kill_child_processes();
+        }
         Ok(())
     }
+}
+
+/// Terminate helper processes (`pw-dump --monitor`, `pw-record` meters, a hung
+/// `pactl`) that would otherwise outlive us when the core thread cannot clean
+/// up itself.
+fn kill_child_processes() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-TERM", "-P", &std::process::id().to_string()])
+        .status();
 }
 
 pub fn run_app(daemon: bool) -> Result<(), String> {

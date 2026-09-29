@@ -14,4 +14,5 @@ pub(crate) mod snapshot_ops;
 pub(crate) mod soundboard_playback;
 pub(crate) mod state_persistence;
 pub(crate) mod stream_routing;
+pub(crate) mod suspend_detector;
 pub mod virtual_devices;

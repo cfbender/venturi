@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct MeterValue(Arc<AtomicU32>);
@@ -28,9 +28,5 @@ pub fn decay_peak(previous: f32, current: f32, elapsed_ms: u32) -> f32 {
 }
 
 pub fn apply_mute(volume: f32, muted: bool) -> f32 {
-    if muted {
-        0.0
-    } else {
-        volume
-    }
+    if muted { 0.0 } else { volume }
 }

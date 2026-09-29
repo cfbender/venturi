@@ -115,11 +115,7 @@ pub(crate) fn extract_volume(item: &serde_json::Value) -> Option<f32> {
 /// PipeWire internally stores volumes as `linear^3`. This reverses that
 /// to match `wpctl get-volume` output (the scale users interact with).
 fn cubic_to_linear(cubic: f32) -> f32 {
-    if cubic <= 0.0 {
-        0.0
-    } else {
-        cubic.cbrt()
-    }
+    if cubic <= 0.0 { 0.0 } else { cubic.cbrt() }
 }
 
 pub(crate) fn parse_pw_dump(

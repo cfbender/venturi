@@ -6,8 +6,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use adw::prelude::*;
-use crossbeam_channel::{Receiver, Sender};
 use crate::app::GuiLauncher;
 use crate::config::persistence::{Paths, load_config};
 use crate::config::schema::Palette;
@@ -16,6 +14,8 @@ use crate::core::messages::{Channel, CoreCommand, CoreEvent};
 use crate::gui::mixer_tab::{MixerTab, build_mixer_widget};
 use crate::gui::settings_tab::{SettingsTab, build_settings_widget};
 use crate::gui::soundboard_tab::{SoundboardTab, build_soundboard_widget};
+use adw::prelude::*;
+use crossbeam_channel::{Receiver, Sender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeUiEvent {

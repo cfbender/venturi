@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::process::Command;
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{Child, ChildStdout, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const VENTURI_MAIN_OUTPUT: &str = "Venturi-Output";
 const VENTURI_MAIN_MONITOR: &str = "Venturi-Output.monitor";
@@ -11,16 +12,99 @@ const MAIN_MIX_MONITOR_DESCRIPTION: &str = "Venturi-MainMix-Monitor";
 const VIRTUAL_MIC_INPUT_DESCRIPTION: &str = "Venturi-Mic-Input";
 const MAIN_MIX_ROUTE_APPLICATION_NAME: &str = "Venturi Main Mix Route";
 
-pub(crate) fn run_command(program: &str, args: &[String]) -> Result<(), String> {
-    let status = Command::new(program)
+/// Upper bound for any one-shot `pactl`/`wpctl`/`pw-*` invocation.
+///
+/// These tools block until the PipeWire graph acknowledges the request. When the
+/// graph is wedged (seen after suspend/resume: links stuck in `init`, nodes never
+/// becoming runnable) a call like `pactl load-module module-loopback` never
+/// returns, which would freeze the core loop and with it every command from the
+/// GUI, hotkeys and tray. A healthy call finishes in tens of milliseconds, so
+/// hitting this limit is itself a signal that PipeWire is unhealthy.
+pub(crate) const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+const SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+struct CapturedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `program` to completion, killing it if it exceeds `timeout`.
+///
+/// stdout and stderr are drained on helper threads so a chatty child can't
+/// block on a full pipe while we wait for it.
+fn run_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<CapturedOutput, String> {
+    let mut child = Command::new(program)
         .args(args)
-        .status()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
 
-    if status.success() {
+    let stdout_reader = spawn_drain(child.stdout.take());
+    let stderr_reader = spawn_drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed waiting for {program}: {e}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{program} {} did not finish within {}s (PipeWire unresponsive?)",
+                args.join(" "),
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(SUBPROCESS_POLL_INTERVAL);
+    };
+
+    Ok(CapturedOutput {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
+}
+
+fn spawn_drain<R: Read + Send + 'static>(reader: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut reader) = reader {
+            let _ = reader.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+fn run_captured(program: &str, args: &[String]) -> Result<CapturedOutput, String> {
+    run_with_timeout(program, args, SUBPROCESS_TIMEOUT)
+}
+
+fn describe_failure(program: &str, output: &CapturedOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!("{program} exited with {}: {}", output.status, stderr.trim())
+}
+
+pub(crate) fn run_command(program: &str, args: &[String]) -> Result<(), String> {
+    let output = run_captured(program, args)?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("{program} exited with {status}"))
+        Err(describe_failure(program, &output))
     }
 }
 
@@ -45,18 +129,10 @@ fn parse_wpctl_volume_output(output: &str) -> Option<f32> {
 
 pub(crate) fn read_wpctl_volume(target: &str) -> Result<f32, String> {
     let args = vec!["get-volume".to_string(), target.to_string()];
-    let output = Command::new("wpctl")
-        .args(&args)
-        .output()
-        .map_err(|e| format!("failed to run wpctl: {e}"))?;
+    let output = run_captured("wpctl", &args)?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "wpctl exited with {}: {}",
-            output.status,
-            stderr.trim()
-        ));
+        return Err(describe_failure("wpctl", &output));
     }
 
     let stdout = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
@@ -69,20 +145,12 @@ pub(crate) fn run_pw_metadata(args: &[String]) -> Result<(), String> {
 }
 
 pub(crate) fn run_pactl(args: &[String]) -> Result<String, String> {
-    let output = Command::new("pactl")
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run pactl: {e}"))?;
+    let output = run_captured("pactl", args)?;
 
     if output.status.success() {
         String::from_utf8(output.stdout).map_err(|e| e.to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "pactl exited with {}: {}",
-            output.status,
-            stderr.trim()
-        ))
+        Err(describe_failure("pactl", &output))
     }
 }
 
@@ -233,9 +301,17 @@ pub(crate) fn load_monitor_loopback_module(
     run_pactl(&args).map(|stdout| stdout.trim().to_string())
 }
 
+/// Point the main-mix `module-loopback` at `output_device`.
+///
+/// An existing module whose `sink=` argument already matches is kept (no
+/// audio pop) unless `force_reload` is set. The module arguments only say what
+/// the loopback was *asked* to target; after suspend/resume or a device
+/// unplug/replug its streams can be dead while the module still lists fine, so
+/// restore paths must recreate it regardless.
 pub(crate) fn reconcile_monitor_loopback_modules(
     monitor_source_name: &str,
     output_device: Option<&str>,
+    force_reload: bool,
 ) -> Result<Option<String>, String> {
     let args = vec![
         "list".to_string(),
@@ -243,7 +319,7 @@ pub(crate) fn reconcile_monitor_loopback_modules(
         "modules".to_string(),
     ];
     let raw = run_pactl(&args)?;
-    let plan = build_monitor_loopback_plan(&raw, monitor_source_name, output_device);
+    let plan = build_monitor_loopback_plan(&raw, monitor_source_name, output_device, force_reload);
 
     for module_id in &plan.unload_ids {
         unload_pactl_module(module_id)?;
@@ -306,10 +382,19 @@ fn load_virtual_mic_module(
     run_pactl(&args).map(|stdout| stdout.trim().to_string())
 }
 
+/// Create any missing Venturi null sinks / virtual mic and wire every category
+/// sink's monitor into `Venturi-Output`.
+///
+/// Null sinks are never recreated when present (apps are connected to them).
+/// The internal channel→main loopbacks are kept unless `force_reload_loopbacks`
+/// is set; the resume path sets it because after suspend those `module-loopback`
+/// streams were observed still listed and "running" yet no longer carrying
+/// audio into the main mix.
 pub(crate) fn ensure_virtual_devices(
     virtual_sinks: &[&str],
     virtual_sources: &[&str],
     legacy_sink_names: &[&str],
+    force_reload_loopbacks: bool,
 ) -> Result<(), String> {
     unload_legacy_venturi_sinks(legacy_sink_names)?;
 
@@ -383,19 +468,24 @@ pub(crate) fn ensure_virtual_devices(
     }
 
     for monitor_source in category_mix_monitor_sources(virtual_sinks) {
-        reconcile_monitor_loopback_modules(&monitor_source, Some(VENTURI_MAIN_OUTPUT)).map_err(
-            |err| {
+        reconcile_monitor_loopback_modules(
+            &monitor_source,
+            Some(VENTURI_MAIN_OUTPUT),
+            force_reload_loopbacks,
+        )
+        .map_err(|err| {
                 format!(
                     "failed to route category mix monitor {monitor_source} into {VENTURI_MAIN_OUTPUT}: {err}"
                 )
-            },
-        )?;
+            })?;
     }
 
     // Route the soundboard sink's monitor into the virtual mic input via pw-link.
     // This uses port-level linking because the virtual mic is a source, not a sink,
     // so module-loopback can't target it.
-    if let Some(sound_sink) = virtual_sinks.iter().find(|s| s.eq_ignore_ascii_case(VENTURI_SOUND_SINK))
+    if let Some(sound_sink) = virtual_sinks
+        .iter()
+        .find(|s| s.eq_ignore_ascii_case(VENTURI_SOUND_SINK))
         && let Some(virtual_mic) = virtual_sources.first()
     {
         link_soundboard_to_virtual_mic(sound_sink, virtual_mic);
@@ -463,32 +553,22 @@ fn recreate_sound_sink_as_mono_if_needed(sink_name: &str) -> Result<(), String> 
 }
 
 fn run_pw_link_list_outputs() -> Result<String, String> {
-    let output = std::process::Command::new("pw-link")
-        .arg("-o")
-        .output()
-        .map_err(|e| format!("failed to run pw-link -o: {e}"))?;
+    let output = run_captured("pw-link", &["-o".to_string()])?;
     if output.status.success() {
         String::from_utf8(output.stdout).map_err(|e| e.to_string())
     } else {
-        Err("pw-link -o failed".to_string())
+        Err(describe_failure("pw-link -o", &output))
     }
 }
 
 /// Create a pw-link. An already-existing link ("File exists") is success.
 fn run_pw_link(args: &[String]) -> Result<(), String> {
-    let output = Command::new("pw-link")
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run pw-link: {e}"))?;
+    let output = run_captured("pw-link", args)?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if pw_link_result_is_success(output.status.success(), &stderr) {
         Ok(())
     } else {
-        Err(format!(
-            "pw-link exited with {}: {}",
-            output.status,
-            stderr.trim()
-        ))
+        Err(describe_failure("pw-link", &output))
     }
 }
 
@@ -528,6 +608,7 @@ fn build_monitor_loopback_plan(
     modules_raw: &str,
     monitor_source_name: &str,
     output_device: Option<&str>,
+    force_reload: bool,
 ) -> MonitorLoopbackPlan {
     let mut matching_modules: Vec<(String, Option<String>)> = Vec::new();
 
@@ -549,7 +630,8 @@ fn build_monitor_loopback_plan(
 
     // If there's exactly one existing loopback already pointing at the desired target,
     // keep it to avoid an audio pop from unnecessary unload/reload.
-    if let Some(desired) = output_device
+    if !force_reload
+        && let Some(desired) = output_device
         && matching_modules.len() == 1
         && matching_modules[0].1.as_deref() == Some(desired)
     {
@@ -559,10 +641,7 @@ fn build_monitor_loopback_plan(
         };
     }
 
-    let unload_ids = matching_modules
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let unload_ids = matching_modules.into_iter().map(|(id, _)| id).collect();
 
     let load_args =
         output_device.map(|device| build_monitor_loopback_load_args(monitor_source_name, device));
@@ -767,8 +846,44 @@ mod tests {
         build_virtual_module_device_description_properties, category_mix_monitor_sources,
         collect_virtual_device_module_unload_ids, compute_stereo_peak_from_s16le,
         find_virtual_mic_module_in_modules_raw, parse_wpctl_volume_output,
-        pw_link_result_is_success, sink_description_for, source_description_for,
+        pw_link_result_is_success, run_with_timeout, sink_description_for, source_description_for,
     };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn hung_subprocess_is_killed_and_reported_after_timeout() {
+        let started = Instant::now();
+        let result = run_with_timeout("sleep", &["30".to_string()], Duration::from_millis(200));
+
+        let err = result.err().expect("timed-out command must fail");
+        assert!(err.contains("did not finish"), "unexpected error: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout must not wait for the child to finish on its own"
+        );
+    }
+
+    #[test]
+    fn fast_subprocess_output_and_status_are_captured() {
+        let script = "printf out; printf err >&2; exit 3".to_string();
+        let output = run_with_timeout("sh", &["-c".to_string(), script], Duration::from_secs(5))
+            .expect("sh should run");
+
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    fn large_subprocess_output_does_not_deadlock() {
+        // > 64 KiB (the pipe buffer): would hang if we waited before draining.
+        let script = "head -c 300000 /dev/zero".to_string();
+        let output = run_with_timeout("sh", &["-c".to_string(), script], Duration::from_secs(5))
+            .expect("sh should run");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 300_000);
+    }
 
     #[test]
     fn pw_link_treats_existing_link_as_success() {
@@ -796,6 +911,7 @@ mod tests {
             modules,
             "Venturi-Output.monitor",
             Some("alsa_output.target"),
+            false,
         );
 
         assert_eq!(
@@ -826,7 +942,7 @@ mod tests {
 536870917 module-loopback source=Venturi-Output.monitor sink=alsa_output.b latency_msec=1
 "#;
 
-        let plan = build_monitor_loopback_plan(modules, "Venturi-Output.monitor", None);
+        let plan = build_monitor_loopback_plan(modules, "Venturi-Output.monitor", None, false);
 
         assert_eq!(
             plan,
@@ -847,6 +963,7 @@ mod tests {
             modules,
             "Venturi-Game.monitor",
             Some("Venturi-Output"),
+            false,
         );
 
         assert_eq!(
@@ -855,6 +972,29 @@ mod tests {
                 unload_ids: vec![],
                 load_args: None,
             }
+        );
+    }
+
+    #[test]
+    fn plan_force_reload_recreates_loopback_even_when_target_already_matches() {
+        // After suspend/resume the module still lists with the right `sink=`
+        // but its streams may be dead; a forced restore must unload + reload.
+        let modules = r#"
+536870916 module-loopback source=Venturi-Output.monitor sink=alsa_output.target latency_msec=1
+"#;
+
+        let plan = build_monitor_loopback_plan(
+            modules,
+            "Venturi-Output.monitor",
+            Some("alsa_output.target"),
+            true,
+        );
+
+        assert_eq!(plan.unload_ids, vec!["536870916".to_string()]);
+        assert!(
+            plan.load_args
+                .as_deref()
+                .is_some_and(|args| args.contains(&"sink=alsa_output.target".to_string()))
         );
     }
 

@@ -75,6 +75,29 @@ Venturi node (e.g. the user set `Venturi-VirtualMic` as their system default),
 in which case the first non-Venturi hardware input is used. This prevents the
 remap module from being pointed at itself, which produced a silent mic.
 
+## Suspend / Resume
+
+Resume from sleep can leave the main-mix `module-loopback` silently dead while
+the physical sink keeps its PipeWire node id, so the "device disappeared and
+came back" restore path never fires. `SuspendDetector` (`suspend_detector.rs`)
+detects a suspend on each core-loop tick by comparing wall-clock elapsed time
+against `Instant` elapsed time (`CLOCK_MONOTONIC` does not advance during
+suspend); a gap over `SUSPEND_GAP_THRESHOLD` schedules a restore after
+`RESUME_SETTLE_DELAY` so USB devices can re-enumerate. The restore recreates
+the internal channel → `Venturi-Output` loopbacks
+(`ensure_virtual_devices(.., force_reload_loopbacks = true)`) and re-runs both
+the output and mic route reconciles with `force_reload = true`, which unloads
+and recreates Venturi's own loopback/remap modules even when their `sink=` /
+`master=` arguments already match. Null sinks are left alone so apps stay
+connected. Startup forces only the main-mix loopback reload.
+
+Observed on 2026-09-29: after a resume that reset the USB controllers, the
+pulse-hosted loopbacks kept running with constant xruns and `Venturi-Output`
+carried silence while `Venturi-Media` still had signal; recreating only the
+main loopback did not heal it, `systemctl --user restart pipewire-pulse` did.
+The full-loopback rebuild above targets that state but has not yet been
+exercised through a real resume.
+
 ## Routing
 
 All stream routing uses `pw-metadata target.object` (with `target.node` legacy fallback). There is no dual routing mode — metadata routing is the only mechanism.
@@ -124,3 +147,16 @@ Monitor process failures are handled with backoff and a circuit breaker:
 - consecutive failure tracking in a time window
 - give-up path emits `CoreEvent::Error`
 - successful `InitialSnapshot` resets failure counters
+
+One-shot CLI calls (`pactl`, `wpctl`, `pw-link`, `pw-metadata`) run through
+`run_with_timeout` in `pipewire_backend.rs` with `SUBPROCESS_TIMEOUT` (10 s).
+A wedged PipeWire graph makes `pactl load-module` block forever, which used to
+freeze the core loop; now the call is killed and reported as an error so the
+loop keeps servicing commands.
+
+Quit is never routed only through the core. The tray sends
+`CoreCommand::Shutdown` (so the core can flush state) *and*
+`CoreEvent::ShutdownRequested` (so the GUI or daemon waiter exits). `app.rs`
+then waits `CORE_SHUTDOWN_GRACE` (5 s) for the core thread; if it is still
+blocked, helper processes (`pw-dump --monitor`, `pw-record` meters, a hung
+`pactl`) are killed via `pkill -P` and the process exits anyway.
