@@ -22,14 +22,15 @@ use crate::core::meter_worker::spawn_meter_worker;
 #[cfg_attr(test, allow(unused_imports))]
 use crate::core::pipewire_backend::{
     PwPlayProcess, current_default_sink_name, current_default_source_name, ensure_virtual_devices,
-    reconcile_monitor_loopback_modules, rewire_virtual_mic_source, run_pw_metadata,
+    reconcile_monitor_loopback_modules, reconnect_bluetooth_device, rewire_virtual_mic_source,
+    run_pw_metadata,
 };
 use crate::core::pipewire_channel_control::{
     ChannelControlTargets, apply_channel_mute, apply_channel_volume,
 };
 use crate::core::pipewire_discovery::{
     DEFAULT_SINK_METADATA_KEY, DEFAULT_SOURCE_METADATA_KEY, Snapshot, extract_default_metadata,
-    extract_mute, extract_volume, is_metadata_object, parse_pw_dump,
+    extract_failed_node, extract_mute, extract_volume, is_metadata_object, parse_pw_dump,
 };
 use crate::core::pw_monitor::{PwMonitor, PwMonitorEvent};
 use crate::core::router::{build_metadata_legacy_target_args, build_metadata_target_args};
@@ -64,6 +65,9 @@ const DEVICE_SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RESUME_SETTLE_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const FAILURE_WINDOW: Duration = Duration::from_secs(30);
+/// A selected Bluetooth output that fails again within this window of being
+/// reconnected is given up on and the output falls back to another device.
+const BLUETOOTH_RECONNECT_COOLDOWN: Duration = Duration::from_secs(120);
 
 const VIRTUAL_SINKS: [&str; 6] = [
     "Venturi-Output",
@@ -85,6 +89,7 @@ fn keep_pipewire_backend_symbols_for_tests() {
     let _ = reconcile_monitor_loopback_modules
         as fn(&str, Option<&str>, bool) -> Result<Option<String>, String>;
     let _ = rewire_virtual_mic_source as fn(&str, &str, bool) -> Result<String, String>;
+    let _ = reconnect_bluetooth_device as fn(&str) -> Result<(), String>;
     let _ = ensure_virtual_devices as fn(&[&str], &[&str], &[&str], bool) -> Result<(), String>;
     let _ = VENTURI_MAIN_MONITOR;
     let _ = LEGACY_VENTURI_SINKS;
@@ -114,6 +119,13 @@ struct CoreRuntimeState {
     last_snapshot: Snapshot,
     overrides: BTreeMap<String, crate::core::messages::Channel>,
     selected_output: Option<String>,
+    /// The output selected before `selected_output`; fallback when it fails.
+    previous_output: Option<String>,
+    /// Node id of the output failure already handled, so repeated error events
+    /// from the same node don't trigger recovery again.
+    handled_output_failure: Option<u32>,
+    /// When the selected Bluetooth output was last reconnected after a failure.
+    output_reconnected_at: Option<Instant>,
     selected_input: Option<String>,
     output_loopback_module: Option<String>,
     virtual_mic_module: Option<String>,
@@ -184,6 +196,9 @@ impl CoreRuntimeState {
             last_snapshot: Snapshot::default(),
             overrides: BTreeMap::new(),
             selected_output: None,
+            previous_output: None,
+            handled_output_failure: None,
+            output_reconnected_at: None,
             selected_input,
             output_loopback_module: None,
             virtual_mic_module: None,
@@ -688,6 +703,11 @@ impl CoreRuntimeState {
         // still points at the same sink — see `reconcile_monitor_loopback_modules`.
         self.reconcile_output_route(device, force)?;
 
+        if selection_changed {
+            self.previous_output = self.selected_output.take();
+            self.handled_output_failure = None;
+            self.output_reconnected_at = None;
+        }
         self.selected_output = Some(device.to_string());
         self.output_restore_pending = false;
         if selection_changed {
@@ -696,6 +716,123 @@ impl CoreRuntimeState {
                 .map_err(|err| format!("failed to persist output device selection: {err}"))?;
         }
         Ok(())
+    }
+
+    /// React to the hardware output behind the main mix going into `error`.
+    ///
+    /// Every Venturi node is linked behind that output, so PipeWire schedules
+    /// the whole mix from it: while it is failed, every app's audio stalls. The
+    /// typical case is a multipoint Bluetooth headset busy streaming from
+    /// another device, which leaves BlueZ refusing the transport until the
+    /// device reconnects. So reconnect a Bluetooth output once; if it fails
+    /// again soon after (or isn't Bluetooth), switch to another output.
+    fn recover_failed_output(
+        &mut self,
+        objects: &[serde_json::Value],
+        event_tx: &crossbeam_channel::Sender<CoreEvent>,
+    ) {
+        let Some(target) = self.selected_output.as_deref().and_then(|selected| {
+            resolve_output_loopback_target(
+                selected,
+                self.last_snapshot.default_sink.as_deref(),
+                VENTURI_MAIN_OUTPUT,
+            )
+        }) else {
+            return;
+        };
+        let Some(failed) = objects
+            .iter()
+            .filter_map(extract_failed_node)
+            .find(|node| node.name == target)
+        else {
+            return;
+        };
+        if self.handled_output_failure == Some(failed.id) {
+            return;
+        }
+        self.handled_output_failure = Some(failed.id);
+        let label = self.output_label(&target);
+
+        if let Some(address) = failed.bluetooth_address
+            && self
+                .output_reconnected_at
+                .is_none_or(|at| at.elapsed() >= BLUETOOTH_RECONNECT_COOLDOWN)
+        {
+            self.output_reconnected_at = Some(Instant::now());
+            let _ = event_tx.send(CoreEvent::Error(format!(
+                "{label} stopped working; reconnecting it."
+            )));
+            // The device disappears and comes back; the selected-device
+            // restore re-routes the main mix to it.
+            #[cfg(not(test))]
+            let reconnected = reconnect_bluetooth_device(address);
+            #[cfg(test)]
+            let reconnected: Result<(), String> = {
+                let _ = address;
+                Ok(())
+            };
+            match reconnected {
+                Ok(()) => return,
+                Err(err) => {
+                    let _ = event_tx.send(CoreEvent::Error(format!(
+                        "failed to reconnect {label}: {err}"
+                    )));
+                }
+            }
+        }
+
+        let Some(fallback) = self.output_fallback(&target) else {
+            let _ = event_tx.send(CoreEvent::Error(format!(
+                "{label} stopped working and no other output is available."
+            )));
+            return;
+        };
+        match self.handle_set_output_device_internal(&fallback, false) {
+            Ok(()) => {
+                self.emit_device_selection_changed(event_tx);
+                let _ = event_tx.send(CoreEvent::Error(format!(
+                    "{label} stopped working; switched output to {}.",
+                    self.output_label(&fallback)
+                )));
+            }
+            Err(err) => {
+                let _ = event_tx.send(CoreEvent::Error(format!(
+                    "{label} stopped working and switching to {fallback} failed: {err}"
+                )));
+            }
+        }
+    }
+
+    /// The previous output, else "Default", if it resolves to an available
+    /// device other than `failed`.
+    fn output_fallback(&self, failed: &str) -> Option<String> {
+        let default_sink = self.last_snapshot.default_sink.as_deref();
+        [
+            self.previous_output.as_deref(),
+            Some(fallback_to_default_device()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            resolve_output_loopback_target(candidate, default_sink, VENTURI_MAIN_OUTPUT)
+                .is_some_and(|target| {
+                    target != failed
+                        && self
+                            .last_snapshot
+                            .devices
+                            .iter()
+                            .any(|d| d.kind == DeviceKind::Output && d.id == target)
+                })
+        })
+        .map(str::to_string)
+    }
+
+    fn output_label(&self, device: &str) -> String {
+        self.last_snapshot
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Output && d.id == device)
+            .map_or_else(|| device.to_string(), |d| d.label.clone())
     }
 
     fn handle_set_input_device(&mut self, device: &str) -> Result<(), String> {
@@ -862,6 +999,7 @@ impl CoreRuntimeState {
             }
             PwMonitorEvent::ObjectsChanged(objects) => {
                 self.merge_changed_objects(&objects, event_tx);
+                self.recover_failed_output(&objects, event_tx);
                 self.poll_selected_device_restore(event_tx, true);
                 *self.shared_snapshot.lock().unwrap() = self.last_snapshot.clone();
             }
@@ -1262,6 +1400,9 @@ mod tests {
             last_snapshot: Snapshot::default(),
             overrides: BTreeMap::new(),
             selected_output: selected_output.map(str::to_string),
+            previous_output: None,
+            handled_output_failure: None,
+            output_reconnected_at: None,
             selected_input: selected_input.map(str::to_string),
             output_loopback_module: None,
             virtual_mic_module: None,
@@ -1563,6 +1704,88 @@ mod tests {
                 Some(selected_input.to_string())
             ))
         );
+    }
+
+    #[test]
+    fn failed_bluetooth_output_reconnects_once_then_falls_back_to_previous_output() {
+        let speakers = "alsa_output.usb-FIIO_FiiO_K11-01.analog-stereo";
+        let earbuds = "bluez_output.BC_87_FA_07_BD_A4.1";
+        let mut state = build_test_runtime_state(Some(speakers), None);
+        let temp = tempfile::tempdir().expect("temp dir");
+        state.paths = Paths::from_bases(temp.path().join("config"), temp.path().join("state"));
+        crate::config::persistence::ensure_dirs(&state.paths).expect("dirs");
+        state.last_snapshot.devices = vec![
+            DeviceEntry {
+                kind: DeviceKind::Output,
+                id: speakers.to_string(),
+                label: "FiiO K11".to_string(),
+            },
+            DeviceEntry {
+                kind: DeviceKind::Output,
+                id: earbuds.to_string(),
+                label: "Bose Open Earbuds Ultra".to_string(),
+            },
+        ];
+        state.last_snapshot.output_ids =
+            BTreeMap::from([(speakers.to_string(), 72), (earbuds.to_string(), 357)]);
+        state
+            .handle_set_output_device(earbuds)
+            .expect("select earbuds");
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let node = |id: u32, node_state: &str| {
+            serde_json::json!({
+                "id": id,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "state": node_state,
+                    "props": {
+                        "media.class": "Audio/Sink",
+                        "node.name": earbuds,
+                        "node.description": "Bose Open Earbuds Ultra",
+                        "api.bluez5.address": "BC:87:FA:07:BD:A4",
+                        "object.serial": id.to_string(),
+                    }
+                }
+            })
+        };
+        let selected_after = |state: &mut CoreRuntimeState, objects| {
+            state.handle_monitor_event(PwMonitorEvent::ObjectsChanged(objects), &event_tx);
+            state.selected_output.clone()
+        };
+
+        // A running node is not a failure.
+        assert_eq!(
+            selected_after(&mut state, vec![node(357, "running")]).as_deref(),
+            Some(earbuds)
+        );
+        // First failure: reconnect instead of switching away.
+        assert_eq!(
+            selected_after(&mut state, vec![node(357, "error")]).as_deref(),
+            Some(earbuds)
+        );
+        assert!(state.output_reconnected_at.is_some());
+        // Repeated error events from the same node are not a new failure.
+        assert_eq!(
+            selected_after(&mut state, vec![node(357, "error")]).as_deref(),
+            Some(earbuds)
+        );
+        // The reconnected device (new node id) fails again: fall back.
+        assert_eq!(
+            selected_after(&mut state, vec![node(384, "error")]).as_deref(),
+            Some(speakers)
+        );
+
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CoreEvent::DeviceSelectionChanged { selected_output, .. }
+                if selected_output.as_deref() == Some(speakers)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CoreEvent::Error(msg) if msg.contains("switched output to FiiO K11")
+        )));
     }
 
     #[test]

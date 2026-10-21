@@ -19,7 +19,8 @@ A Linux audio mixer for PipeWire with channel-based routing, virtual devices, an
 
 Installs the prebuilt binary from the latest GitHub Release. Requires GTK 4
 and libadwaita runtime libraries plus PipeWire's CLI tools (`pactl`, `wpctl`,
-`pw-link`, `pw-dump`, `pw-record`, `pw-play`, `pw-metadata`).
+`pw-link`, `pw-dump`, `pw-record`, `pw-play`, `pw-metadata`). `bluetoothctl` is
+optional and used to reconnect a Bluetooth output that stops working.
 
 ```toml
 [tools]

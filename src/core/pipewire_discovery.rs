@@ -79,6 +79,31 @@ pub(crate) fn extract_default_metadata(item: &Value) -> Vec<(&'static str, Optio
         .collect()
 }
 
+/// A PipeWire node that reported `state: "error"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailedNode<'a> {
+    pub id: u32,
+    pub name: &'a str,
+    /// `api.bluez5.address` for Bluetooth nodes.
+    pub bluetooth_address: Option<&'a str>,
+}
+
+pub(crate) fn extract_failed_node(item: &Value) -> Option<FailedNode<'_>> {
+    if item.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Node") {
+        return None;
+    }
+    let info = item.get("info")?;
+    if info.get("state").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let props = info.get("props")?;
+    Some(FailedNode {
+        id: u32::try_from(item.get("id")?.as_u64()?).ok()?,
+        name: props.get("node.name")?.as_str()?,
+        bluetooth_address: props.get("api.bluez5.address").and_then(Value::as_str),
+    })
+}
+
 /// Extract the mute flag from a PipeWire node's `Props` param.
 ///
 /// Returns `None` if the node has no `Props` param or the param has no `mute` field.

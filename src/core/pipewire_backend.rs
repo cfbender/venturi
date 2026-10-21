@@ -337,6 +337,24 @@ pub(crate) fn reconcile_monitor_loopback_modules(
     }
 }
 
+/// Drop and re-establish the Bluetooth connection to `address`.
+///
+/// When acquiring a Bluetooth audio transport fails (e.g. a multipoint headset
+/// is busy streaming from a phone), BlueZ can keep the transport marked as
+/// owned and reject every later acquire with `NotAuthorized`. Changing the card
+/// profile does not clear that; only a disconnect does.
+pub(crate) fn reconnect_bluetooth_device(address: &str) -> Result<(), String> {
+    run_command(
+        "bluetoothctl",
+        &["disconnect".to_string(), address.to_string()],
+    )?;
+    std::thread::sleep(Duration::from_secs(1));
+    run_command(
+        "bluetoothctl",
+        &["connect".to_string(), address.to_string()],
+    )
+}
+
 /// Point the `module-remap-source` behind the virtual mic at `master_source`.
 ///
 /// When a module already exists for the same master it is kept (no audio pop)

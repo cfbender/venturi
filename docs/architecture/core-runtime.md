@@ -98,6 +98,25 @@ main loopback did not heal it, `systemctl --user restart pipewire-pulse` did.
 The full-loopback rebuild above targets that state but has not yet been
 exercised through a real resume.
 
+## Failed Output Recovery
+
+Every Venturi node sits behind the main-mix loopback, so PipeWire schedules the
+whole mix from the selected hardware output. If that output goes into `error`,
+no app's audio is processed and every player stalls. `recover_failed_output`
+watches `pw-dump --monitor` node updates for the resolved output target
+reporting `state: "error"` (each node id is handled once):
+
+- Bluetooth outputs (`api.bluez5.address`) are reconnected with `bluetoothctl`
+  once per `BLUETOOTH_RECONNECT_COOLDOWN`; the selected-device restore then
+  re-routes the main mix to the new node.
+- Otherwise, or on a repeat failure within the cooldown, the selection falls
+  back to the previous output, else `Default`, and a banner explains why.
+
+Observed on 2026-10-21 with a multipoint headset streaming from a phone: the
+first `Acquire` of the A2DP transport timed out and every later one returned
+`org.bluez.Error.NotAuthorized` because BlueZ kept the transport owned. Changing
+the card profile did not clear it; disconnecting the device did.
+
 ## Routing
 
 All stream routing uses `pw-metadata target.object` (with `target.node` legacy fallback). There is no dual routing mode — metadata routing is the only mechanism.
@@ -138,6 +157,7 @@ Meters are only active while the window is visible. Per-app stream metering is n
 - **`pactl`** — null sinks / loopback / remap modules
 - **`pw-play`** — soundboard playback
 - **`pw-record`** — bus-level metering
+- **`bluetoothctl`** — reconnecting a failed Bluetooth output (optional)
 
 ## Failure Handling
 
